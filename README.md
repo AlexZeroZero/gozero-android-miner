@@ -1,6 +1,6 @@
 # Gozero Android Miner
 
-Android 原生 BNT / JTM 挖矿应用，当前版本 **0.2.10**。
+Android 原生 BNT / JTM 挖矿应用，当前版本 **1.0.0**。
 
 [下载安装包](https://github.com/AlexZeroZero/gozero-android-miner/releases/latest) · [构建说明](docs/BUILD.md)
 
@@ -14,7 +14,7 @@ Android 原生 BNT / JTM 挖矿应用，当前版本 **0.2.10**。
 
 ## 安装与使用
 
-从 Releases 下载 `Gozero-0.2.10-arm64-v8a.apk`，在手机上安装。最低 Android 9（API 28），正式安装包面向 ARM64 手机；真机验证设备为 realme GT5（RMX3823 / SM8550）。三星 S24 等其他设备的性能取决于芯片、散热及系统限制。
+从 Releases 下载 `Gozero-1.0.0-arm64-v8a.apk`，在手机上安装。最低 Android 9（API 28），正式安装包面向 ARM64 手机；真机验证设备为 realme GT5（RMX3823 / SM8550）。三星 S24 等其他设备的性能取决于芯片、散热及系统限制。
 
 进入“配置”，选择币种，填写自己的公开收款地址、矿池和矿工名称，保存后启动。预填的地址是项目测试地址，请核对并换成你的地址；不要输入私钥或助记词。默认“仅充电时挖矿”需要接通电源。
 
@@ -37,6 +37,6 @@ adb shell pm grant trade.gozero.bnt android.permission.DUMP
 
 ## 版本验证
 
-0.2.10 通过 34 项 JVM 测试、Android Debug / Release 构建与 lint，并在 GT5 检查两个币种界面。两个 native 核心与 0.2.9 相同；本次为费用文案精简。
+1.0.0 通过 34 项 JVM 测试、Android Debug / Release 构建与 lint，并在 GT5 检查两个币种界面。基于已验证的 0.2.10 功能，统一为首个 GitHub 正式版本；两个 native 核心保持一致。
 
 上游组件的许可与版权声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。上游目录中的说明适用于对应原项目；本应用的使用及构建以本页和构建说明为准。

@@ -109,7 +109,7 @@ public final class MainActivity extends Activity {
         FrameLayout frame=new FrameLayout(this);frame.addView(root,new FrameLayout.LayoutParams(-1,-1));mini=new MiniView();mini.setVisibility(View.GONE);frame.addView(mini,new FrameLayout.LayoutParams(-1,-1));setContentView(frame);
         header=row();header.setPadding(0,dp(14),0,dp(14));
         LinearLayout brand=col();brand.addView(bold("GOZERO.",20,TEXT));TextView subtitle=text("MOBILE MINER",9,MUTED);subtitle.setLetterSpacing(.16f);add(brand,subtitle,3);weight(header,brand);
-        Button aboutButton=compactButton("0.2.10",false);aboutButton.setOnClickListener(v->about());header.addView(aboutButton);root.addView(header);
+        Button aboutButton=compactButton("1.0.0",false);aboutButton.setOnClickListener(v->about());header.addView(aboutButton);root.addView(header);
         coinBar=row();coinBar.setPadding(dp(4),dp(4),dp(4),dp(4));coinBar.setBackground(outline(FIELD));
         for(Coin coin:new Coin[]{Coin.JTM,Coin.BNT}){
             LinearLayout item=row();item.setPadding(dp(10),dp(7),dp(10),dp(7));item.setMinimumHeight(dp(48));item.setContentDescription("切换到 "+coin);item.setFocusable(true);
@@ -243,7 +243,7 @@ public final class MainActivity extends Activity {
     @Override public void onRequestPermissionsResult(int r,String[] p,int[] g){super.onRequestPermissionsResult(r,p,g);if(r==41){if(g.length>0&&g[0]==PackageManager.PERMISSION_GRANTED)toggle();else toast("需要通知权限，便于查看后台状态和停止挖矿");}}
     private void about(){
         String license="";try(java.io.InputStream in=getAssets().open(selected==Coin.BNT?"SEINE-LICENSE.txt":"JTM-LICENSE.txt")){java.io.ByteArrayOutputStream out=new java.io.ByteArrayOutputStream();byte[] buf=new byte[4096];int n;while((n=in.read(buf))!=-1)out.write(buf,0,n);license=out.toString("UTF-8");}catch(Exception ignored){}
-        new AlertDialog.Builder(this).setTitle("Gozero · 0.2.10").setMessage("Android 原生 BNT / JTM 矿工。两种币的地址、矿池和线程分别保存；同一时间运行一个核心。\n\nBNT：Seine 0.3.1。JTM：towerminer 0.3.1，ARM64 / NEON + PMULL。\n1% 开发费用\n\n内存为核心 RSS；算力与收益不同，收益以矿池为准。退出到桌面可显示小窗，关闭小窗不停止挖矿。\n\n"+license).setPositiveButton("关闭",null).show();
+        new AlertDialog.Builder(this).setTitle("Gozero · 1.0.0").setMessage("Android 原生 BNT / JTM 矿工。两种币的地址、矿池和线程分别保存；同一时间运行一个核心。\n\nBNT：Seine 0.3.1。JTM：towerminer 0.3.1，ARM64 / NEON + PMULL。\n1% 开发费用\n\n内存为核心 RSS；算力与收益不同，收益以矿池为准。退出到桌面可显示小窗，关闭小窗不停止挖矿。\n\n"+license).setPositiveButton("关闭",null).show();
     }
     private void toast(String s){Toast.makeText(this,s,Toast.LENGTH_SHORT).show();}
     private void cpuDetails(){

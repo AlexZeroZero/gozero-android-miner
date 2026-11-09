@@ -133,7 +133,7 @@ public final class MiningService extends Service {
             File core=new File(getApplicationInfo().nativeLibraryDir,settings.coin.binary);
             if(!core.canExecute())throw new IOException("当前架构没有可执行核心："+Build.SUPPORTED_ABIS[0]);
             File data=new File(getFilesDir(),"seine-data");if(!data.exists()&&!data.mkdirs())throw new IOException("无法建立核心目录");
-            MinerState.line("Gozero 0.2.10 · "+settings.coin+" · "+settings.coin.core+" · "+Build.MODEL);
+            MinerState.line("Gozero 1.0.0 · "+settings.coin+" · "+settings.coin.core+" · "+Build.MODEL);
             MinerState.line(FeePolicy.description(settings.coin));
             while(requested){
                 String reason=guard(true);
