@@ -1,0 +1,9 @@
+[package]
+name = "gozero-verifier"
+version = "0.1.0"
+edition = "2021"
+[lib]
+crate-type = ["cdylib"]
+[dependencies]
+jetsam_core = { path = "../vendor/jetsam_core" }
+jetsam_poseidon2b = { path = "../vendor/jetsam_poseidon2b" }

@@ -1,0 +1,83 @@
+---
+title: How to mine Blocknet on Windows
+description: Mine Blocknet on Windows with seine. Choose the ZIP, extract the files, enter your address, and check accepted shares with CPU and NVIDIA mining together.
+date: 2026-10-25
+updated: 2026-11-02
+tags: [Mining guide, Windows, NVIDIA]
+faq:
+  - q: Do I need the CUDA Toolkit to mine Blocknet on Windows?
+    a: No. The Windows release ZIP includes the NVIDIA runtime libraries seine needs. Install a current NVIDIA driver and keep the extracted files together. Seine detects supported NVIDIA cards alongside the CPU and tunes them automatically. CPU mining also works on machines without an NVIDIA card.
+  - q: Where does seine save my Windows mining settings?
+    a: By default, seine saves the payout address, pool and rig name in seine-data/seine.config.json beneath the folder you launch it from. Run it from the same extracted folder to reuse those settings. The data-dir option lets you choose a different directory when you need one.
+  - q: Do I need Windows large pages before I start mining?
+    a: No. Seine tries large pages automatically and uses regular pages when they are unavailable. You can start mining with the default settings. For an optional large-page setup, grant your mining account Lock pages in memory, then sign out and back in before restarting seine.
+related: [start-miner-automatically-windows, mine-blocknet-nvidia-gpu, antivirus-flags-crypto-miner, seine-dashboard-explained]
+---
+
+This guide takes you from the Windows ZIP download to accepted shares on bntpool.com. You will extract the files, enter your payout address, and confirm that your CPU and any supported NVIDIA cards are mining. The commands below use PowerShell and native Windows.
+
+## How do you start mining Blocknet on Windows?
+
+<Answer>
+Download `seine-windows-x86_64.zip`, extract the whole archive, and open `seine.exe`. Enter your Blocknet address or registered `@name`, then accept `stratum+tcp://bntpool.com:3333` as the pool. Seine selects the available CPU and NVIDIA backends, sizes threads to memory, and starts tuning while it mines.
+</Answer>
+
+Have your public payout address ready before you open the miner. The [wallet guide](/blog/blocknet-wallet-for-mining/) explains how to obtain one. Enter the receiving address only: the miner does not need your wallet seed or spending keys. A registered [Blocknet ID](/blog/blocknet-id-pay-by-name/) also works, so you can use `@name` in place of the long address.
+
+## Step 1: download the right build
+
+Open the [download section](/#download) and choose Windows x86_64. The archive is named `seine-windows-x86_64.zip`.
+
+![Windows ZIP in the official seine download table](/assets/blog/setup-download.webp)
+
+## Step 2: extract and launch
+
+In File Explorer, right-click the downloaded ZIP and choose **Extract All**. Select a folder you can write to, then open the extracted folder. Keep `seine.exe` and the accompanying DLLs together: the Windows archive includes the NVIDIA runtime libraries used by the miner.
+
+Double-click `seine.exe` from the extracted folder. If you prefer a terminal, open PowerShell in that folder and run:
+
+```powershell
+.\seine.exe
+```
+
+## Step 3: enter your wallet address
+
+Paste your public Blocknet receiving address or registered `@name`, then press Enter to accept `stratum+tcp://bntpool.com:3333`. The [wallet guide](/blog/blocknet-wallet-for-mining/) shows where to find your address. Seine does not need your recovery phrase or spending keys. It assigns a pool worker name automatically.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="First-run address and pool prompts. Replace the example with your own address or registered name." loading="lazy" />
+  </picture>
+  <figcaption>First-run address and pool prompts. Replace the example with your own address or registered name.</figcaption>
+</figure>
+
+Seine chooses threads and tunes automatically. On later starts, launch it from the same folder to reuse `seine-data/seine.config.json`.
+
+## Step 4: check accepted shares
+
+<Answer>
+Check that seine's dashboard shows a hashrate and accepted shares, then look up the same payout address on bntpool.com's My Stats page. The dashboard describes the miner's current work; the pool records submitted shares and rewards. Let automatic tuning settle before comparing rates or changing settings.
+</Answer>
+
+The [dashboard guide](/blog/seine-dashboard-explained/) explains the hashrate, mining state and pool panels. A running hashrate shows local hashing activity; an accepted share confirms that work has reached the pool. Open [My Stats](https://bntpool.com/stats) and enter the same address or shortname to follow this rig's shares and balance.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="Seine’s actual dashboard renderer with example data. Look for Accepted; these figures are not a benchmark." loading="lazy" />
+  </picture>
+  <figcaption>Seine’s actual dashboard renderer with example data. Look for Accepted; these figures are not a benchmark.</figcaption>
+</figure>
+
+## CPU and NVIDIA mining on the same PC
+
+Seine uses the CPU and supported NVIDIA cards together by default. Install a current NVIDIA driver; the Windows ZIP already contains the runtime libraries, so you do not need to install the CUDA Toolkit separately. Leave the extracted DLLs beside the executable when you move the miner's folder.
+
+On first launch, seine tunes each GPU and remembers its settings. CPU tuning also runs during mining. The [hardware guide](/blog/blocknet-mining-hardware-hashrate/) explains memory sizing and measured results, while the [NVIDIA guide](https://github.com/zpalmtree/seine/blob/master/docs/guides/nvidia.md) covers multiple cards. To stop cleanly, press `q` in the dashboard or `Ctrl+C` in the terminal.
+
+<MinerSettings os="windows" />
+
+<CTA target="seine" title="Download seine for Windows" text="Extract the ZIP, enter your payout address, and start mining on bntpool.com with automatic CPU and NVIDIA tuning." />
+
+Open [My Stats](https://bntpool.com/stats) and enter the same address or registered name to find your worker, shares, and balance.

@@ -1,0 +1,87 @@
+---
+title: 'Cách đào Blocknet trên Linux'
+description: "Linux: Tải seine, giải nén, nhập địa chỉ Blocknet và xác nhận share được chấp nhận trên bntpool.com. Bắt đầu bằng cài đặt tự động; hướng dẫn hiệu năng nằm sau phần thiết lập."
+tags: ['Hướng dẫn đào coin', 'Linux', 'NVIDIA']
+faq:
+  - q: 'Tôi nên tải tệp Linux nào?'
+    a: "Mở mục tải xuống. Chạy uname -m: chọn seine-linux-x86_64.tar.gz cho x86_64 hoặc seine-linux-aarch64.tar.gz cho aarch64. Các bản Linux yêu cầu glibc 2.31 trở lên. Bản x86_64 hỗ trợ CPU và NVIDIA; ARM64 hỗ trợ đào bằng CPU."
+  - q: 'Có cần chạy seine bằng sudo không?'
+    a: 'Chạy phần mềm đào bình thường bằng tài khoản của bạn từ thư mục có quyền ghi. Giải nén, cấp quyền thực thi cho chủ sở hữu nếu cần, rồi chạy ./seine. Dành trước huge pages là thao tác quản trị riêng; khởi động thông thường có thể dùng trang bộ nhớ thường.'
+  - q: 'Tôi có cần CUDA hoặc NVRTC để đào bằng NVIDIA trên Linux không?'
+    a: 'Không. Trình điều khiển NVIDIA là đủ. Seine dùng NVRTC khi nó được cài, và nếu không thì nạp các kernel tích hợp sẵn trong seine, hỗ trợ card GeForce dòng GTX 10 trở lên. Hãy cài trình điều khiển, khởi động seine và kiểm tra card của bạn có hiện trong bảng Devices.'
+sourceHash: acdcb56b3c1f
+translation: draft
+---
+
+## Bắt đầu đào Blocknet trên Linux như thế nào?
+
+<Answer>
+Tải seine, giải nén, nhập địa chỉ Blocknet và xác nhận share được chấp nhận trên bntpool.com. Bắt đầu bằng cài đặt tự động; hướng dẫn hiệu năng nằm sau phần thiết lập.
+</Answer>
+
+## Bước 1: tải đúng phiên bản
+
+Mở [mục tải xuống](/vi/#download). Chạy `uname -m`: chọn `seine-linux-x86_64.tar.gz` cho `x86_64` hoặc `seine-linux-aarch64.tar.gz` cho `aarch64`. Các bản Linux yêu cầu glibc 2.31 trở lên. Bản x86_64 hỗ trợ CPU và NVIDIA; ARM64 hỗ trợ đào bằng CPU.
+
+<img src="/assets/blog/setup-download.webp" alt="Bảng tải xuống chính thức với các tệp Linux và Linux ARM64" loading="lazy" />
+
+## Bước 2: giải nén và chạy
+
+Mở Terminal. Các lệnh này giả định tệp nén nằm trong thư mục Downloads; hãy dùng đường dẫn thực tế nếu khác. Trên ARM64, thay `seine-linux-x86_64.tar.gz` bằng `seine-linux-aarch64.tar.gz`. Chúng giải nén seine vào thư mục cá nhân rồi chạy chương trình:
+
+```sh
+mkdir -p "$HOME/seine"
+tar -xzf "$HOME/Downloads/seine-linux-x86_64.tar.gz" -C "$HOME/seine"
+cd "$HOME/seine"
+./seine
+```
+
+## Bước 3: nhập địa chỉ ví
+
+Dán địa chỉ nhận Blocknet công khai hoặc `@name` đã đăng ký, rồi nhấn Enter để chấp nhận `stratum+tcp://bntpool.com:3333`. [Hướng dẫn ví](/vi/blog/blocknet-wallet-for-mining/) chỉ nơi tìm địa chỉ. Seine không cần cụm từ khôi phục hay khóa chi tiêu của bạn. Chương trình tự động đặt tên worker trong pool.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="Lời nhắc nhập địa chỉ và pool ở lần chạy đầu. Thay ví dụ bằng địa chỉ hoặc tên đã đăng ký của bạn." loading="lazy" />
+  </picture>
+  <figcaption>Lời nhắc nhập địa chỉ và pool ở lần chạy đầu. Thay ví dụ bằng địa chỉ hoặc tên đã đăng ký của bạn.</figcaption>
+</figure>
+
+Seine tự chọn luồng và tinh chỉnh hiệu năng. Ở những lần chạy sau, hãy mở từ cùng thư mục để dùng lại `seine-data/seine.config.json`.
+
+## Bước 4: kiểm tra share được chấp nhận
+
+Tìm hashrate và bộ đếm **Accepted** tăng dần trên [bảng điều khiển](/vi/blog/seine-dashboard-explained/). Share được chấp nhận xác nhận pool đã nhận công việc của bạn; điều đó không có nghĩa là đã thanh toán. Nhấn `q` hoặc `Ctrl+C` để dừng.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="Bảng điều khiển thật của seine với dữ liệu minh họa. Tìm Accepted; các số liệu này không phải kết quả benchmark." loading="lazy" />
+  </picture>
+  <figcaption>Bảng điều khiển thật của seine với dữ liệu minh họa. Tìm Accepted; các số liệu này không phải kết quả benchmark.</figcaption>
+</figure>
+
+Mở [Thống kê của tôi](https://bntpool.com/stats?lang=vi) và nhập cùng địa chỉ hoặc tên đã đăng ký để tìm worker, share và số dư.
+
+## Bạn cần gì để đào bằng GPU trên Linux?
+
+Card NVIDIA chỉ cần trình điều khiển NVIDIA. Card AMD cần trình điều khiển amdgpu và runtime ROCm HIP, như [hướng dẫn AMD](https://github.com/zpalmtree/seine/blob/master/docs/guides/amd.md) giải thích. Seine tự tìm card của bạn và đào bằng chúng cùng với CPU trên bản x86_64. [Hướng dẫn NVIDIA](/vi/blog/mine-blocknet-nvidia-gpu/) nói về cách chọn card và kiểm tra share của GPU.
+
+<MinerSettings os="linux" />
+
+## Cách xử lý lỗi khởi động trên Linux?
+
+Dựa vào thông báo lỗi đầu tiên để chọn bước kiểm tra tiếp theo:
+
+| Thông báo hoặc biểu hiện | Điều cần kiểm tra |
+|---|---|
+| `Exec format error` | Sai kiến trúc: đối chiếu `uname -m` với tên tệp nén. |
+| `GLIBC_... not found` | Chương trình yêu cầu glibc mới hơn. Dùng hệ thống tương thích hoặc biên dịch từ nguồn; để bản phân phối quản lý thư viện C hệ thống. |
+| `Permission denied` | Kiểm tra quyền thực thi của người dùng và dùng thư mục trên hệ thống tệp cho phép thực thi. |
+
+Khi share đã được chấp nhận, [hướng dẫn huge pages](/vi/blog/huge-pages-blocknet-mining/) trình bày thiết lập trang bộ nhớ tùy chọn trên Linux. [Hướng dẫn máy chủ](/vi/blog/mine-blocknet-on-servers/) nói về chạy không giao diện đồ họa và bố trí NUMA. Cả hai đều không bắt buộc cho lần chạy đầu này; thay đổi từng phần để nhận biết tác động trên máy của bạn.
+
+<CTA target="seine" title="Tải seine cho Linux" text="Giải nén bản tải cho Linux, nhập địa chỉ và bắt đầu đào với tính năng tự động tinh chỉnh CPU." />
+
+Mở [Thống kê của tôi](https://bntpool.com/stats?lang=vi) và nhập cùng địa chỉ hoặc tên đã đăng ký để tìm worker, share và số dư.

@@ -1,0 +1,349 @@
+openapi: 3.1.0
+info:
+  title: Seine Control API
+  version: "1.0.0"
+  description: >-
+    Control and observability API for the Seine miner runtime.
+    This API is local-first, supports sparse config overrides, and exposes streaming runtime events.
+servers:
+  - url: http://127.0.0.1:9977
+security:
+  - bearerAuth: []
+tags:
+  - name: Health
+  - name: Runtime
+  - name: Miner
+  - name: Wallet
+  - name: Events
+  - name: Metrics
+paths:
+  /v1/health:
+    get:
+      tags: [Health]
+      summary: Health check
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /v1/runtime/state:
+    get:
+      tags: [Runtime]
+      summary: Get runtime state snapshot
+      responses:
+        '200':
+          description: Runtime snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeState'
+  /v1/runtime/config/defaults:
+    get:
+      tags: [Runtime]
+      summary: Get baseline/default config
+      responses:
+        '200':
+          description: Baseline config
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigEnvelope'
+  /v1/runtime/config/effective:
+    get:
+      tags: [Runtime]
+      summary: Get current effective config
+      responses:
+        '200':
+          description: Effective config
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigEnvelope'
+  /v1/miner/start:
+    post:
+      tags: [Miner]
+      summary: Start mining session
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartRequest'
+      responses:
+        '200':
+          description: Start requested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: Already running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+  /v1/miner/stop:
+    post:
+      tags: [Miner]
+      summary: Stop mining session
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StopRequest'
+      responses:
+        '200':
+          description: Stop requested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionResponse'
+  /v1/miner/restart:
+    post:
+      tags: [Miner]
+      summary: Restart mining session
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartRequest'
+      responses:
+        '200':
+          description: Restart requested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+  /v1/miner/live-config:
+    patch:
+      tags: [Miner]
+      summary: Patch live config (safe/next-start semantics)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartRequest'
+      responses:
+        '200':
+          description: Patch handled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+  /v1/miner/stats:
+    get:
+      tags: [Runtime]
+      summary: Get live hashrate, share counters and per-device rates
+      responses:
+        '200':
+          description: Live mining statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MinerStatsResponse'
+  /v1/backends:
+    get:
+      tags: [Runtime]
+      summary: Get backend phase/visibility snapshot
+      responses:
+        '200':
+          description: Backend state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackendsResponse'
+  /v1/wallet/unlock:
+    post:
+      tags: [Wallet]
+      summary: Store wallet password for future session startup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WalletUnlockRequest'
+      responses:
+        '200':
+          description: Password accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+  /v1/events/stream:
+    get:
+      tags: [Events]
+      summary: Subscribe to runtime event stream (SSE)
+      responses:
+        '200':
+          description: Event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Server-Sent Events; each event payload is JSON.
+  /metrics:
+    get:
+      tags: [Metrics]
+      summary: Prometheus metrics
+      responses:
+        '200':
+          description: Metrics text
+          content:
+            text/plain:
+              schema:
+                type: string
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Token from `<data-dir>/control-api.cookie` (or `--api-token`).
+  schemas:
+    ErrorBody:
+      $ref: '../schemas/action-response.schema.json#/$defs/ErrorBody'
+    ActionResponse:
+      $ref: '../schemas/action-response.schema.json#/$defs/ActionResponse'
+    RuntimeState:
+      $ref: '../schemas/runtime-state.schema.json#/$defs/RuntimeState'
+    HealthResponse:
+      type: object
+      required: [status, version, started_unix_ms, now_unix_ms]
+      properties:
+        status: { type: string, enum: [ok] }
+        version: { type: string }
+        started_unix_ms: { type: integer, minimum: 0 }
+        now_unix_ms: { type: integer, minimum: 0 }
+    ConfigEnvelope:
+      type: object
+      required: [config]
+      properties:
+        config:
+          $ref: '#/components/schemas/RuntimeConfig'
+    RuntimeConfig:
+      type: object
+      additionalProperties: true
+      description: Effective config snapshot. See runtime-state schema for representative fields.
+    StartRequest:
+      $ref: '../schemas/start-request.schema.json#/$defs/StartRequest'
+    StopRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        wait_ms:
+          type: integer
+          minimum: 1
+    WalletUnlockRequest:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password:
+          type: string
+          minLength: 1
+    BackendsResponse:
+      type: object
+      required: [pending_nvidia_count, pending_amd_count, backend_phases, configured_backends, available_devices]
+      properties:
+        pending_nvidia_count:
+          type: integer
+          minimum: 0
+        pending_amd_count:
+          type: integer
+          minimum: 0
+        backend_phases:
+          type: object
+          additionalProperties:
+            type: string
+        configured_backends:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        available_devices:
+          type: array
+          description: >-
+            GPUs currently reported by device enumeration (nvidia-smi / HIP),
+            so clients can build explicit per-device backend_specs. AMD
+            entries only include devices the backend can use (wave32).
+          items:
+            $ref: '#/components/schemas/AvailableDevice'
+    AvailableDevice:
+      type: object
+      required: [vendor, index, name, memory_total_mib]
+      properties:
+        vendor: { type: string, enum: [nvidia, amd] }
+        index: { type: integer, minimum: 0 }
+        name: { type: string }
+        memory_total_mib: { type: integer, minimum: 0 }
+    MinerStatsResponse:
+      type: object
+      required: [version, lifecycle, running, mining]
+      properties:
+        version: { type: string }
+        lifecycle: { type: string, enum: [idle, starting, running, stopping, error] }
+        running: { type: boolean }
+        mining:
+          description: Null until the first sample of a mining session.
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/LiveMiningStats'
+    LiveMiningStats:
+      type: object
+      required: [state, uptime_secs, updated_at_unix_ms, hashrate_hps, average_hashrate_hps, total_hashes, submitted, accepted, rejected, devices]
+      properties:
+        state:
+          type: string
+          description: Mining state, for example `working`, `pool-disconnected` or `wallet-required`. Current rates read as zero in states where the miner is not hashing.
+        uptime_secs: { type: number, minimum: 0, description: Seconds since this mining session started. }
+        updated_at_unix_ms: { type: integer, minimum: 0 }
+        hashrate_hps: { type: number, minimum: 0, description: Current hashrate in H/s (zero once samples are 30 s old). }
+        average_hashrate_hps: { type: number, minimum: 0 }
+        total_hashes: { type: integer, minimum: 0 }
+        submitted: { type: integer, minimum: 0, description: Shares (pool mode) or blocks (daemon mode) submitted. }
+        accepted: { type: integer, minimum: 0 }
+        rejected: { type: integer, minimum: 0, description: Rejected or stale shares/blocks. }
+        devices:
+          type: array
+          items:
+            $ref: '#/components/schemas/LiveDeviceStats'
+    LiveDeviceStats:
+      type: object
+      required: [label, kind, device_index, pci_address, lanes, hashrate_hps, average_hashrate_hps]
+      properties:
+        label: { type: string, description: 'Backend instance label, for example `nvidia#1`.' }
+        kind: { type: string, enum: [cpu, nvidia, amd, metal] }
+        device_index: { type: [integer, 'null'], minimum: 0, description: GPU index for GPU backends. }
+        pci_address: { type: [string, 'null'], description: 'PCI address (`dddd:bb:dd.f`) of the GPU, when known.' }
+        lanes: { type: integer, minimum: 0 }
+        hashrate_hps: { type: number, minimum: 0 }
+        average_hashrate_hps: { type: number, minimum: 0 }

@@ -1,0 +1,145 @@
+---
+title: 'Modifier les réglages de seine : threads, CPU, GPU et pool'
+description: 'Désactivez le minage CPU ou GPU dans seine, fixez le nombre de threads, choisissez une carte graphique, gardez vos réglages à chaque démarrage et changez adresse ou pool.'
+tags: ['Guide de minage', 'Configuration', 'seine']
+faq:
+  - q: 'Comment désactiver le minage CPU dans seine ?'
+    a: 'Lancez seine avec l’option backend réglée sur votre carte graphique, nvidia ou amd. Utilisez les deux, séparées par une virgule, si la machine a les deux types de carte. Seine mine alors uniquement avec les cartes graphiques et laisse le processeur libre pour autre chose.'
+  - q: 'Comment désactiver le minage GPU dans seine ?'
+    a: 'Lancez seine avec l’option backend réglée sur cpu. Seine mine alors uniquement avec le processeur et laisse toutes les cartes graphiques libres pour les jeux et d’autres applications. Retirez l’option pour miner de nouveau avec le processeur et les cartes graphiques ensemble.'
+  - q: 'Combien de threads CPU dois-je utiliser ?'
+    a: 'Seine choisit le nombre de threads pour vous, vous n’avez donc à le fixer que si vous voulez laisser de la place à d’autres tâches. Chaque thread utilise environ 2 Go de RAM. Appuyez sur la touche moins dans le tableau de bord jusqu’à ce que votre ordinateur soit à l’aise, puis utilisez ce nombre.'
+  - q: 'Où seine enregistre-t-il ses réglages ?'
+    a: 'Seine enregistre votre adresse, votre pool et le nom du worker dans seine-data/seine.config.json, dans le dossier depuis lequel vous le lancez. Les options de threads et de backend n’y sont pas enregistrées : mettez-les dans un petit fichier de démarrage si vous les voulez à chaque lancement.'
+sourceHash: b5ca5a9a16d8
+translation: draft
+---
+
+Seine fonctionne bien sans aucun réglage. Ce guide couvre les changements que vous voudrez le plus probablement faire : désactiver le minage CPU ou GPU, utiliser moins de threads, choisir une carte graphique, et changer votre adresse ou votre pool.
+
+## Comment modifier un réglage de seine ?
+
+<Answer>
+Fermez seine, ouvrez un terminal dans son dossier et relancez-le avec le réglage ajouté à la commande, par exemple `./seine --threads 4`. Sous Windows, utilisez PowerShell et `.\seine.exe --threads 4`. Seine garde votre adresse et votre pool enregistrés : vous ne tapez que ce que vous voulez changer.
+</Answer>
+
+- **Windows :** ouvrez le dossier de seine dans l’Explorateur de fichiers, tapez `powershell` dans la barre d’adresse et appuyez sur Entrée.
+- **macOS et Linux :** ouvrez Terminal et allez dans le dossier de seine avec `cd`.
+
+Les exemples ci-dessous utilisent `./seine`. Sous Windows, tapez plutôt `.\seine.exe`.
+
+## Comment désactiver le minage CPU ou GPU ?
+
+Par défaut, seine mine avec votre CPU et toutes les cartes graphiques prises en charge. Le réglage `--backend` choisit lesquelles utiliser :
+
+| Ce que vous voulez | Ajoutez ceci |
+|---|---|
+| CPU seulement, GPU désactivé | `--backend cpu` |
+| GPU NVIDIA seulement, CPU désactivé | `--backend nvidia` |
+| GPU AMD seulement, CPU désactivé | `--backend amd` |
+| GPU NVIDIA et AMD, CPU désactivé | `--backend nvidia,amd` |
+
+Par exemple, pour miner avec une carte NVIDIA et laisser le CPU libre :
+
+```sh
+./seine --backend nvidia
+```
+
+Le panneau Devices du [tableau de bord](/fr/blog/seine-dashboard-explained/) affiche une ligne pour chaque appareil qui mine.
+
+## Comment utiliser moins de threads CPU ?
+
+Ajoutez `--threads` avec le nombre voulu :
+
+```sh
+./seine --threads 4
+```
+
+Chaque thread utilise environ 2 Go de RAM, donc 4 threads en utilisent environ 8 Go. Seine garde ce nombre jusqu’à ce que vous retiriez le réglage.
+
+Pour trouver un bon nombre, lancez seine normalement et appuyez sur `-` dans le tableau de bord pour retirer un thread, ou sur `+` pour en ajouter un. Le changement prend un instant et le tableau de bord affiche le nouveau nombre. Arrêtez-vous quand votre ordinateur est à l’aise, puis utilisez ce nombre avec `--threads`, car les touches ne valent que jusqu’à la fermeture de seine.
+
+Pour laisser seine choisir lui-même un nombre de threads plus léger, utilisez plutôt ceci :
+
+```sh
+./seine --cpu-profile efficiency
+```
+
+Le [guide pour ordinateur de bureau](/fr/blog/mine-while-using-pc/) en dit plus sur le minage pendant que vous utilisez votre ordinateur.
+
+## Comment choisir une seule carte graphique ?
+
+Ajoutez le numéro de la carte. La première carte est `0` :
+
+```sh
+./seine --backend cpu,nvidia --nvidia-devices 0
+```
+
+Cela mine avec le CPU et la première carte NVIDIA. Utilisez `--nvidia-devices 0,1` pour deux cartes, et retirez `cpu,` pour désactiver le CPU. Les cartes AMD fonctionnent de la même façon :
+
+```sh
+./seine --backend cpu,amd --amd-devices 0
+```
+
+Pour laisser de la mémoire vidéo libre pour d’autres applications, utilisez `--nvidia-max-lanes 2` ou `--amd-max-lanes 2`. Chaque lane utilise environ 2 Go de mémoire vidéo. Les graphiques Radeon intégrés restent désactivés sauf si vous ajoutez vous-même `--backend amd`.
+
+## Comment garder vos réglages à chaque démarrage ?
+
+Seine enregistre tout seul votre adresse, votre pool et le nom du worker. Les réglages comme `--threads` et `--backend` ne valent que pour cette exécution : mettez-les dans un petit fichier de démarrage et ouvrez ce fichier à la place de seine.
+
+Sous Windows, ouvrez le Bloc-notes, tapez ces lignes avec vos propres réglages et enregistrez le fichier dans le dossier de seine sous le nom `start-mining.bat`, avec **Type** réglé sur **Tous les fichiers** :
+
+```bat
+seine.exe --backend cpu --threads 4
+pause
+```
+
+Double-cliquez sur `start-mining.bat` pour commencer à miner. La ligne `pause` garde la fenêtre ouverte si seine s’arrête, pour que vous puissiez lire son dernier message.
+
+Sous macOS ou Linux, enregistrez ces lignes dans le dossier de seine sous le nom `start-mining.sh` :
+
+```sh
+#!/bin/sh
+cd "$(dirname "$0")"
+./seine --backend cpu --threads 4
+```
+
+Exécutez `chmod +x start-mining.sh` une fois, puis commencez à miner avec `./start-mining.sh`. Les mises à jour automatiques relancent seine avec les mêmes réglages. Pour miner dès que vous ouvrez une session Windows, suivez le [guide du démarrage automatique](/fr/blog/start-miner-automatically-windows/).
+
+## Comment changer votre adresse, votre pool ou le nom du worker ?
+
+Fermez seine et ouvrez `seine-data/seine.config.json` dans un éditeur de texte. Ce dossier se trouve dans celui depuis lequel vous lancez seine. Changez la valeur voulue et enregistrez le fichier :
+
+```json
+{
+  "schema_version": 1,
+  "mode": "pool",
+  "address": "@yourname",
+  "pool_url": "stratum+tcp://bntpool.com:3333",
+  "pool_worker": "desktop-01"
+}
+```
+
+Laissez les autres lignes telles quelles. Gardez les guillemets et les virgules, et n’ajoutez ni votre phrase de récupération ni vos clés privées à ce fichier.
+
+Pour utiliser une valeur différente pour une seule exécution, ajoutez-la à la commande. Le fichier enregistré ne change pas :
+
+```sh
+./seine --pool-worker desktop-02
+```
+
+Les deux autres réglages sont `--address` et `--pool-url`. Le [guide de changement d’adresse](https://bntpool.com/blog/fr/change-mining-wallet-address/) explique comment le pool crédite votre travail après un changement d’adresse.
+
+## Que faire si un réglage ne fonctionne pas ?
+
+| Ce que vous voyez | Que faire |
+|---|---|
+| `--nvidia-devices requires selecting nvidia in --backend` | Ajoutez `nvidia` au backend : `--backend cpu,nvidia`. Il en va de même pour `amd`. |
+| `configured CPU lanes need` plus de RAM | Utilisez un nombre plus bas avec `--threads`, environ un thread pour 2 Go de RAM libre. |
+| `all GPU backends failed to start` | Installez le pilote actuel de votre carte. Le [guide AMD](https://github.com/zpalmtree/seine/blob/master/docs/guides/amd.md) indique ce dont les cartes AMD ont besoin sous Linux. |
+| Seine vous redemande votre adresse | Lancez seine depuis le même dossier qu’avant, ou définissez le dossier avec `--data-dir`. |
+| Vos réglages sont revenus en automatique | Lancez seine depuis votre fichier de démarrage. Les touches `-` et `+` ne valent que jusqu’à la fermeture de seine. |
+
+La [référence des options](https://github.com/zpalmtree/seine/blob/master/docs/MINER_FLAGS.md) liste tous les réglages.
+
+<CTA target="seine" title="Téléchargez la version actuelle de seine" text="Téléchargez seine, lancez-le une fois, puis ajoutez seulement les réglages que vous voulez changer." />

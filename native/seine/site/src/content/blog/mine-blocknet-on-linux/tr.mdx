@@ -1,0 +1,87 @@
+---
+title: 'Linux’ta Blocknet nasıl kazılır?'
+description: "Linux: Seine’ı indirin, arşivi çıkarın, Blocknet adresinizi girin ve bntpool.com üzerinde kabul edilen payları kontrol edin. Otomatik ayarlarla başlayın; performans önerileri kurulumdan sonra gelir."
+tags: ['Madencilik rehberi', 'Linux', 'NVIDIA']
+faq:
+  - q: 'Hangi Linux arşivini indirmeliyim?'
+    a: "İndirme bölümünü açın. uname -m komutunu çalıştırın: x86_64 için seine-linux-x86_64.tar.gz, aarch64 için seine-linux-aarch64.tar.gz seçin. Linux sürümleri glibc 2.31 veya yenisini gerektirir. x86_64 sürümü CPU ve NVIDIA’yı, ARM64 ise CPU madenciliğini destekler."
+  - q: 'seine’i sudo ile mi çalıştırmalıyım?'
+    a: 'Normal madenciyi yazılabilir bir klasörden kendi kullanıcınızla çalıştırın. Arşivi açın, gerekirse dosya sahibine çalıştırma izni verin ve ./seine ile başlatın. Ayrılmış huge pages hazırlamak ayrı bir yönetim işidir; normal başlatma sıradan bellek sayfalarını kullanabilir.'
+  - q: 'Linux’ta NVIDIA ile madencilik için CUDA veya NVRTC gerekir mi?'
+    a: 'Hayır. NVIDIA sürücüsü yeterlidir. seine, NVRTC kuruluysa onu kullanır; değilse seine içine gömülü, GeForce GTX 10 serisi ve daha yeni kartları kapsayan kernel’ları yükler. Sürücüyü yükleyin, seine’ı başlatın ve kartınızın Devices panelinde göründüğünü kontrol edin.'
+sourceHash: acdcb56b3c1f
+translation: draft
+---
+
+## Linux’ta Blocknet madenciliğine nasıl başlanır?
+
+<Answer>
+Seine’ı indirin, arşivi çıkarın, Blocknet adresinizi girin ve bntpool.com üzerinde kabul edilen payları kontrol edin. Otomatik ayarlarla başlayın; performans önerileri kurulumdan sonra gelir.
+</Answer>
+
+## 1. adım: doğru sürümü indirin
+
+[İndirme bölümünü](/tr/#download) açın. `uname -m` komutunu çalıştırın: `x86_64` için `seine-linux-x86_64.tar.gz`, `aarch64` için `seine-linux-aarch64.tar.gz` seçin. Linux sürümleri glibc 2.31 veya yenisini gerektirir. x86_64 sürümü CPU ve NVIDIA’yı, ARM64 ise CPU madenciliğini destekler.
+
+<img src="/assets/blog/setup-download.webp" alt="Linux ve Linux ARM64 arşivlerini gösteren resmi indirme tablosu" loading="lazy" />
+
+## 2. adım: çıkarın ve başlatın
+
+Terminal’i açın. Bu komutlar arşivin Downloads klasöründe olduğunu varsayar; farklıysa gerçek konumu kullanın. ARM64 üzerinde `seine-linux-x86_64.tar.gz` yerine `seine-linux-aarch64.tar.gz` kullanın. Seine’ı ev klasörünüze çıkarıp başlatırlar:
+
+```sh
+mkdir -p "$HOME/seine"
+tar -xzf "$HOME/Downloads/seine-linux-x86_64.tar.gz" -C "$HOME/seine"
+cd "$HOME/seine"
+./seine
+```
+
+## 3. adım: cüzdan adresinizi girin
+
+Herkese açık Blocknet alma adresinizi veya kayıtlı `@name` adınızı yapıştırın, ardından `stratum+tcp://bntpool.com:3333` adresini kabul etmek için Enter’a basın. [Cüzdan rehberi](/tr/blog/blocknet-wallet-for-mining/) adresinizi nerede bulacağınızı gösterir. Seine, kurtarma ifadenizi veya harcama anahtarlarınızı istemez. Havuz işçisi adını otomatik atar.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="İlk açılıştaki adres ve havuz soruları. Örneği kendi adresiniz veya kayıtlı adınızla değiştirin." loading="lazy" />
+  </picture>
+  <figcaption>İlk açılıştaki adres ve havuz soruları. Örneği kendi adresiniz veya kayıtlı adınızla değiştirin.</figcaption>
+</figure>
+
+Seine iş parçacıklarını seçer ve otomatik ayar yapar. Sonraki açılışlarda `seine-data/seine.config.json` dosyasını yeniden kullanmak için aynı klasörden başlatın.
+
+## 4. adım: kabul edilen payları kontrol edin
+
+[Panelde](/tr/blog/seine-dashboard-explained/) hashrate değerini ve artan **Accepted** sayacını arayın. Kabul edilen bir pay, havuzun çalışmanızı aldığını doğrular; ödeme yapıldığı anlamına gelmez. Durdurmak için `q` veya `Ctrl+C` kullanın.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="Örnek verilerle seine’ın gerçek paneli. Accepted sayacına bakın; bu sayılar performans ölçümü değildir." loading="lazy" />
+  </picture>
+  <figcaption>Örnek verilerle seine’ın gerçek paneli. Accepted sayacına bakın; bu sayılar performans ölçümü değildir.</figcaption>
+</figure>
+
+[İstatistiklerim](https://bntpool.com/stats?lang=tr) sayfasını açıp aynı adresi veya kayıtlı adı girerek işçinizi, paylarınızı ve bakiyenizi bulun.
+
+## Linux’ta GPU madenciliği için neye ihtiyacınız var?
+
+NVIDIA kartları yalnızca NVIDIA sürücüsüne ihtiyaç duyar. AMD kartları, [AMD rehberinde](https://github.com/zpalmtree/seine/blob/master/docs/guides/amd.md) anlatıldığı gibi amdgpu sürücüsüne ve ROCm HIP çalışma zamanına ihtiyaç duyar. seine kartlarınızı kendisi bulur ve x86_64 sürümünde CPU ile birlikte onlarla kazar. [NVIDIA rehberi](/tr/blog/mine-blocknet-nvidia-gpu/), kart seçmeyi ve GPU paylarını kontrol etmeyi anlatır.
+
+<MinerSettings os="linux" />
+
+## Linux başlatma hatası nasıl çözülür?
+
+Sonraki kontrolü ilk hata mesajına göre seçin:
+
+| Mesaj veya belirti | Kontrol edilecekler |
+|---|---|
+| `Exec format error` | Yanlış mimari: `uname -m` çıktısını arşiv adıyla karşılaştırın. |
+| `GLIBC_... not found` | İkili dosya daha yeni glibc gerektiriyor. Uyumlu sistem kullanın veya kaynaktan derleyin; sistem C kitaplığını dağıtımınız yönetmeye devam etsin. |
+| `Permission denied` | Kullanıcının çalıştırma iznini kontrol edin ve çalıştırmaya izin veren bir dosya sistemindeki klasörü kullanın. |
+
+Paylar kabul edilince [huge pages rehberi](/tr/blog/huge-pages-blocknet-mining/) isteğe bağlı Linux sayfa ayarlarını açıklar. [Sunucu rehberi](/tr/blog/mine-blocknet-on-servers/) grafik arayüzsüz çalışmayı ve NUMA yerleşimini kapsar. Bu ilk çalıştırma için ikisi de gerekmez; makinenizdeki etkisini anlayabilmek için değişiklikleri tek tek yapın.
+
+<CTA target="seine" title="Linux için seine indirin" text="Linux indirmesini çıkarın, adresinizi girin ve otomatik CPU ayarıyla madenciliğe başlayın." />
+
+[İstatistiklerim](https://bntpool.com/stats?lang=tr) sayfasını açıp aynı adresi veya kayıtlı adı girerek işçinizi, paylarınızı ve bakiyenizi bulun.

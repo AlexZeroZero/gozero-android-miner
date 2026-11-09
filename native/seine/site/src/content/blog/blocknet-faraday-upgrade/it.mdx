@@ -1,0 +1,68 @@
+---
+title: 'L’aggiornamento Faraday di Blocknet, spiegato'
+description: 'Scopri la proposta Faraday di Blocknet: privacy post-quantistica, migrazione, parole di recupero e tempi dei blocchi, con indicazioni per prepararti.'
+tags: ['Blocknet', 'Faraday', 'Aggiornamento della rete']
+faq:
+  - q: 'Faraday è già attivo su Blocknet?'
+    a: 'L’articolo ufficiale del 27 ottobre 2026 descrive Faraday come un aggiornamento ancora in sviluppo e in fase di test, previsto per febbraio 2027 al blocco 103.680. Date, cifre e progettazione possono cambiare prima del rilascio. Sono regole proposte: usa le istruzioni pubblicate del wallet e del miner per la rete attuale.'
+  - q: 'Le mie parole di recupero Blocknet continueranno a funzionare?'
+    a: 'Il piano annunciato manterrebbe valide le frasi esistenti di 12 parole, mentre i nuovi wallet riceverebbero 24 parole. I wallet importati da chiavi senza parole di recupero richiederebbero un nuovo wallet e il trasferimento delle monete. Conserva il backup attuale e segui le istruzioni definitive al rilascio dell’aggiornamento.'
+  - q: 'Cosa dovranno fare i possessori di monete al lancio di Faraday?'
+    a: 'Il piano concede un anno dall’attivazione per migrare le monete tramite il wallet. Dopo il termine, le monete non migrate diventerebbero definitivamente non spendibili; quelle migrate attenderebbero circa una settimana prima di poter essere spese. I passaggi definitivi non sono ancora pubblicati: un backup del wallet non esegue la migrazione.'
+sourceHash: 7645976ef060
+translation: draft
+---
+
+Segui la proposta Faraday di Blocknet e prepara le verifiche di wallet, nodo e miner che ti riguardano. Questa guida integra la [spiegazione ufficiale del 27 ottobre 2026](https://blocknetcrypto.com/blog/2026-10-27-how-blocknet-privacy-survives-quantum-computers/). Faraday è ancora in sviluppo e in fase di test: il progetto precisa che date, cifre e dettagli possono cambiare. Ogni modifica Faraday descritta qui fa parte di quel piano futuro.
+
+## Cos’è l’aggiornamento Faraday di Blocknet?
+
+<Answer>
+Faraday è un aggiornamento previsto della blockchain esistente di Blocknet. Propone prove di spesa basate su hash, rilevamento dei pagamenti tramite ML-KEM e privacy della spesa nell’insieme delle monete Faraday. La transizione annunciata comprende migrazione dei wallet, nuovi formati di indirizzo e recupero e variazioni dei tempi dei blocchi. La cronologia della blockchain proseguirebbe.
+</Answer>
+
+<img src="/assets/blog/blocknet-faraday-upgrade.svg" alt="Una blockchain esistente continua dopo un aggiornamento proposto, con un passaggio separato di migrazione del wallet e un calendario della transizione prevista." width="1200" height="675" loading="lazy" />
+
+## Come cambierebbero la privacy e le prove di spesa?
+
+Il progetto annunciato sostituisce i meccanismi a curve ellittiche che proteggono le monete con meccanismi post-quantistici. Le spese userebbero prove basate su hash costruite con Plonky3 e i wallet rileverebbero i pagamenti in entrata tramite ML-KEM. Il progetto li presenta come parti dello stesso aggiornamento. La [guida alla privacy attuale](/it/blog/blocknet-privacy-features/) spiega i meccanismi della rete di oggi; non descrive una rete Faraday già attiva.
+
+L’anello attuale comprende 16 membri. Nel nuovo piano, una spesa si nasconderebbe nell’intero insieme delle monete Faraday, che crescerebbe con l’ingresso di monete in quel formato. L’annuncio descrive anche la combinazione delle prove individuali in una prova di blocco e la loro eliminazione individuale dopo la finalità. Sono descrizioni del progetto, non funzioni testate da questa guida sulla mainnet. Segui l’implementazione pubblicata e la documentazione durante lo sviluppo.
+
+## Quando è prevista l’attivazione di Faraday?
+
+Il nuovo annuncio punta a febbraio 2027, vicino al primo anniversario della mainnet, al blocco 103.680. Il [riepilogo ufficiale](https://blocknetcrypto.com/#faraday) indica approssimativamente il 16 febbraio. L’altezza di attivazione e la stima sul calendario hanno ruoli diversi: la produzione reale dei blocchi determina quando si raggiunge un’altezza e i test possono modificare il piano. Mantieni questo carattere provvisorio nei promemoria.
+
+Il periodo di migrazione proposto dura un anno dopo l’attivazione. Pianifica in base alle condizioni finali di attivazione e chiusura pubblicate dal progetto, senza considerare un promemoria come una conferma. Registra la fonte ufficiale e la data dell’ultima consultazione. Ricontrolla quando esce una versione compatibile del wallet o del core; pubblicare un articolo non significa che l’aggiornamento sia attivo.
+
+## Come migrerebbero le monete esistenti?
+
+Faraday proseguirebbe la blockchain esistente e la sua cronologia mentre i possessori trasferiscono le monete al nuovo formato tramite i wallet. L’annuncio indica che i passaggi esatti saranno pubblicati prima dell’attivazione. Propone inoltre un’attesa di circa una settimana prima di poter spendere le monete migrate. Considera questa attesa prevista quando pianifichi l’accesso ai fondi e verifica le istruzioni definitive prima di agire.
+
+Secondo le regole annunciate, le monete non migrate al termine dell’anno diventerebbero definitivamente non spendibili. Completa la migrazione documentata entro il termine e verifica il risultato nel wallet. Un [backup del wallet](/it/blog/blocknet-wallet-backup-restore/) conserva il materiale di recupero, ma non migra da solo le monete. Qui non viene fornito alcun comando di migrazione: usa la procedura della versione che la supporterà effettivamente quando sarà disponibile.
+
+## Cosa succede alle parole di recupero e agli indirizzi?
+
+L’articolo ufficiale afferma che le frasi esistenti di 12 parole continuerebbero a funzionare e che i nuovi wallet riceverebbero 24 parole. Per un wallet importato da chiavi che non ha mai avuto parole di recupero, il piano richiede un nuovo wallet e un trasferimento delle monete. Controlla il materiale di recupero del wallet attuale e proteggilo ora. La [guida al backup e al ripristino](/it/blog/blocknet-wallet-backup-restore/) riguarda il software attualmente pubblicato, non futuri comandi di recupero Faraday.
+
+Gli indirizzi post-quantistici proposti hanno circa 1.700 caratteri. Copia e incolla e codici QR sono i metodi annunciati per usarli, mentre i [nomi Blocknet ID](/it/blog/blocknet-id-pay-by-name/) offrono un identificativo di pagamento più breve. Segui il formato del wallet aggiornato al rilascio e confronta il destinatario risolto prima di confermare un pagamento. Un esempio di indirizzo attuale non va riutilizzato come indirizzo di test del formato futuro.
+
+## Come cambierebbero i tempi dei blocchi e le ricompense?
+
+L’annuncio propone di portare il tempo obiettivo di blocco da 5 a 10 minuti e raddoppiare la ricompensa per blocco durante la transizione. Metà dei blocchi previsti con una ricompensa doppia manterrebbe il ritmo di emissione previsto; non raddoppierebbe le monete emesse al giorno. La [guida al calendario delle ricompense](https://bntpool.com/blog/it/blocknet-block-reward-schedule/) descrive il calendario attuale. Leggi le cifre future insieme alle ipotesi sul mese del fork e sui tempi.
+
+La stessa proposta fissa la profondità massima di riorganizzazione a 60 blocchi e mantiene un’attesa di 60 blocchi per spendere monete appena minate. Con l’obiettivo proposto di 10 minuti, equivale a circa 10 ore. I wallet attenderebbero ancora 10 conferme per indicare un pagamento come sicuro, cioè circa 100 minuti. Sono stime basate su obiettivi, non tempi garantiti: gli intervalli reali variano e le regole finali devono ancora essere confermate.
+
+## Cosa devono preparare gli operatori di nodi e i miner?
+
+Annota versione del core, rete, directory dei dati e servizi dipendenti. L’annuncio descrive aggiornamenti automatici del nodo, ma gli operatori devono verificare la propria politica delle versioni e la versione che implementerà il fork. La [guida al nodo](/it/blog/run-blocknet-node/) copre il funzionamento attuale, incluso il blocco a una versione specifica. Pianifica i riavvii considerando wallet, explorer e pool, poi controlla peer, avanzamento della blockchain e riconnessioni.
+
+Anche il mining cambia al fork e l’annuncio rimanda a un articolo dedicato. Non fornisce parametri futuri di seine, classifiche hardware o una procedura di transizione del pool. Usa la [guida attuale ad Argon2id](/it/blog/argon2id-proof-of-work-explained/) e la [configurazione di bntpool](https://bntpool.com/blog/it/mine-blocknet-on-bntpool/) per la rete di oggi. Quando arriveranno versioni compatibili e istruzioni, verifica miner e pool insieme e controlla che vengano accettate nuove share dopo l’aggiornamento.
+
+## Separa la migrazione delle monete dagli aggiornamenti software
+
+Tieni un breve registro: posizione del backup verificato, materiale di recupero disponibile, versioni di wallet e core in uso e istruzioni ufficiali ancora attese. Registra aggiornamenti del nodo, del miner e migrazione delle monete come attività separate, ognuna con verifiche proprie. Scaricare una versione o vedere il nodo sincronizzarsi non dimostra che le monete siano migrate.
+
+L’articolo ufficiale descrive test continui del verificatore, confronti tra un’implementazione di riferimento e i circuiti di prova e misurazioni pubbliche. Questi resoconti spiegano lo sviluppo del progetto; la versione finale resta la fonte delle istruzioni operative. Rileggi l’annuncio con l’avanzare del calendario, aggiorna i promemoria e registra il risultato della migrazione quando sarà disponibile. Nel frattempo mantieni backup aggiornati e usa la [guida al wallet](/it/blog/blocknet-wallet-for-mining/) per le operazioni attuali.
+
+<CTA target="seine" title="Segui il mining di Blocknet con seine" text="Esplora il miner attuale e conserva le sue istruzioni pubblicate insieme al tuo piano di aggiornamento di Blocknet." />

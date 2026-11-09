@@ -1,0 +1,87 @@
+---
+title: 'Como minerar Blocknet no Linux'
+description: "Linux: Baixe o seine, extraia os arquivos, informe seu endereço Blocknet e confirme as shares aceitas no bntpool.com. Comece com os ajustes automáticos; as dicas de desempenho vêm depois da configuração."
+tags: ['Guia de mineração', 'Linux', 'NVIDIA']
+faq:
+  - q: 'Qual arquivo do Linux devo baixar?'
+    a: "Abra a seção de downloads. Execute uname -m: escolha seine-linux-x86_64.tar.gz para x86_64 ou seine-linux-aarch64.tar.gz para aarch64. As versões Linux exigem glibc 2.31 ou mais recente. A versão x86_64 aceita CPU e NVIDIA; ARM64 aceita mineração com CPU."
+  - q: 'Preciso executar seine com sudo?'
+    a: 'Execute o minerador normalmente com seu próprio usuário em uma pasta gravável. Extraia o arquivo, conceda permissão de execução ao proprietário se necessário e inicie com ./seine. Reservar huge pages é uma tarefa administrativa separada; o início normal pode usar páginas comuns.'
+  - q: 'Preciso de CUDA ou NVRTC para minerar com NVIDIA no Linux?'
+    a: 'Não. O driver da NVIDIA basta. O seine usa o NVRTC quando ele está instalado e, caso contrário, carrega os kernels embutidos no seine, que cobrem placas GeForce da série GTX 10 e mais novas. Instale o driver, inicie o seine e confira se a sua placa aparece no painel Devices.'
+sourceHash: acdcb56b3c1f
+translation: draft
+---
+
+## Como começar a minerar Blocknet no Linux?
+
+<Answer>
+Baixe o seine, extraia os arquivos, informe seu endereço Blocknet e confirme as shares aceitas no bntpool.com. Comece com os ajustes automáticos; as dicas de desempenho vêm depois da configuração.
+</Answer>
+
+## Passo 1: baixe a versão certa
+
+Abra a [seção de downloads](/pt-br/#download). Execute `uname -m`: escolha `seine-linux-x86_64.tar.gz` para `x86_64` ou `seine-linux-aarch64.tar.gz` para `aarch64`. As versões Linux exigem glibc 2.31 ou mais recente. A versão x86_64 aceita CPU e NVIDIA; ARM64 aceita mineração com CPU.
+
+<img src="/assets/blog/setup-download.webp" alt="Tabela oficial de downloads com arquivos Linux e Linux ARM64" loading="lazy" />
+
+## Passo 2: extraia e execute
+
+Abra o Terminal. Estes comandos pressupõem que o arquivo está na pasta Downloads; use o caminho real se for diferente. No ARM64, substitua `seine-linux-x86_64.tar.gz` por `seine-linux-aarch64.tar.gz`. Eles extraem o seine para sua pasta pessoal e o executam:
+
+```sh
+mkdir -p "$HOME/seine"
+tar -xzf "$HOME/Downloads/seine-linux-x86_64.tar.gz" -C "$HOME/seine"
+cd "$HOME/seine"
+./seine
+```
+
+## Passo 3: informe o endereço da carteira
+
+Cole seu endereço público de recebimento Blocknet ou seu `@name` registrado e pressione Enter para aceitar `stratum+tcp://bntpool.com:3333`. O [guia da carteira](/pt-br/blog/blocknet-wallet-for-mining/) mostra onde encontrar o endereço. O seine não precisa da sua frase de recuperação nem das chaves de gasto. Ele atribui automaticamente um nome ao worker no pool.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="Perguntas de endereço e pool no primeiro início. Substitua o exemplo pelo seu endereço ou nome registrado." loading="lazy" />
+  </picture>
+  <figcaption>Perguntas de endereço e pool no primeiro início. Substitua o exemplo pelo seu endereço ou nome registrado.</figcaption>
+</figure>
+
+O seine escolhe as threads e faz o ajuste automaticamente. Nos próximos inícios, execute-o da mesma pasta para reutilizar `seine-data/seine.config.json`.
+
+## Passo 4: confira as shares aceitas
+
+Procure uma taxa de hash e um contador **Accepted** aumentando no [painel](/pt-br/blog/seine-dashboard-explained/). Uma share aceita confirma que o pool recebeu seu trabalho; não significa que já houve um pagamento. Pressione `q` ou `Ctrl+C` para parar.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="Painel real do seine com dados de exemplo. Procure Accepted; estes números não são um benchmark." loading="lazy" />
+  </picture>
+  <figcaption>Painel real do seine com dados de exemplo. Procure Accepted; estes números não são um benchmark.</figcaption>
+</figure>
+
+Abra [Minhas estatísticas](https://bntpool.com/stats?lang=pt-br) e informe o mesmo endereço ou nome registrado para encontrar seu worker, shares e saldo.
+
+## O que você precisa para minerar com GPU no Linux?
+
+As placas NVIDIA precisam apenas do driver da NVIDIA. As placas AMD precisam do driver amdgpu e do runtime ROCm HIP, como explica o [guia da AMD](https://github.com/zpalmtree/seine/blob/master/docs/guides/amd.md). O seine encontra suas placas sozinho e minera nelas junto com a CPU na versão x86_64. O [guia da NVIDIA](/pt-br/blog/mine-blocknet-nvidia-gpu/) explica como escolher placas e conferir as shares da GPU.
+
+<MinerSettings os="linux" />
+
+## Como resolver um erro de inicialização no Linux?
+
+Use a primeira mensagem de erro para escolher a próxima verificação:
+
+| Mensagem ou sintoma | O que conferir |
+|---|---|
+| `Exec format error` | Arquitetura incorreta: compare `uname -m` com o nome do arquivo. |
+| `GLIBC_... not found` | O binário exige uma glibc mais recente. Use um sistema compatível ou compile o código-fonte; mantenha a biblioteca C do sistema sob a gestão da distribuição. |
+| `Permission denied` | Confira a permissão de execução do usuário e use uma pasta em um sistema de arquivos que permita executar. |
+
+Depois de receber shares aceitas, consulte o [guia de huge pages](/pt-br/blog/huge-pages-blocknet-mining/) para a configuração opcional no Linux. O [guia de servidores](/pt-br/blog/mine-blocknet-on-servers/) cobre operação sem interface gráfica e posicionamento NUMA. Nenhuma dessas preparações é exigida neste primeiro início; faça cada mudança separadamente para identificar seu efeito na máquina.
+
+<CTA target="seine" title="Baixe seine para Linux" text="Extraia o download para Linux, informe seu endereço e comece a minerar com ajuste automático da CPU." />
+
+Abra [Minhas estatísticas](https://bntpool.com/stats?lang=pt-br) e informe o mesmo endereço ou nome registrado para encontrar seu worker, shares e saldo.

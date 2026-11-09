@@ -1,0 +1,4004 @@
+#[cfg(target_arch = "x86_64")]
+mod avx512_256;
+#[cfg(target_arch = "x86_64")]
+mod avx512_reg;
+
+#[cfg(feature = "cpu-research")]
+pub(crate) mod research;
+
+use crate::CpuKernel;
+use std::convert::TryInto;
+use std::num::Wrapping;
+
+use blake2::digest::{Digest, VariableOutput};
+use blake2::{Blake2b512, Blake2bVar};
+
+const ARGON2_VERSION_13: u32 = 0x13;
+const ARGON2_TYPE_ID: u32 = 2;
+const ARGON2_LANES: u32 = 1;
+const ARGON2_T_COST: u32 = 1;
+#[allow(dead_code)]
+const ISA_SCALAR: u8 = 0;
+#[allow(dead_code)]
+const ISA_AVX2: u8 = 1;
+#[allow(dead_code)]
+const ISA_AVX512: u8 = 2;
+#[allow(dead_code)]
+const ISA_NEON: u8 = 3;
+#[allow(dead_code)]
+const ISA_AVX512_256: u8 = 4;
+#[allow(dead_code)]
+const ISA_AVX512_256_STREAM: u8 = 5;
+#[allow(dead_code)]
+const ISA_NEON_SHA3: u8 = 6;
+#[allow(dead_code)]
+const ISA_AVX512_256_STREAM_R8D2: u8 = 7;
+#[allow(dead_code)]
+const ISA_AVX512_256_STREAM_R64D3: u8 = 8;
+#[allow(dead_code)]
+const ISA_AVX512_256_STREAM_R64D4: u8 = 9;
+#[allow(dead_code)]
+const ISA_AVX512_256_STREAM_R64D6: u8 = 10;
+#[allow(dead_code)]
+const ISA_AVX2_STREAM: u8 = 11;
+#[allow(dead_code)]
+const ISA_AVX512_STREAM: u8 = 12;
+#[allow(dead_code)]
+const ISA_AVX512_256_STREAM_L2: u8 = 13;
+#[allow(dead_code)]
+const ISA_AVX512_STREAM_L2: u8 = 14;
+const ADDRESSES_IN_BLOCK: usize = 128;
+const SYNC_POINTS: usize = 4;
+/// `hash_password_into_with_memory_until` also asks its stop hook every
+/// 32Ki blocks inside a slice (64 times per 2 GiB hash), so an abandoned
+/// hash stops within about 1/64 of a hash time.
+const STOP_CHECK_MASK: usize = (1 << 15) - 1;
+const MAX_PWD_LEN: usize = 0xFFFF_FFFF;
+const MIN_SALT_LEN: usize = 8;
+const MAX_SALT_LEN: usize = 0xFFFF_FFFF;
+const MIN_OUTPUT_LEN: usize = 4;
+const TRUNC: u64 = u32::MAX as u64;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Error {
+    PwdTooLong,
+    SaltTooShort,
+    SaltTooLong,
+    OutputTooShort,
+    OutputTooLong,
+    MemoryTooLittle,
+    UnsupportedKernel,
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[inline(always)]
+const fn isa_label(isa: u8) -> &'static str {
+    match isa {
+        ISA_AVX2 => "avx2",
+        ISA_AVX512 => "avx512",
+        ISA_AVX512_256 => "avx512-256",
+        ISA_AVX512_256_STREAM => "avx512-256-stream",
+        ISA_NEON => "neon",
+        ISA_NEON_SHA3 => "neon-sha3",
+        ISA_AVX512_256_STREAM_R8D2 => "avx512-256-stream-r8d2",
+        ISA_AVX512_256_STREAM_R64D3 => "avx512-256-stream-r64d3",
+        ISA_AVX512_256_STREAM_R64D4 => "avx512-256-stream-r64d4",
+        ISA_AVX512_256_STREAM_R64D6 => "avx512-256-stream-r64d6",
+        ISA_AVX2_STREAM => "avx2-stream",
+        ISA_AVX512_STREAM => "avx512-stream",
+        ISA_AVX512_256_STREAM_L2 => "avx512-256-stream-l2",
+        ISA_AVX512_STREAM_L2 => "avx512-stream-l2",
+        _ => "scalar",
+    }
+}
+
+#[inline]
+fn detect_isa() -> u8 {
+    kernel_isa(CpuKernel::preferred())
+}
+
+const fn kernel_isa(kernel: CpuKernel) -> u8 {
+    match kernel {
+        CpuKernel::Scalar => ISA_SCALAR,
+        CpuKernel::Avx2 => ISA_AVX2,
+        CpuKernel::Avx512 => ISA_AVX512,
+        CpuKernel::Avx512256 => ISA_AVX512_256,
+        CpuKernel::Avx512256Stream => ISA_AVX512_256_STREAM,
+        CpuKernel::Neon => ISA_NEON,
+        CpuKernel::NeonSha3 => ISA_NEON_SHA3,
+        CpuKernel::Avx512256StreamR8D2 => ISA_AVX512_256_STREAM_R8D2,
+        CpuKernel::Avx512256StreamR64D3 => ISA_AVX512_256_STREAM_R64D3,
+        CpuKernel::Avx512256StreamR64D4 => ISA_AVX512_256_STREAM_R64D4,
+        CpuKernel::Avx512256StreamR64D6 => ISA_AVX512_256_STREAM_R64D6,
+        CpuKernel::Avx2Stream => ISA_AVX2_STREAM,
+        CpuKernel::Avx512Stream => ISA_AVX512_STREAM,
+        CpuKernel::Avx512256StreamL2 => ISA_AVX512_256_STREAM_L2,
+        CpuKernel::Avx512StreamL2 => ISA_AVX512_STREAM_L2,
+        CpuKernel::Avx512StreamSkip => ISA_AVX512_STREAM,
+        CpuKernel::Avx2StreamSkip => ISA_AVX2_STREAM,
+    }
+}
+
+pub fn active_isa_label() -> &'static str {
+    isa_label(detect_isa())
+}
+
+pub fn compiled_isa_variants() -> &'static [&'static str] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        &[
+            "scalar",
+            "avx2",
+            "avx512",
+            "avx512-256",
+            "avx512-256-stream",
+            "avx512-256-stream-r8d2",
+            "avx512-256-stream-r64d3",
+            "avx512-256-stream-r64d4",
+            "avx512-256-stream-r64d6",
+            "avx2-stream",
+            "avx512-stream",
+            "avx512-256-stream-l2",
+            "avx512-stream-l2",
+        ]
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        &["scalar", "neon", "neon-sha3"]
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        &["scalar"]
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FixedArgon2id {
+    requested_memory_kib: u32,
+    block_count: usize,
+    segment_length: usize,
+    data_independent_ref_indexes: Box<[usize]>,
+    isa: u8,
+    side_cache: Option<SideCacheSchedule>,
+    /// First block whose odd-indexed successors skip the arena store
+    /// (`usize::MAX` = store everything). See `set_skip_store_permille`.
+    skip_from: usize,
+    /// A skipped-store kernel (`Avx512StreamSkip`, `Avx2StreamSkip`) is active: skip
+    /// from `KERNEL_SKIP_PERMILLE`.
+    kernel_skip: bool,
+}
+
+/// Skip boundary used by the skipped-store kernels.
+const KERNEL_SKIP_PERMILLE: usize = 600;
+
+const NO_SLOT: u16 = u16::MAX;
+
+/// Static schedule for a small side buffer in the streaming ring kernels. The
+/// first half of a fill uses data-independent references, known in advance and
+/// identical for every hash. The schedule keeps a block in a side slot only when a
+/// reference to it falls within `max_distance`, and frees the slot after that
+/// block's last such reader. Blocks that find no free slot are read from the
+/// arena. Output is identical either way.
+#[derive(Debug, Clone)]
+struct SideCacheSchedule {
+    slots: usize,
+    /// Slot that receives a copy of the block written at this index, or `NO_SLOT`.
+    write_slot: Box<[u16]>,
+    /// Slot holding this index's reference block, or `NO_SLOT` (read the arena).
+    read_slot: Box<[u16]>,
+}
+
+impl SideCacheSchedule {
+    fn new(refs: &[usize], ring: usize, slots: usize, max_distance: usize) -> Self {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let slots = slots.min(usize::from(NO_SLOT - 1)).max(1);
+        let len = refs.len();
+        let mut write_slot = vec![NO_SLOT; len].into_boxed_slice();
+        let mut read_slot = vec![NO_SLOT; len].into_boxed_slice();
+        // Readers of each block, in reading order, restricted to references the
+        // ring cannot serve (distance >= ring) and within the kept window.
+        let eligible = |reader: usize, block: usize| {
+            reader > block && reader - block >= ring && reader - block <= max_distance
+        };
+        let mut counts = vec![0u32; len + 1];
+        for (reader, &block) in refs.iter().enumerate().skip(2) {
+            if eligible(reader, block) {
+                counts[block + 1] += 1;
+            }
+        }
+        for i in 1..=len {
+            counts[i] += counts[i - 1];
+        }
+        let mut readers = vec![0u32; counts[len] as usize];
+        let mut fill = counts.clone();
+        for (reader, &block) in refs.iter().enumerate().skip(2) {
+            if eligible(reader, block) {
+                readers[fill[block] as usize] = reader as u32;
+                fill[block] += 1;
+            }
+        }
+        let mut free: Vec<u16> = (0..slots as u16).rev().collect();
+        // (last reader, slot): a slot is free again once its last reader is past.
+        let mut busy: BinaryHeap<Reverse<(usize, u16)>> = BinaryHeap::new();
+        // Blocks 0 and 1 are the seeds, written before the fill loop with ordinary
+        // stores and never copied, so their readers keep reading the arena.
+        for block in 2..len {
+            while let Some(Reverse((last, slot))) = busy.peek().copied() {
+                if last < block {
+                    busy.pop();
+                    free.push(slot);
+                } else {
+                    break;
+                }
+            }
+            let block_readers = &readers[counts[block] as usize..counts[block + 1] as usize];
+            if block_readers.is_empty() {
+                continue;
+            }
+            let Some(slot) = free.pop() else {
+                continue;
+            };
+            write_slot[block] = slot;
+            for &reader in block_readers {
+                read_slot[reader as usize] = slot;
+            }
+            busy.push(Reverse((
+                *block_readers.last().expect("non-empty") as usize,
+                slot,
+            )));
+        }
+        Self {
+            slots,
+            write_slot,
+            read_slot,
+        }
+    }
+
+    #[inline(always)]
+    fn read(&self, index: usize) -> u16 {
+        self.read_slot.get(index).copied().unwrap_or(NO_SLOT)
+    }
+}
+
+impl FixedArgon2id {
+    pub fn new(requested_memory_kib: u32) -> Self {
+        Self::new_for_isa(requested_memory_kib, detect_isa())
+    }
+
+    /// Select a supported path explicitly without global or environment overrides.
+    /// Unsupported paths fail before precomputation or arena allocation.
+    pub fn with_kernel(requested_memory_kib: u32, kernel: CpuKernel) -> Result<Self> {
+        if !kernel.is_supported() {
+            return Err(Error::UnsupportedKernel);
+        }
+        let mut fixed = Self::new_for_isa(requested_memory_kib, kernel_isa(kernel));
+        fixed.kernel_skip = kernel.skips_stores();
+        Ok(fixed)
+    }
+
+    /// Change compression paths between hashes, retaining address precomputation.
+    /// The mutable borrow prevents switching during an in-flight hash.
+    pub fn set_kernel(&mut self, kernel: CpuKernel) -> Result<()> {
+        if !kernel.is_supported() {
+            return Err(Error::UnsupportedKernel);
+        }
+        self.isa = kernel_isa(kernel);
+        self.kernel_skip = kernel.skips_stores();
+        Ok(())
+    }
+
+    fn new_for_isa(requested_memory_kib: u32, isa: u8) -> Self {
+        let lanes = ARGON2_LANES as usize;
+        let min_blocks = 2 * SYNC_POINTS * lanes;
+        let memory_blocks = requested_memory_kib.max(min_blocks as u32) as usize;
+        let segment_length = memory_blocks / (lanes * SYNC_POINTS);
+        let block_count = segment_length * lanes * SYNC_POINTS;
+        let data_independent_ref_indexes =
+            precompute_data_independent_ref_indexes(block_count, segment_length);
+        Self {
+            requested_memory_kib,
+            block_count,
+            segment_length,
+            data_independent_ref_indexes,
+            isa,
+            side_cache: None,
+            skip_from: usize::MAX,
+            kernel_skip: false,
+        }
+    }
+
+    /// Serve data-independent references to recently written blocks from a side
+    /// buffer of `blocks` 1 KiB slots in the AVX-512 streaming ring kernels; 0
+    /// disables it (the default). Research knob, see [`SideCacheSchedule`].
+    pub fn set_side_cache_blocks(&mut self, blocks: usize) {
+        self.side_cache = (blocks > 0).then(|| {
+            SideCacheSchedule::new(
+                &self.data_independent_ref_indexes,
+                2,
+                blocks,
+                blocks.saturating_mul(16),
+            )
+        });
+    }
+
+    pub fn side_cache_blocks(&self) -> usize {
+        self.side_cache.as_ref().map_or(0, |s| s.slots)
+    }
+
+    /// AVX2 and AVX-512 streaming ring kernels: from `permille` of the
+    /// way through the arena, odd blocks are not written to memory and are
+    /// rebuilt from their stored predecessor whenever referenced. 0 disables;
+    /// values below 500 are raised to
+    /// 500 so skipped blocks always use data-dependent addressing.
+    pub fn set_skip_store_permille(&mut self, permille: u16) {
+        self.skip_from = match permille {
+            0 => usize::MAX,
+            p => self.block_count * usize::from(p.clamp(500, 1000)) / 1000,
+        };
+    }
+
+    pub fn skip_store_permille(&self) -> u16 {
+        if self.skip_from == usize::MAX {
+            0
+        } else {
+            (self.skip_from * 1000).div_ceil(self.block_count.max(1)) as u16
+        }
+    }
+
+    pub const fn block_count(&self) -> usize {
+        self.block_count
+    }
+
+    pub const fn isa_label(&self) -> &'static str {
+        if self.kernel_skip && self.isa == ISA_AVX2_STREAM {
+            CpuKernel::Avx2StreamSkip.as_str()
+        } else if self.kernel_skip {
+            CpuKernel::Avx512StreamSkip.as_str()
+        } else {
+            isa_label(self.isa)
+        }
+    }
+
+    pub fn hash_password_into_with_memory(
+        &self,
+        pwd: &[u8],
+        salt: &[u8],
+        out: &mut [u8],
+        memory_blocks: &mut [PowBlock],
+    ) -> Result<()> {
+        self.hash_password_into_with_memory_until(pwd, salt, out, memory_blocks, &|| false)
+            .map(|_| ())
+    }
+
+    /// Like `hash_password_into_with_memory`, but asks `stop` at each Argon2
+    /// slice boundary and every 32Ki blocks, and abandons the hash when it
+    /// returns true. Returns whether the hash completed; `out` is only
+    /// written when it did. Miners use this to drop a stale nonce on a new
+    /// job instead of finishing it.
+    pub fn hash_password_into_with_memory_until(
+        &self,
+        pwd: &[u8],
+        salt: &[u8],
+        out: &mut [u8],
+        memory_blocks: &mut [PowBlock],
+        stop: &dyn Fn() -> bool,
+    ) -> Result<bool> {
+        verify_inputs(pwd, salt, out)?;
+        let memory_blocks = memory_blocks
+            .get_mut(..self.block_count)
+            .ok_or(Error::MemoryTooLittle)?;
+
+        let initial_hash = initial_hash(
+            self.requested_memory_kib,
+            ARGON2_T_COST,
+            ARGON2_LANES,
+            pwd,
+            salt,
+            out,
+        );
+
+        initialize_lane_blocks(memory_blocks, initial_hash)?;
+
+        let completed = match self.isa {
+            ISA_AVX512 => self.fill_blocks::<ISA_AVX512, true, false>(memory_blocks, stop),
+            ISA_AVX512_256 => self.fill_blocks::<ISA_AVX512_256, true, false>(memory_blocks, stop),
+            #[cfg(target_arch = "x86_64")]
+            ISA_AVX512_256_STREAM => unsafe {
+                self.fill_streaming_ring::<2, 3, false, false, 0>(memory_blocks, stop)
+            },
+            #[cfg(target_arch = "x86_64")]
+            ISA_AVX512_256_STREAM_L2 => unsafe {
+                self.fill_streaming_ring::<2, 3, false, false, STREAM_FAR_PREFETCH>(
+                    memory_blocks,
+                    stop,
+                )
+            },
+            #[cfg(target_arch = "x86_64")]
+            ISA_AVX512_STREAM_L2 => unsafe {
+                self.fill_streaming_ring::<2, 3, false, true, STREAM_FAR_PREFETCH>(
+                    memory_blocks,
+                    stop,
+                )
+            },
+            #[cfg(target_arch = "x86_64")]
+            ISA_AVX512_STREAM => unsafe {
+                self.fill_streaming_ring::<2, 3, false, true, 0>(memory_blocks, stop)
+            },
+            #[cfg(target_arch = "x86_64")]
+            ISA_AVX512_256_STREAM_R8D2 => unsafe {
+                self.fill_streaming_ring::<8, 2, { cfg!(any(target_os = "linux", target_os = "windows")) }, false, 0>(memory_blocks, stop)
+            },
+            #[cfg(target_arch = "x86_64")]
+            ISA_AVX512_256_STREAM_R64D3 => unsafe {
+                self.fill_streaming_ring::<64, 3, true, false, 0>(memory_blocks, stop)
+            },
+            #[cfg(target_arch = "x86_64")]
+            ISA_AVX512_256_STREAM_R64D4 => unsafe {
+                self.fill_streaming_ring::<64, 4, true, false, 0>(memory_blocks, stop)
+            },
+            #[cfg(target_arch = "x86_64")]
+            ISA_AVX512_256_STREAM_R64D6 => unsafe {
+                self.fill_streaming_ring::<64, 6, true, false, 0>(memory_blocks, stop)
+            },
+            ISA_AVX2 => self.fill_blocks::<ISA_AVX2, true, false>(memory_blocks, stop),
+            #[cfg(target_arch = "x86_64")]
+            ISA_AVX2_STREAM => unsafe {
+                self.fill_streaming_ring_avx2::<2, 3>(memory_blocks, stop)
+            },
+            ISA_NEON => self.fill_blocks::<ISA_NEON, false, true>(memory_blocks, stop),
+            #[cfg(target_arch = "aarch64")]
+            ISA_NEON_SHA3 => unsafe { self.fill_blocks_neon_sha3(memory_blocks, stop) },
+            _ => self.fill_blocks::<ISA_SCALAR, false, false>(memory_blocks, stop),
+        };
+        if !completed {
+            return Ok(false);
+        }
+
+        finalize(memory_blocks, out)?;
+        Ok(true)
+    }
+
+    // Fixed one-pass, one-lane Argon2id: retain recent blocks in a cached ring.
+    // Periodic mode issues no fence before arena loads (same-core loads observe
+    // this core's NT stores) and an SFENCE every 32 blocks. R8/D2 and R64/D3–6
+    // fence before reading an uncommitted arena block. Recent references stay in
+    // the ring; finalization always fences. FAR > 0 also prefetches
+    // data-independent references FAR blocks ahead.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,avx512f,avx512vl")]
+    unsafe fn fill_streaming_ring<
+        const RING: usize,
+        const DEPTH: usize,
+        const DEMAND_FENCE: bool,
+        const FULL_WIDTH: bool,
+        const FAR: usize,
+    >(
+        &self,
+        memory: &mut [PowBlock],
+        stop: &dyn Fn() -> bool,
+    ) -> bool {
+        use std::arch::x86_64::{__m256i, _mm256_load_si256, _mm256_stream_si256, _mm_mfence};
+        assert!(RING >= 2 && RING.is_power_of_two());
+        assert!((1..=8).contains(&DEPTH));
+        let mask = RING - 1;
+        let mut ring = Box::new([PowBlock::default(); RING]);
+        ring[0] = memory[0];
+        ring[1] = memory[1];
+        let arena = memory.as_mut_ptr();
+        let cache = ring.as_mut_ptr();
+        debug_assert_eq!(arena as usize % 64, 0);
+        debug_assert_eq!(cache as usize % 64, 0);
+        let mut committed_end = 2; // Seeds use ordinary stores.
+        let side = self.side_cache.as_ref();
+        let mut side_buffer: Box<[PowBlock]> = match side {
+            Some(schedule) => vec![PowBlock::default(); schedule.slots].into_boxed_slice(),
+            None => Box::default(),
+        };
+        let side_ptr = side_buffer.as_mut_ptr();
+        let skip_from = if self.kernel_skip {
+            self.block_count * KERNEL_SKIP_PERMILLE / 1000
+        } else {
+            self.skip_from
+        };
+        let last = memory.len() - 1;
+        let mut rebuilt = std::mem::MaybeUninit::<PowBlock>::uninit();
+        for slice in 0..SYNC_POINTS {
+            if slice > 0 && stop() {
+                _mm_mfence(); // Leave no streaming stores in flight.
+                return false;
+            }
+            let first = if slice == 0 { 2 } else { 0 };
+            let di = slice < 2;
+            let base = slice * self.segment_length;
+            for block in first..self.segment_length {
+                if block & STOP_CHECK_MASK == STOP_CHECK_MASK && stop() {
+                    _mm_mfence(); // Leave no streaming stores in flight.
+                    return false;
+                }
+                let cur = base + block;
+                let prev = &*cache.add((cur - 1) & mask);
+                let reference = if di {
+                    self.data_independent_ref_indexes[cur]
+                } else {
+                    reference_index(cur - 1, prev.0[0])
+                };
+                debug_assert!(reference < cur - 1);
+                let side_read = if di {
+                    side.map_or(NO_SLOT, |schedule| schedule.read(cur))
+                } else {
+                    NO_SLOT
+                };
+                // A distance of exactly RING aliases the output slot, so use the
+                // arena in that case, never the cached ring. Fence first if needed.
+                let reference_ptr = if side_read != NO_SLOT {
+                    side_ptr.add(usize::from(side_read))
+                } else if cur - reference < RING {
+                    cache.add(reference & mask)
+                } else {
+                    if DEMAND_FENCE && reference >= committed_end {
+                        // MFENCE makes prior NT stores in 2..cur visible before
+                        // this arena load. SFENCE would not order store-to-load.
+                        _mm_mfence();
+                        committed_end = cur;
+                    }
+                    if store_skipped(reference, skip_from) {
+                        rebuild_skipped::<FULL_WIDTH>(
+                            arena,
+                            skip_from,
+                            reference,
+                            &mut *rebuilt.as_mut_ptr(),
+                        );
+                        rebuilt.as_mut_ptr()
+                    } else {
+                        arena.add(reference)
+                    }
+                };
+                let dst = cache.add(cur & mask);
+                debug_assert_ne!(dst, reference_ptr);
+                if di {
+                    if FAR > 0 {
+                        let far_index = cur + FAR;
+                        if let Some(&far) = self.data_independent_ref_indexes.get(far_index) {
+                            if far < cur
+                                && cur - far >= RING
+                                && side.map_or(true, |schedule| schedule.read(far_index) == NO_SLOT)
+                            {
+                                prefetch_pow_block_l2(&*arena.add(far));
+                            }
+                        }
+                    }
+                    if block + DEPTH < self.segment_length {
+                        let ahead = self.data_independent_ref_indexes[cur + DEPTH];
+                        // Recent references are already cached, or are not yet
+                        // produced. Only issue an arena prefetch for older blocks.
+                        if ahead < cur
+                            && cur - ahead >= RING
+                            && side.map_or(true, |schedule| schedule.read(cur + DEPTH) == NO_SLOT)
+                        {
+                            prefetch_pow_block::<ISA_AVX512_256_STREAM>(&*arena.add(ahead));
+                        }
+                    }
+                    if FULL_WIDTH {
+                        avx512_reg::compress_into(prev, &*reference_ptr, &mut *dst);
+                    } else {
+                        avx512_256::compress_into(prev, &*reference_ptr, &mut *dst);
+                    }
+                    if let Some(schedule) = side {
+                        let slot = schedule.write_slot[cur];
+                        if slot != NO_SLOT {
+                            // Copy the block into its side slot.
+                            std::ptr::copy_nonoverlapping(
+                                (*dst).0.as_ptr(),
+                                (*side_ptr.add(usize::from(slot))).0.as_mut_ptr(),
+                                (*dst).0.len(),
+                            );
+                        }
+                    }
+                } else if block + 1 < self.segment_length {
+                    if FULL_WIDTH {
+                        avx512_reg::compress_into_mid_prefetch_ring::<RING>(
+                            prev,
+                            &*reference_ptr,
+                            &mut *dst,
+                            cur,
+                            arena,
+                            cache,
+                            cur + 1,
+                            skip_from,
+                        );
+                    } else {
+                        avx512_256::compress_into_mid_prefetch_ring::<RING>(
+                            prev,
+                            &*reference_ptr,
+                            &mut *dst,
+                            cur,
+                            arena,
+                            cache,
+                            cur + 1,
+                            skip_from,
+                        );
+                    }
+                } else {
+                    if FULL_WIDTH {
+                        avx512_reg::compress_into(prev, &*reference_ptr, &mut *dst);
+                    } else {
+                        avx512_256::compress_into(prev, &*reference_ptr, &mut *dst);
+                    }
+                }
+                // Store the block to the arena. The arena is never used as a
+                // pre-round backup here.
+                if !store_skipped(cur, skip_from) || cur == last {
+                    let src = (*dst).0.as_ptr();
+                    let output = (*arena.add(cur)).0.as_mut_ptr();
+                    for vector in 0..32 {
+                        let value = _mm256_load_si256(src.add(vector * 4).cast::<__m256i>());
+                        _mm256_stream_si256(output.add(vector * 4).cast::<__m256i>(), value);
+                    }
+                }
+                if !DEMAND_FENCE && cur & 31 == 31 {
+                    std::arch::x86_64::_mm_sfence();
+                }
+            }
+        }
+        _mm_mfence(); // Finalization consumes the final arena block.
+        true
+    }
+
+    // AVX2 counterpart of `fill_streaming_ring` for CPUs without AVX-512:
+    // a 2-block cached ring, non-temporal arena stores and a three-block
+    // whole-block prefetch while addresses are data independent. Same-core loads
+    // observe this core's earlier NT stores to the same address, so arena reads
+    // need no fence.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn fill_streaming_ring_avx2<const RING: usize, const DEPTH: usize>(
+        &self,
+        memory: &mut [PowBlock],
+        stop: &dyn Fn() -> bool,
+    ) -> bool {
+        use std::arch::x86_64::{
+            __m128i, _mm_load_si128, _mm_mfence, _mm_sfence, _mm_stream_si128,
+        };
+        assert!(RING >= 2 && RING.is_power_of_two());
+        assert!((1..=16).contains(&DEPTH));
+        let mask = RING - 1;
+        let mut ring = Box::new([PowBlock::default(); RING]);
+        ring[0] = memory[0];
+        ring[1] = memory[1];
+        let arena = memory.as_mut_ptr();
+        let cache = ring.as_mut_ptr();
+        debug_assert_eq!(arena as usize % 64, 0);
+        debug_assert_eq!(cache as usize % 64, 0);
+        let skip_from = if self.kernel_skip {
+            self.block_count * KERNEL_SKIP_PERMILLE / 1000
+        } else {
+            self.skip_from
+        };
+        let last = memory.len() - 1;
+        let mut rebuilt = std::mem::MaybeUninit::<PowBlock>::uninit();
+        for slice in 0..SYNC_POINTS {
+            if slice > 0 && stop() {
+                _mm_mfence(); // Leave no streaming stores in flight.
+                return false;
+            }
+            let first = if slice == 0 { 2 } else { 0 };
+            let di = slice < 2;
+            let base = slice * self.segment_length;
+            for block in first..self.segment_length {
+                if block & STOP_CHECK_MASK == STOP_CHECK_MASK && stop() {
+                    _mm_mfence(); // Leave no streaming stores in flight.
+                    return false;
+                }
+                let cur = base + block;
+                let prev = &*cache.add((cur - 1) & mask);
+                let reference = if di {
+                    self.data_independent_ref_indexes[cur]
+                } else {
+                    reference_index(cur - 1, prev.0[0])
+                };
+                debug_assert!(reference < cur - 1);
+                // A distance of exactly RING aliases the output slot: use the arena.
+                // Same-core loads observe this core's earlier NT stores to the same
+                // address, so arena reads need no fence (full-size parity verified).
+                let reference_ptr = if cur - reference < RING {
+                    cache.add(reference & mask)
+                } else if store_skipped(reference, skip_from) {
+                    rebuild_skipped_avx2(arena, skip_from, reference, &mut *rebuilt.as_mut_ptr());
+                    rebuilt.as_mut_ptr()
+                } else {
+                    arena.add(reference)
+                };
+                let dst = cache.add(cur & mask);
+                debug_assert_ne!(dst, reference_ptr);
+                if di {
+                    if block + DEPTH < self.segment_length {
+                        let ahead = self.data_independent_ref_indexes[cur + DEPTH];
+                        if ahead < cur && cur - ahead >= RING {
+                            prefetch_pow_block::<ISA_AVX2>(&*arena.add(ahead));
+                        }
+                    }
+                    compress_avx2_into(prev, &*reference_ptr, &mut *dst);
+                } else if block + 1 < self.segment_length {
+                    compress_avx2_into_mid_prefetch(
+                        prev,
+                        &*reference_ptr,
+                        &mut *dst,
+                        cur,
+                        arena,
+                        skip_from,
+                    );
+                } else {
+                    compress_avx2_into(prev, &*reference_ptr, &mut *dst);
+                }
+                if !store_skipped(cur, skip_from) || cur == last {
+                    let src = (*dst).0.as_ptr();
+                    let output = (*arena.add(cur)).0.as_mut_ptr();
+                    // 16-byte NT stores.
+                    for vector in 0..64 {
+                        let value = _mm_load_si128(src.add(vector * 2).cast::<__m128i>());
+                        _mm_stream_si128(output.add(vector * 2).cast::<__m128i>(), value);
+                    }
+                }
+                if cur & 31 == 31 {
+                    _mm_sfence();
+                }
+            }
+        }
+        _mm_mfence(); // Finalization consumes the final arena block.
+        true
+    }
+
+    // Keep the x86 loop out of the dispatch function; the ARM target-feature
+    // wrapper needs an inline implementation.
+    #[cfg_attr(target_arch = "x86_64", inline(never))]
+    fn fill_blocks<
+        const ISA: u8,
+        const USE_X86_MID_PREFETCH: bool,
+        const USE_AARCH64_MID_PREFETCH: bool,
+    >(
+        &self,
+        memory_blocks: &mut [PowBlock],
+        stop: &dyn Fn() -> bool,
+    ) -> bool {
+        self.fill_blocks_impl::<ISA, USE_X86_MID_PREFETCH, USE_AARCH64_MID_PREFETCH>(
+            memory_blocks,
+            stop,
+        )
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "sha3")]
+    unsafe fn fill_blocks_neon_sha3(
+        &self,
+        memory_blocks: &mut [PowBlock],
+        stop: &dyn Fn() -> bool,
+    ) -> bool {
+        // Feature detection happens in with_kernel/set_kernel, once per selection.
+        // Inline the loop and its NEON helpers into this feature-enabled boundary.
+        self.fill_blocks_impl::<ISA_NEON_SHA3, false, true>(memory_blocks, stop)
+    }
+
+    #[inline(always)]
+    fn fill_blocks_impl<
+        const ISA: u8,
+        const USE_X86_MID_PREFETCH: bool,
+        const USE_AARCH64_MID_PREFETCH: bool,
+    >(
+        &self,
+        memory_blocks: &mut [PowBlock],
+        stop: &dyn Fn() -> bool,
+    ) -> bool {
+        debug_assert_eq!(ARGON2_LANES, 1);
+        debug_assert_eq!(memory_blocks.len(), self.block_count);
+        for slice in 0..SYNC_POINTS {
+            if slice > 0 && stop() {
+                return false;
+            }
+            let data_independent_addressing = slice < (SYNC_POINTS / 2);
+
+            let first_block = if slice == 0 { 2 } else { 0 };
+
+            let mut cur_index = slice * self.segment_length + first_block;
+            let mut prev_index = cur_index - 1;
+
+            if data_independent_addressing {
+                let ref_base = slice * self.segment_length;
+                // Prefetch the first ref blocks before entering the loop.
+                const DI_PREFETCH_DISTANCE: usize = 3; // tested 1-5, all equivalent
+                for pre in 0..DI_PREFETCH_DISTANCE {
+                    let idx = first_block + pre;
+                    if idx < self.segment_length {
+                        prefetch_pow_block::<ISA>(
+                            &memory_blocks[self.data_independent_ref_indexes[ref_base + idx]],
+                        );
+                    }
+                }
+                for block in first_block..self.segment_length {
+                    if block & STOP_CHECK_MASK == STOP_CHECK_MASK && stop() {
+                        return false;
+                    }
+                    let ref_index = self.data_independent_ref_indexes[ref_base + block];
+                    let ahead = block + DI_PREFETCH_DISTANCE;
+                    if ahead < self.segment_length {
+                        prefetch_pow_block::<ISA>(
+                            &memory_blocks[self.data_independent_ref_indexes[ref_base + ahead]],
+                        );
+                    }
+                    fill_block_from_refs::<ISA>(memory_blocks, prev_index, ref_index, cur_index);
+                    prev_index = cur_index;
+                    cur_index += 1;
+                }
+            } else {
+                let slice_prefix = (slice * self.segment_length) - 1;
+                for block in first_block..self.segment_length {
+                    if block & STOP_CHECK_MASK == STOP_CHECK_MASK && stop() {
+                        return false;
+                    }
+                    let rand = memory_blocks[prev_index].as_ref()[0];
+                    let reference_area_size = slice_prefix + block;
+                    let ref_index = reference_index(reference_area_size, rand);
+                    debug_assert!(ref_index < self.block_count);
+
+                    if block + 1 < self.segment_length {
+                        // Prefetch the next reference block inside the compress
+                        // function, once column round 0 has written dst[0].
+                        #[cfg(target_arch = "aarch64")]
+                        if USE_AARCH64_MID_PREFETCH {
+                            let next_ref_area = slice_prefix + block + 1;
+                            fill_block_from_refs_mid_prefetch::<ISA>(
+                                memory_blocks,
+                                prev_index,
+                                ref_index,
+                                cur_index,
+                                next_ref_area,
+                            );
+                            prev_index = cur_index;
+                            cur_index += 1;
+                            continue;
+                        }
+
+                        #[cfg(target_arch = "x86_64")]
+                        if USE_X86_MID_PREFETCH {
+                            let next_ref_area = slice_prefix + block + 1;
+                            fill_block_from_refs_mid_prefetch::<ISA>(
+                                memory_blocks,
+                                prev_index,
+                                ref_index,
+                                cur_index,
+                                next_ref_area,
+                            );
+                            prev_index = cur_index;
+                            cur_index += 1;
+                            continue;
+                        }
+                    }
+
+                    fill_block_from_refs::<ISA>(memory_blocks, prev_index, ref_index, cur_index);
+                    prev_index = cur_index;
+                    cur_index += 1;
+                }
+            }
+        }
+        true
+    }
+}
+
+fn precompute_data_independent_ref_indexes(
+    block_count: usize,
+    segment_length: usize,
+) -> Box<[usize]> {
+    debug_assert_eq!(ARGON2_LANES, 1);
+    debug_assert!(ADDRESSES_IN_BLOCK.is_power_of_two());
+    const ADDRESS_MASK: usize = ADDRESSES_IN_BLOCK - 1;
+
+    let slice_count = SYNC_POINTS / 2;
+    let mut refs = vec![0usize; slice_count * segment_length];
+    let zero_block = PowBlock::default();
+
+    for slice in 0..slice_count {
+        let mut address_block = PowBlock::default();
+        let mut input_block = PowBlock::default();
+        input_block.as_mut()[..6].copy_from_slice(&[
+            0,
+            0,
+            slice as u64,
+            block_count as u64,
+            ARGON2_T_COST as u64,
+            ARGON2_TYPE_ID as u64,
+        ]);
+
+        let first_block = if slice == 0 {
+            update_address_block::<ISA_SCALAR>(&mut address_block, &mut input_block, &zero_block);
+            2
+        } else {
+            0
+        };
+        let mut address_idx = first_block & ADDRESS_MASK;
+        let refs_base = slice * segment_length;
+        let slice_prefix = (slice * segment_length).saturating_sub(1);
+
+        for block in first_block..segment_length {
+            if address_idx == 0 {
+                update_address_block::<ISA_SCALAR>(
+                    &mut address_block,
+                    &mut input_block,
+                    &zero_block,
+                );
+            }
+
+            let rand = address_block.as_ref()[address_idx];
+            address_idx = (address_idx + 1) & ADDRESS_MASK;
+
+            let reference_area_size = if slice == 0 {
+                block - 1
+            } else {
+                slice_prefix + block
+            };
+            let ref_index = reference_index(reference_area_size, rand);
+            debug_assert!(ref_index < block_count);
+
+            refs[refs_base + block] = ref_index;
+        }
+    }
+
+    refs.into_boxed_slice()
+}
+
+/// Whether block `index` skips its arena store under `skip_from` (the last
+/// block is always stored: finalization reads it from the arena).
+#[inline(always)]
+fn store_skipped(index: usize, skip_from: usize) -> bool {
+    index >= skip_from && index & 1 == 1
+}
+
+/// Rebuild a block whose arena store was skipped: B[b] = G(B[b-1], B[ref(b)]),
+/// where B[b-1] is stored (even) and B[ref(b)] is rebuilt again if skipped.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+unsafe fn rebuild_skipped<const FULL_WIDTH: bool>(
+    arena: *const PowBlock,
+    skip_from: usize,
+    index: usize,
+    out: &mut PowBlock,
+) {
+    let prev = &*arena.add(index - 1);
+    let reference = reference_index(index - 1, prev.0[0]);
+    let mut rebuilt = std::mem::MaybeUninit::<PowBlock>::uninit();
+    let reference_block = if store_skipped(reference, skip_from) {
+        rebuild_skipped::<FULL_WIDTH>(arena, skip_from, reference, &mut *rebuilt.as_mut_ptr());
+        &*rebuilt.as_ptr()
+    } else {
+        &*arena.add(reference)
+    };
+    if FULL_WIDTH {
+        avx512_reg::compress_into(prev, reference_block, out);
+    } else {
+        avx512_256::compress_into(prev, reference_block, out);
+    }
+}
+
+/// AVX2 counterpart of `rebuild_skipped`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+unsafe fn rebuild_skipped_avx2(
+    arena: *const PowBlock,
+    skip_from: usize,
+    index: usize,
+    out: &mut PowBlock,
+) {
+    let prev = &*arena.add(index - 1);
+    let reference = reference_index(index - 1, prev.0[0]);
+    let mut rebuilt = std::mem::MaybeUninit::<PowBlock>::uninit();
+    let reference_block = if store_skipped(reference, skip_from) {
+        rebuild_skipped_avx2(arena, skip_from, reference, &mut *rebuilt.as_mut_ptr());
+        &*rebuilt.as_ptr()
+    } else {
+        &*arena.add(reference)
+    };
+    compress_avx2_into(prev, reference_block, out);
+}
+
+#[inline(always)]
+fn reference_index(reference_area_size: usize, rand: u64) -> usize {
+    debug_assert!(reference_area_size > 0);
+    let mapped = ((rand as u32 as u64) * (rand as u32 as u64)) >> 32;
+    let offset = ((reference_area_size as u64 * mapped) >> 32) as usize;
+    (reference_area_size - 1) - offset
+}
+
+#[inline(always)]
+fn fill_block_from_refs<const ISA: u8>(
+    memory_blocks: &mut [PowBlock],
+    prev_index: usize,
+    ref_index: usize,
+    cur_index: usize,
+) {
+    debug_assert!(prev_index < memory_blocks.len());
+    debug_assert!(ref_index < memory_blocks.len());
+    debug_assert!(cur_index < memory_blocks.len());
+    debug_assert_ne!(cur_index, prev_index);
+    debug_assert_ne!(cur_index, ref_index);
+
+    // Safety: caller guarantees these indices are in-bounds and cur_index does not
+    // alias prev_index or ref_index (dst always advances forward past both sources).
+    // We use raw pointer arithmetic to obtain the three disjoint references without
+    // triggering the borrow checker's simultaneous immutable+mutable restriction.
+    unsafe {
+        let base = memory_blocks.as_mut_ptr();
+        let prev = &*base.add(prev_index);
+        let refb = &*base.add(ref_index);
+        let dst = &mut *base.add(cur_index);
+        compress_into::<ISA>(prev, refb, dst);
+    }
+}
+
+/// Like [`fill_block_from_refs`] but uses the mid-compress prefetch variant:
+/// after column round 0 writes `dst[0]`, it computes the next iteration's
+/// ref_index and prefetches that block.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn fill_block_from_refs_mid_prefetch<const ISA: u8>(
+    memory_blocks: &mut [PowBlock],
+    prev_index: usize,
+    ref_index: usize,
+    cur_index: usize,
+    next_ref_area_size: usize,
+) {
+    debug_assert!(prev_index < memory_blocks.len());
+    debug_assert!(ref_index < memory_blocks.len());
+    debug_assert!(cur_index < memory_blocks.len());
+    debug_assert_ne!(cur_index, prev_index);
+    debug_assert_ne!(cur_index, ref_index);
+
+    unsafe {
+        let base = memory_blocks.as_mut_ptr();
+        let prev = &*base.add(prev_index);
+        let refb = &*base.add(ref_index);
+        let dst = &mut *base.add(cur_index);
+        if ISA == ISA_AVX512 {
+            compress_avx512_into_mid_prefetch(
+                prev,
+                refb,
+                dst,
+                next_ref_area_size,
+                base as *const PowBlock,
+            );
+        } else if ISA == ISA_AVX512_256 {
+            avx512_256::compress_into_mid_prefetch(
+                prev,
+                refb,
+                dst,
+                next_ref_area_size,
+                base as *const PowBlock,
+            );
+        } else {
+            compress_avx2_into_mid_prefetch(
+                prev,
+                refb,
+                dst,
+                next_ref_area_size,
+                base as *const PowBlock,
+                usize::MAX,
+            );
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fill_block_from_refs_mid_prefetch<const ISA: u8>(
+    memory_blocks: &mut [PowBlock],
+    prev_index: usize,
+    ref_index: usize,
+    cur_index: usize,
+    next_ref_area_size: usize,
+) {
+    debug_assert!(prev_index < memory_blocks.len());
+    debug_assert!(ref_index < memory_blocks.len());
+    debug_assert!(cur_index < memory_blocks.len());
+    debug_assert_ne!(cur_index, prev_index);
+    debug_assert_ne!(cur_index, ref_index);
+
+    unsafe {
+        let base = memory_blocks.as_mut_ptr();
+        let prev = &*base.add(prev_index);
+        let refb = &*base.add(ref_index);
+        let dst = &mut *base.add(cur_index);
+        if ISA == ISA_NEON_SHA3 {
+            compress_neon_into_mid_prefetch::<true>(
+                prev,
+                refb,
+                dst,
+                next_ref_area_size,
+                base as *const PowBlock,
+            );
+            return;
+        }
+        compress_neon_into_mid_prefetch::<false>(
+            prev,
+            refb,
+            dst,
+            next_ref_area_size,
+            base as *const PowBlock,
+        );
+    }
+}
+
+/// Distance, in blocks, of the streaming kernels' far data-independent prefetch.
+const STREAM_FAR_PREFETCH: usize = 14;
+
+/// Prefetch a whole PowBlock with `prefetcht1`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn prefetch_pow_block_l2(block: &PowBlock) {
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T1};
+        let ptr = block as *const PowBlock as *const i8;
+        for line in 0..16 {
+            _mm_prefetch(ptr.add(line * 64), _MM_HINT_T1);
+        }
+    }
+}
+
+/// Prefetch a whole PowBlock.
+///
+/// - x86_64: all 16 cache lines at 64-byte stride (full 1024-byte block).
+/// - AArch64 baseline: retain eight hints at the original 128-byte stride.
+/// - NEON SHA3 candidate: sixteen hints cover every 64-byte server cache line.
+#[inline(always)]
+fn prefetch_pow_block<const ISA: u8>(block: &PowBlock) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let ptr = block as *const PowBlock as *const i8;
+            _mm_prefetch(ptr, _MM_HINT_T0);
+            _mm_prefetch(ptr.add(64), _MM_HINT_T0);
+            _mm_prefetch(ptr.add(128), _MM_HINT_T0);
+            _mm_prefetch(ptr.add(192), _MM_HINT_T0);
+            _mm_prefetch(ptr.add(256), _MM_HINT_T0);
+            _mm_prefetch(ptr.add(320), _MM_HINT_T0);
+            _mm_prefetch(ptr.add(384), _MM_HINT_T0);
+            _mm_prefetch(ptr.add(448), _MM_HINT_T0);
+            _mm_prefetch(ptr.add(512), _MM_HINT_T0);
+            _mm_prefetch(ptr.add(576), _MM_HINT_T0);
+            _mm_prefetch(ptr.add(640), _MM_HINT_T0);
+            _mm_prefetch(ptr.add(704), _MM_HINT_T0);
+            _mm_prefetch(ptr.add(768), _MM_HINT_T0);
+            _mm_prefetch(ptr.add(832), _MM_HINT_T0);
+            _mm_prefetch(ptr.add(896), _MM_HINT_T0);
+            _mm_prefetch(ptr.add(960), _MM_HINT_T0);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            let ptr = block as *const PowBlock as *const u8;
+            if ISA == ISA_NEON_SHA3 {
+                // Baseline keeps the 128-byte stride; this path covers every
+                // 64-byte line.
+                std::arch::asm!(
+                    "prfm pldl1keep, [{ptr}]",
+                    "prfm pldl1keep, [{ptr}, #64]",
+                    "prfm pldl1keep, [{ptr}, #128]",
+                    "prfm pldl1keep, [{ptr}, #192]",
+                    "prfm pldl1keep, [{ptr}, #256]",
+                    "prfm pldl1keep, [{ptr}, #320]",
+                    "prfm pldl1keep, [{ptr}, #384]",
+                    "prfm pldl1keep, [{ptr}, #448]",
+                    "prfm pldl1keep, [{ptr}, #512]",
+                    "prfm pldl1keep, [{ptr}, #576]",
+                    "prfm pldl1keep, [{ptr}, #640]",
+                    "prfm pldl1keep, [{ptr}, #704]",
+                    "prfm pldl1keep, [{ptr}, #768]",
+                    "prfm pldl1keep, [{ptr}, #832]",
+                    "prfm pldl1keep, [{ptr}, #896]",
+                    "prfm pldl1keep, [{ptr}, #960]",
+                    ptr = in(reg) ptr,
+                    options(nostack, preserves_flags),
+                );
+                return;
+            }
+            std::arch::asm!(
+                "prfm pldl1keep, [{ptr}]",
+                "prfm pldl1keep, [{ptr}, #128]",
+                "prfm pldl1keep, [{ptr}, #256]",
+                "prfm pldl1keep, [{ptr}, #384]",
+                "prfm pldl1keep, [{ptr}, #512]",
+                "prfm pldl1keep, [{ptr}, #640]",
+                "prfm pldl1keep, [{ptr}, #768]",
+                "prfm pldl1keep, [{ptr}, #896]",
+                ptr = in(reg) ptr,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
+
+#[inline(always)]
+fn verify_inputs(pwd: &[u8], salt: &[u8], out: &[u8]) -> Result<()> {
+    if pwd.len() > MAX_PWD_LEN {
+        return Err(Error::PwdTooLong);
+    }
+    if salt.len() < MIN_SALT_LEN {
+        return Err(Error::SaltTooShort);
+    }
+    if salt.len() > MAX_SALT_LEN {
+        return Err(Error::SaltTooLong);
+    }
+    if out.len() < MIN_OUTPUT_LEN {
+        return Err(Error::OutputTooShort);
+    }
+    if out.len() > u32::MAX as usize {
+        return Err(Error::OutputTooLong);
+    }
+    Ok(())
+}
+
+fn initial_hash(
+    memory_kib: u32,
+    t_cost: u32,
+    lanes: u32,
+    pwd: &[u8],
+    salt: &[u8],
+    out: &[u8],
+) -> [u8; 64] {
+    let mut digest = Blake2b512::new();
+    Digest::update(&mut digest, lanes.to_le_bytes());
+    Digest::update(&mut digest, (out.len() as u32).to_le_bytes());
+    Digest::update(&mut digest, memory_kib.to_le_bytes());
+    Digest::update(&mut digest, t_cost.to_le_bytes());
+    Digest::update(&mut digest, ARGON2_VERSION_13.to_le_bytes());
+    Digest::update(&mut digest, ARGON2_TYPE_ID.to_le_bytes());
+    Digest::update(&mut digest, (pwd.len() as u32).to_le_bytes());
+    Digest::update(&mut digest, pwd);
+    Digest::update(&mut digest, (salt.len() as u32).to_le_bytes());
+    Digest::update(&mut digest, salt);
+    Digest::update(&mut digest, 0u32.to_le_bytes());
+    Digest::update(&mut digest, 0u32.to_le_bytes());
+    let output = digest.finalize();
+    output.into()
+}
+
+fn initialize_lane_blocks(memory_blocks: &mut [PowBlock], initial_hash: [u8; 64]) -> Result<()> {
+    for (idx, block) in memory_blocks.iter_mut().take(2).enumerate() {
+        let mut hash = [0u8; PowBlock::SIZE];
+        let i = idx as u32;
+        let lane = 0u32;
+        blake2b_long(
+            &[&initial_hash, &i.to_le_bytes(), &lane.to_le_bytes()],
+            &mut hash,
+        )?;
+        block.load(&hash);
+    }
+    Ok(())
+}
+
+fn finalize(memory_blocks: &[PowBlock], out: &mut [u8]) -> Result<()> {
+    let Some(last_block) = memory_blocks.last() else {
+        return Err(Error::MemoryTooLittle);
+    };
+    let mut blockhash_bytes = [0u8; PowBlock::SIZE];
+    for (chunk, value) in blockhash_bytes.chunks_mut(8).zip(last_block.iter()) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    blake2b_long(&[&blockhash_bytes], out)
+}
+
+#[inline(always)]
+fn update_address_block<const ISA: u8>(
+    address_block: &mut PowBlock,
+    input_block: &mut PowBlock,
+    zero_block: &PowBlock,
+) {
+    input_block.as_mut()[6] = input_block.as_mut()[6].wrapping_add(1);
+    *address_block = compress::<ISA>(zero_block, input_block);
+    *address_block = compress::<ISA>(zero_block, address_block);
+}
+
+#[inline(always)]
+fn compress<const ISA: u8>(rhs: &PowBlock, lhs: &PowBlock) -> PowBlock {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if ISA == ISA_AVX512 {
+            unsafe {
+                return compress_avx512(rhs, lhs);
+            }
+        }
+        if ISA == ISA_AVX512_256 {
+            unsafe {
+                return avx512_256::compress(rhs, lhs);
+            }
+        }
+        if ISA == ISA_AVX2 {
+            unsafe {
+                return compress_avx2(rhs, lhs);
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if ISA == ISA_NEON {
+            unsafe {
+                return compress_neon::<false>(rhs, lhs);
+            }
+        }
+        if ISA == ISA_NEON_SHA3 {
+            unsafe {
+                return compress_neon::<true>(rhs, lhs);
+            }
+        }
+    }
+    PowBlock::compress(rhs, lhs)
+}
+
+/// In-place variant of [`compress`] that writes the result directly into `dst`,
+/// bypassing the ABI return-value memcpy that `#[target_feature]` functions incur.
+///
+/// # Safety (caller obligations)
+/// `dst` must not alias `rhs` or `lhs`.
+#[inline(always)]
+fn compress_into<const ISA: u8>(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBlock) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if ISA == ISA_AVX512 {
+            unsafe {
+                compress_avx512_into(rhs, lhs, dst);
+                return;
+            }
+        }
+        if ISA == ISA_AVX512_256 {
+            unsafe {
+                avx512_256::compress_into(rhs, lhs, dst);
+                return;
+            }
+        }
+        if ISA == ISA_AVX2 {
+            unsafe {
+                compress_avx2_into(rhs, lhs, dst);
+                return;
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if ISA == ISA_NEON {
+            unsafe {
+                compress_neon_into::<false>(rhs, lhs, dst);
+            }
+            return;
+        }
+        if ISA == ISA_NEON_SHA3 {
+            unsafe {
+                compress_neon_into::<true>(rhs, lhs, dst);
+            }
+            return;
+        }
+    }
+    *dst = PowBlock::compress(rhs, lhs);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn avx2_blamka(
+    a: std::arch::x86_64::__m256i,
+    b: std::arch::x86_64::__m256i,
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::{_mm256_add_epi64, _mm256_mul_epu32};
+    let product = _mm256_mul_epu32(a, b);
+    let doubled_product = _mm256_add_epi64(product, product);
+    _mm256_add_epi64(_mm256_add_epi64(a, b), doubled_product)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn avx2_rotr_64_32(value: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::{_mm256_or_si256, _mm256_slli_epi64, _mm256_srli_epi64};
+    _mm256_or_si256(
+        _mm256_srli_epi64::<32>(value),
+        _mm256_slli_epi64::<32>(value),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn avx2_rotr_64_24(value: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::{_mm256_or_si256, _mm256_slli_epi64, _mm256_srli_epi64};
+    _mm256_or_si256(
+        _mm256_srli_epi64::<24>(value),
+        _mm256_slli_epi64::<40>(value),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn avx2_rotr_64_16(value: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::{_mm256_or_si256, _mm256_slli_epi64, _mm256_srli_epi64};
+    _mm256_or_si256(
+        _mm256_srli_epi64::<16>(value),
+        _mm256_slli_epi64::<48>(value),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn avx2_rotr_64_63(value: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::{_mm256_or_si256, _mm256_slli_epi64, _mm256_srli_epi64};
+    _mm256_or_si256(
+        _mm256_srli_epi64::<63>(value),
+        _mm256_slli_epi64::<1>(value),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn avx512_blamka(
+    a: std::arch::x86_64::__m512i,
+    b: std::arch::x86_64::__m512i,
+) -> std::arch::x86_64::__m512i {
+    use std::arch::x86_64::{_mm512_add_epi64, _mm512_mul_epu32};
+    let product = _mm512_mul_epu32(a, b);
+    let doubled_product = _mm512_add_epi64(product, product);
+    _mm512_add_epi64(_mm512_add_epi64(a, b), doubled_product)
+}
+
+/// Full BLAMKA round on two independent 4-element groups packed into __m512i
+/// registers (one group per 256-bit half). Performs column step + diagonal step.
+///
+/// Diagonal lane permutation uses `_mm512_permutexvar_epi64` and rotations use
+/// `_mm512_ror_epi64`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn avx512_round(
+    a: &mut std::arch::x86_64::__m512i,
+    b: &mut std::arch::x86_64::__m512i,
+    c: &mut std::arch::x86_64::__m512i,
+    d: &mut std::arch::x86_64::__m512i,
+) {
+    use std::arch::x86_64::{
+        _mm512_permutexvar_epi64, _mm512_ror_epi64, _mm512_set_epi64, _mm512_xor_si512,
+    };
+
+    // Column step.
+    *a = avx512_blamka(*a, *b);
+    *d = _mm512_ror_epi64::<32>(_mm512_xor_si512(*d, *a));
+    *c = avx512_blamka(*c, *d);
+    *b = _mm512_ror_epi64::<24>(_mm512_xor_si512(*b, *c));
+    *a = avx512_blamka(*a, *b);
+    *d = _mm512_ror_epi64::<16>(_mm512_xor_si512(*d, *a));
+    *c = avx512_blamka(*c, *d);
+    *b = _mm512_ror_epi64::<63>(_mm512_xor_si512(*b, *c));
+
+    // Diagonal step: rotate within each 4-lane half independently.
+    //   rot1 (left-by-1): [1,2,3,0, 5,6,7,4]
+    //   rot2 (left-by-2): [2,3,0,1, 6,7,4,5]
+    //   rot3 (left-by-3): [3,0,1,2, 7,4,5,6]
+    let rot1 = _mm512_set_epi64(4, 7, 6, 5, 0, 3, 2, 1);
+    let rot2 = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
+    let rot3 = _mm512_set_epi64(6, 5, 4, 7, 2, 1, 0, 3);
+
+    let mut bb = _mm512_permutexvar_epi64(rot1, *b);
+    let mut cc = _mm512_permutexvar_epi64(rot2, *c);
+    let mut dd = _mm512_permutexvar_epi64(rot3, *d);
+
+    *a = avx512_blamka(*a, bb);
+    dd = _mm512_ror_epi64::<32>(_mm512_xor_si512(dd, *a));
+    cc = avx512_blamka(cc, dd);
+    bb = _mm512_ror_epi64::<24>(_mm512_xor_si512(bb, cc));
+    *a = avx512_blamka(*a, bb);
+    dd = _mm512_ror_epi64::<16>(_mm512_xor_si512(dd, *a));
+    cc = avx512_blamka(cc, dd);
+    bb = _mm512_ror_epi64::<63>(_mm512_xor_si512(bb, cc));
+
+    // Un-permute: rot3 inverts rot1, rot2 is self-inverse, rot1 inverts rot3.
+    *b = _mm512_permutexvar_epi64(rot3, bb);
+    *c = _mm512_permutexvar_epi64(rot2, cc);
+    *d = _mm512_permutexvar_epi64(rot1, dd);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn avx2_round(
+    a: &mut std::arch::x86_64::__m256i,
+    b: &mut std::arch::x86_64::__m256i,
+    c: &mut std::arch::x86_64::__m256i,
+    d: &mut std::arch::x86_64::__m256i,
+) {
+    use std::arch::x86_64::{_mm256_permute4x64_epi64, _mm256_xor_si256};
+
+    *a = avx2_blamka(*a, *b);
+    *d = avx2_rotr_64_32(_mm256_xor_si256(*d, *a));
+    *c = avx2_blamka(*c, *d);
+    *b = avx2_rotr_64_24(_mm256_xor_si256(*b, *c));
+    *a = avx2_blamka(*a, *b);
+    *d = avx2_rotr_64_16(_mm256_xor_si256(*d, *a));
+    *c = avx2_blamka(*c, *d);
+    *b = avx2_rotr_64_63(_mm256_xor_si256(*b, *c));
+
+    let mut bb = _mm256_permute4x64_epi64::<0x39>(*b);
+    let mut cc = _mm256_permute4x64_epi64::<0x4E>(*c);
+    let mut dd = _mm256_permute4x64_epi64::<0x93>(*d);
+
+    *a = avx2_blamka(*a, bb);
+    dd = avx2_rotr_64_32(_mm256_xor_si256(dd, *a));
+    cc = avx2_blamka(cc, dd);
+    bb = avx2_rotr_64_24(_mm256_xor_si256(bb, cc));
+    *a = avx2_blamka(*a, bb);
+    dd = avx2_rotr_64_16(_mm256_xor_si256(dd, *a));
+    cc = avx2_blamka(cc, dd);
+    bb = avx2_rotr_64_63(_mm256_xor_si256(bb, cc));
+
+    *b = _mm256_permute4x64_epi64::<0x93>(bb);
+    *c = _mm256_permute4x64_epi64::<0x4E>(cc);
+    *d = _mm256_permute4x64_epi64::<0x39>(dd);
+}
+
+/// Two independent BLAMKA rounds, interleaved.
+/// Both groups remain in AVX2 registers; the caller selects the AVX2 kernel first.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn avx2_round_pair(
+    a0: &mut std::arch::x86_64::__m256i,
+    b0: &mut std::arch::x86_64::__m256i,
+    c0: &mut std::arch::x86_64::__m256i,
+    d0: &mut std::arch::x86_64::__m256i,
+    a1: &mut std::arch::x86_64::__m256i,
+    b1: &mut std::arch::x86_64::__m256i,
+    c1: &mut std::arch::x86_64::__m256i,
+    d1: &mut std::arch::x86_64::__m256i,
+) {
+    use std::arch::x86_64::{_mm256_permute4x64_epi64, _mm256_xor_si256};
+
+    *a0 = avx2_blamka(*a0, *b0);
+    *a1 = avx2_blamka(*a1, *b1);
+    *d0 = avx2_rotr_64_32(_mm256_xor_si256(*d0, *a0));
+    *d1 = avx2_rotr_64_32(_mm256_xor_si256(*d1, *a1));
+    *c0 = avx2_blamka(*c0, *d0);
+    *c1 = avx2_blamka(*c1, *d1);
+    *b0 = avx2_rotr_64_24(_mm256_xor_si256(*b0, *c0));
+    *b1 = avx2_rotr_64_24(_mm256_xor_si256(*b1, *c1));
+    *a0 = avx2_blamka(*a0, *b0);
+    *a1 = avx2_blamka(*a1, *b1);
+    *d0 = avx2_rotr_64_16(_mm256_xor_si256(*d0, *a0));
+    *d1 = avx2_rotr_64_16(_mm256_xor_si256(*d1, *a1));
+    *c0 = avx2_blamka(*c0, *d0);
+    *c1 = avx2_blamka(*c1, *d1);
+    *b0 = avx2_rotr_64_63(_mm256_xor_si256(*b0, *c0));
+    *b1 = avx2_rotr_64_63(_mm256_xor_si256(*b1, *c1));
+
+    let mut bb0 = _mm256_permute4x64_epi64::<0x39>(*b0);
+    let mut bb1 = _mm256_permute4x64_epi64::<0x39>(*b1);
+    let mut cc0 = _mm256_permute4x64_epi64::<0x4E>(*c0);
+    let mut cc1 = _mm256_permute4x64_epi64::<0x4E>(*c1);
+    let mut dd0 = _mm256_permute4x64_epi64::<0x93>(*d0);
+    let mut dd1 = _mm256_permute4x64_epi64::<0x93>(*d1);
+
+    *a0 = avx2_blamka(*a0, bb0);
+    *a1 = avx2_blamka(*a1, bb1);
+    dd0 = avx2_rotr_64_32(_mm256_xor_si256(dd0, *a0));
+    dd1 = avx2_rotr_64_32(_mm256_xor_si256(dd1, *a1));
+    cc0 = avx2_blamka(cc0, dd0);
+    cc1 = avx2_blamka(cc1, dd1);
+    bb0 = avx2_rotr_64_24(_mm256_xor_si256(bb0, cc0));
+    bb1 = avx2_rotr_64_24(_mm256_xor_si256(bb1, cc1));
+    *a0 = avx2_blamka(*a0, bb0);
+    *a1 = avx2_blamka(*a1, bb1);
+    dd0 = avx2_rotr_64_16(_mm256_xor_si256(dd0, *a0));
+    dd1 = avx2_rotr_64_16(_mm256_xor_si256(dd1, *a1));
+    cc0 = avx2_blamka(cc0, dd0);
+    cc1 = avx2_blamka(cc1, dd1);
+    bb0 = avx2_rotr_64_63(_mm256_xor_si256(bb0, cc0));
+    bb1 = avx2_rotr_64_63(_mm256_xor_si256(bb1, cc1));
+
+    *b0 = _mm256_permute4x64_epi64::<0x93>(bb0);
+    *b1 = _mm256_permute4x64_epi64::<0x93>(bb1);
+    *c0 = _mm256_permute4x64_epi64::<0x4E>(cc0);
+    *c1 = _mm256_permute4x64_epi64::<0x4E>(cc1);
+    *d0 = _mm256_permute4x64_epi64::<0x39>(dd0);
+    *d1 = _mm256_permute4x64_epi64::<0x39>(dd1);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn compress_avx2(rhs: &PowBlock, lhs: &PowBlock) -> PowBlock {
+    use std::arch::x86_64::{
+        __m256i, _mm256_loadu_si256, _mm256_set_epi64x, _mm256_storeu_si256, _mm256_xor_si256,
+    };
+
+    let mut r = PowBlock::default();
+    let mut q = PowBlock::default();
+
+    let rhs_ptr = rhs.0.as_ptr();
+    let lhs_ptr = lhs.0.as_ptr();
+    let r_ptr = r.0.as_mut_ptr();
+    let q_ptr = q.0.as_mut_ptr();
+
+    for vec_idx in 0..(PowBlock::SIZE / 32) {
+        let offset = vec_idx * 4;
+        let rv = _mm256_xor_si256(
+            _mm256_loadu_si256(rhs_ptr.add(offset) as *const __m256i),
+            _mm256_loadu_si256(lhs_ptr.add(offset) as *const __m256i),
+        );
+        _mm256_storeu_si256(r_ptr.add(offset) as *mut __m256i, rv);
+        _mm256_storeu_si256(q_ptr.add(offset) as *mut __m256i, rv);
+    }
+
+    for row in 0..8 {
+        let base = row * 16;
+        let mut a = _mm256_loadu_si256(q_ptr.add(base) as *const __m256i);
+        let mut b = _mm256_loadu_si256(q_ptr.add(base + 4) as *const __m256i);
+        let mut c = _mm256_loadu_si256(q_ptr.add(base + 8) as *const __m256i);
+        let mut d = _mm256_loadu_si256(q_ptr.add(base + 12) as *const __m256i);
+        avx2_round(&mut a, &mut b, &mut c, &mut d);
+        _mm256_storeu_si256(q_ptr.add(base) as *mut __m256i, a);
+        _mm256_storeu_si256(q_ptr.add(base + 4) as *mut __m256i, b);
+        _mm256_storeu_si256(q_ptr.add(base + 8) as *mut __m256i, c);
+        _mm256_storeu_si256(q_ptr.add(base + 12) as *mut __m256i, d);
+    }
+
+    for idx in 0..8 {
+        let base = idx * 2;
+
+        let mut a = _mm256_set_epi64x(
+            q.0[base + 17] as i64,
+            q.0[base + 16] as i64,
+            q.0[base + 1] as i64,
+            q.0[base] as i64,
+        );
+        let mut b = _mm256_set_epi64x(
+            q.0[base + 49] as i64,
+            q.0[base + 48] as i64,
+            q.0[base + 33] as i64,
+            q.0[base + 32] as i64,
+        );
+        let mut c = _mm256_set_epi64x(
+            q.0[base + 81] as i64,
+            q.0[base + 80] as i64,
+            q.0[base + 65] as i64,
+            q.0[base + 64] as i64,
+        );
+        let mut d = _mm256_set_epi64x(
+            q.0[base + 113] as i64,
+            q.0[base + 112] as i64,
+            q.0[base + 97] as i64,
+            q.0[base + 96] as i64,
+        );
+
+        avx2_round(&mut a, &mut b, &mut c, &mut d);
+
+        let mut aa = [0u64; 4];
+        let mut bb = [0u64; 4];
+        let mut cc = [0u64; 4];
+        let mut dd = [0u64; 4];
+        _mm256_storeu_si256(aa.as_mut_ptr() as *mut __m256i, a);
+        _mm256_storeu_si256(bb.as_mut_ptr() as *mut __m256i, b);
+        _mm256_storeu_si256(cc.as_mut_ptr() as *mut __m256i, c);
+        _mm256_storeu_si256(dd.as_mut_ptr() as *mut __m256i, d);
+
+        q.0[base] = aa[0];
+        q.0[base + 1] = aa[1];
+        q.0[base + 16] = aa[2];
+        q.0[base + 17] = aa[3];
+        q.0[base + 32] = bb[0];
+        q.0[base + 33] = bb[1];
+        q.0[base + 48] = bb[2];
+        q.0[base + 49] = bb[3];
+        q.0[base + 64] = cc[0];
+        q.0[base + 65] = cc[1];
+        q.0[base + 80] = cc[2];
+        q.0[base + 81] = cc[3];
+        q.0[base + 96] = dd[0];
+        q.0[base + 97] = dd[1];
+        q.0[base + 112] = dd[2];
+        q.0[base + 113] = dd[3];
+    }
+
+    for vec_idx in 0..(PowBlock::SIZE / 32) {
+        let offset = vec_idx * 4;
+        let qv = _mm256_loadu_si256(q_ptr.add(offset) as *const __m256i);
+        let rv = _mm256_loadu_si256(r_ptr.add(offset) as *const __m256i);
+        _mm256_storeu_si256(q_ptr.add(offset) as *mut __m256i, _mm256_xor_si256(qv, rv));
+    }
+
+    q
+}
+
+/// In-place AVX2 block compression: writes result directly into `dst`, eliminating the
+/// 1 KiB ABI return-value memcpy that the by-value `compress_avx2` incurs per call.
+///
+/// # Safety
+/// * Requires AVX2.
+/// * `dst` must not alias `rhs` or `lhs`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn compress_avx2_into(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBlock) {
+    use std::arch::x86_64::{
+        __m256i, _mm256_loadu_si256, _mm256_permute2x128_si256, _mm256_storeu_si256,
+        _mm256_xor_si256,
+    };
+
+    // q lives on the stack as the working buffer for round permutations.
+    // dst doubles as the pre-round XOR backup (r), eliminating the second stack buffer.
+    let mut q = PowBlock::default();
+
+    let rhs_ptr = rhs.0.as_ptr();
+    let lhs_ptr = lhs.0.as_ptr();
+    let dst_ptr = dst.0.as_mut_ptr();
+    let q_ptr = q.0.as_mut_ptr();
+
+    // Phase 1: XOR rhs ^ lhs → store to both dst (pre-round backup) and q (working copy).
+    for vec_idx in 0..(PowBlock::SIZE / 32) {
+        let offset = vec_idx * 4;
+        let rv = _mm256_xor_si256(
+            _mm256_loadu_si256(rhs_ptr.add(offset) as *const __m256i),
+            _mm256_loadu_si256(lhs_ptr.add(offset) as *const __m256i),
+        );
+        _mm256_storeu_si256(dst_ptr.add(offset) as *mut __m256i, rv);
+        _mm256_storeu_si256(q_ptr.add(offset) as *mut __m256i, rv);
+    }
+
+    // Phase 2: Interleave pairs of contiguous 16-element row rounds.
+    for row in (0..8).step_by(2) {
+        let base0 = row * 16;
+        let mut a0 = _mm256_loadu_si256(q_ptr.add(base0) as *const __m256i);
+        let mut b0 = _mm256_loadu_si256(q_ptr.add(base0 + 4) as *const __m256i);
+        let mut c0 = _mm256_loadu_si256(q_ptr.add(base0 + 8) as *const __m256i);
+        let mut d0 = _mm256_loadu_si256(q_ptr.add(base0 + 12) as *const __m256i);
+
+        let base1 = (row + 1) * 16;
+        let mut a1 = _mm256_loadu_si256(q_ptr.add(base1) as *const __m256i);
+        let mut b1 = _mm256_loadu_si256(q_ptr.add(base1 + 4) as *const __m256i);
+        let mut c1 = _mm256_loadu_si256(q_ptr.add(base1 + 8) as *const __m256i);
+        let mut d1 = _mm256_loadu_si256(q_ptr.add(base1 + 12) as *const __m256i);
+
+        avx2_round_pair(
+            &mut a0, &mut b0, &mut c0, &mut d0, &mut a1, &mut b1, &mut c1, &mut d1,
+        );
+
+        _mm256_storeu_si256(q_ptr.add(base0) as *mut __m256i, a0);
+        _mm256_storeu_si256(q_ptr.add(base0 + 4) as *mut __m256i, b0);
+        _mm256_storeu_si256(q_ptr.add(base0 + 8) as *mut __m256i, c0);
+        _mm256_storeu_si256(q_ptr.add(base0 + 12) as *mut __m256i, d0);
+
+        _mm256_storeu_si256(q_ptr.add(base1) as *mut __m256i, a1);
+        _mm256_storeu_si256(q_ptr.add(base1 + 4) as *mut __m256i, b1);
+        _mm256_storeu_si256(q_ptr.add(base1 + 8) as *mut __m256i, c1);
+        _mm256_storeu_si256(q_ptr.add(base1 + 12) as *mut __m256i, d1);
+    }
+
+    // Phase 3: Adjacent columns share 256-bit contiguous loads. Split their
+    // 128-bit halves into independent rounds, then recombine for contiguous
+    // scatter + XOR against the pre-round backup in dst.
+    for idx in (0..8).step_by(2) {
+        let base = idx * 2;
+        let a_lo = _mm256_loadu_si256(q_ptr.add(base) as *const __m256i);
+        let a_hi = _mm256_loadu_si256(q_ptr.add(base + 16) as *const __m256i);
+        let mut a0 = _mm256_permute2x128_si256::<0x20>(a_lo, a_hi);
+        let mut a1 = _mm256_permute2x128_si256::<0x31>(a_lo, a_hi);
+        let b_lo = _mm256_loadu_si256(q_ptr.add(base + 32) as *const __m256i);
+        let b_hi = _mm256_loadu_si256(q_ptr.add(base + 48) as *const __m256i);
+        let mut b0 = _mm256_permute2x128_si256::<0x20>(b_lo, b_hi);
+        let mut b1 = _mm256_permute2x128_si256::<0x31>(b_lo, b_hi);
+        let c_lo = _mm256_loadu_si256(q_ptr.add(base + 64) as *const __m256i);
+        let c_hi = _mm256_loadu_si256(q_ptr.add(base + 80) as *const __m256i);
+        let mut c0 = _mm256_permute2x128_si256::<0x20>(c_lo, c_hi);
+        let mut c1 = _mm256_permute2x128_si256::<0x31>(c_lo, c_hi);
+        let d_lo = _mm256_loadu_si256(q_ptr.add(base + 96) as *const __m256i);
+        let d_hi = _mm256_loadu_si256(q_ptr.add(base + 112) as *const __m256i);
+        let mut d0 = _mm256_permute2x128_si256::<0x20>(d_lo, d_hi);
+        let mut d1 = _mm256_permute2x128_si256::<0x31>(d_lo, d_hi);
+        avx2_round_pair(
+            &mut a0, &mut b0, &mut c0, &mut d0, &mut a1, &mut b1, &mut c1, &mut d1,
+        );
+        let a_lo = _mm256_permute2x128_si256::<0x20>(a0, a1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base) as *mut __m256i,
+            _mm256_xor_si256(
+                a_lo,
+                _mm256_loadu_si256(dst_ptr.add(base) as *const __m256i),
+            ),
+        );
+        let a_hi = _mm256_permute2x128_si256::<0x31>(a0, a1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base + 16) as *mut __m256i,
+            _mm256_xor_si256(
+                a_hi,
+                _mm256_loadu_si256(dst_ptr.add(base + 16) as *const __m256i),
+            ),
+        );
+        let b_lo = _mm256_permute2x128_si256::<0x20>(b0, b1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base + 32) as *mut __m256i,
+            _mm256_xor_si256(
+                b_lo,
+                _mm256_loadu_si256(dst_ptr.add(base + 32) as *const __m256i),
+            ),
+        );
+        let b_hi = _mm256_permute2x128_si256::<0x31>(b0, b1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base + 48) as *mut __m256i,
+            _mm256_xor_si256(
+                b_hi,
+                _mm256_loadu_si256(dst_ptr.add(base + 48) as *const __m256i),
+            ),
+        );
+        let c_lo = _mm256_permute2x128_si256::<0x20>(c0, c1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base + 64) as *mut __m256i,
+            _mm256_xor_si256(
+                c_lo,
+                _mm256_loadu_si256(dst_ptr.add(base + 64) as *const __m256i),
+            ),
+        );
+        let c_hi = _mm256_permute2x128_si256::<0x31>(c0, c1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base + 80) as *mut __m256i,
+            _mm256_xor_si256(
+                c_hi,
+                _mm256_loadu_si256(dst_ptr.add(base + 80) as *const __m256i),
+            ),
+        );
+        let d_lo = _mm256_permute2x128_si256::<0x20>(d0, d1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base + 96) as *mut __m256i,
+            _mm256_xor_si256(
+                d_lo,
+                _mm256_loadu_si256(dst_ptr.add(base + 96) as *const __m256i),
+            ),
+        );
+        let d_hi = _mm256_permute2x128_si256::<0x31>(d0, d1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base + 112) as *mut __m256i,
+            _mm256_xor_si256(
+                d_hi,
+                _mm256_loadu_si256(dst_ptr.add(base + 112) as *const __m256i),
+            ),
+        );
+    }
+    // No Phase 4 needed — final XOR was fused into the column scatter above.
+}
+
+/// Like [`compress_avx2_into`] but performs a mid-compress prefetch for the
+/// data-dependent phase: after column round 0 finalises `dst[0]`, this reads
+/// that value, computes the next iteration's ref_index, and prefetches the
+/// target block.
+///
+/// # Safety
+/// * Requires AVX2.
+/// * `dst` must not alias `rhs` or `lhs`.
+/// * `memory_blocks_base` must point to a valid PowBlock array.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn compress_avx2_into_mid_prefetch(
+    rhs: &PowBlock,
+    lhs: &PowBlock,
+    dst: &mut PowBlock,
+    next_ref_area_size: usize,
+    memory_blocks_base: *const PowBlock,
+    skip_from: usize,
+) {
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm256_castsi128_si256, _mm256_castsi256_si128, _mm256_extracti128_si256,
+        _mm256_inserti128_si256, _mm256_loadu_si256, _mm256_permute2x128_si256,
+        _mm256_storeu_si256, _mm256_xor_si256, _mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128,
+    };
+
+    let mut q = PowBlock::default();
+
+    let rhs_ptr = rhs.0.as_ptr();
+    let lhs_ptr = lhs.0.as_ptr();
+    let dst_ptr = dst.0.as_mut_ptr();
+    let q_ptr = q.0.as_mut_ptr();
+
+    // Phase 1: XOR rhs ^ lhs → store to both dst (pre-round backup) and q (working copy).
+    for vec_idx in 0..(PowBlock::SIZE / 32) {
+        let offset = vec_idx * 4;
+        let rv = _mm256_xor_si256(
+            _mm256_loadu_si256(rhs_ptr.add(offset) as *const __m256i),
+            _mm256_loadu_si256(lhs_ptr.add(offset) as *const __m256i),
+        );
+        _mm256_storeu_si256(dst_ptr.add(offset) as *mut __m256i, rv);
+        _mm256_storeu_si256(q_ptr.add(offset) as *mut __m256i, rv);
+    }
+
+    // Phase 2: Interleave pairs of contiguous 16-element row rounds.
+    for row in (0..8).step_by(2) {
+        let base0 = row * 16;
+        let mut a0 = _mm256_loadu_si256(q_ptr.add(base0) as *const __m256i);
+        let mut b0 = _mm256_loadu_si256(q_ptr.add(base0 + 4) as *const __m256i);
+        let mut c0 = _mm256_loadu_si256(q_ptr.add(base0 + 8) as *const __m256i);
+        let mut d0 = _mm256_loadu_si256(q_ptr.add(base0 + 12) as *const __m256i);
+
+        let base1 = (row + 1) * 16;
+        let mut a1 = _mm256_loadu_si256(q_ptr.add(base1) as *const __m256i);
+        let mut b1 = _mm256_loadu_si256(q_ptr.add(base1 + 4) as *const __m256i);
+        let mut c1 = _mm256_loadu_si256(q_ptr.add(base1 + 8) as *const __m256i);
+        let mut d1 = _mm256_loadu_si256(q_ptr.add(base1 + 12) as *const __m256i);
+
+        avx2_round_pair(
+            &mut a0, &mut b0, &mut c0, &mut d0, &mut a1, &mut b1, &mut c1, &mut d1,
+        );
+
+        _mm256_storeu_si256(q_ptr.add(base0) as *mut __m256i, a0);
+        _mm256_storeu_si256(q_ptr.add(base0 + 4) as *mut __m256i, b0);
+        _mm256_storeu_si256(q_ptr.add(base0 + 8) as *mut __m256i, c0);
+        _mm256_storeu_si256(q_ptr.add(base0 + 12) as *mut __m256i, d0);
+
+        _mm256_storeu_si256(q_ptr.add(base1) as *mut __m256i, a1);
+        _mm256_storeu_si256(q_ptr.add(base1 + 4) as *mut __m256i, b1);
+        _mm256_storeu_si256(q_ptr.add(base1 + 8) as *mut __m256i, c1);
+        _mm256_storeu_si256(q_ptr.add(base1 + 12) as *mut __m256i, d1);
+    }
+
+    // Scatter-XOR for the unpaired first and last column rounds.
+    macro_rules! scatter_xor_pair {
+        ($vec:expr, $lo_off:expr, $hi_off:expr) => {{
+            let lo = _mm256_castsi256_si128($vec);
+            let hi = _mm256_extracti128_si256::<1>($vec);
+            let d_lo = _mm_loadu_si128(dst_ptr.add($lo_off) as *const __m128i);
+            let d_hi = _mm_loadu_si128(dst_ptr.add($hi_off) as *const __m128i);
+            _mm_storeu_si128(
+                dst_ptr.add($lo_off) as *mut __m128i,
+                _mm_xor_si128(lo, d_lo),
+            );
+            _mm_storeu_si128(
+                dst_ptr.add($hi_off) as *mut __m128i,
+                _mm_xor_si128(hi, d_hi),
+            );
+        }};
+    }
+
+    // Phase 3a: Column round 0 — writes dst[0] to its final value.
+    {
+        let base = 0;
+        let mut a = _mm256_inserti128_si256::<1>(
+            _mm256_castsi128_si256(_mm_loadu_si128(q_ptr.add(base) as *const __m128i)),
+            _mm_loadu_si128(q_ptr.add(base + 16) as *const __m128i),
+        );
+        let mut b = _mm256_inserti128_si256::<1>(
+            _mm256_castsi128_si256(_mm_loadu_si128(q_ptr.add(base + 32) as *const __m128i)),
+            _mm_loadu_si128(q_ptr.add(base + 48) as *const __m128i),
+        );
+        let mut c = _mm256_inserti128_si256::<1>(
+            _mm256_castsi128_si256(_mm_loadu_si128(q_ptr.add(base + 64) as *const __m128i)),
+            _mm_loadu_si128(q_ptr.add(base + 80) as *const __m128i),
+        );
+        let mut d = _mm256_inserti128_si256::<1>(
+            _mm256_castsi128_si256(_mm_loadu_si128(q_ptr.add(base + 96) as *const __m128i)),
+            _mm_loadu_si128(q_ptr.add(base + 112) as *const __m128i),
+        );
+
+        avx2_round(&mut a, &mut b, &mut c, &mut d);
+
+        scatter_xor_pair!(a, base, base + 16);
+        scatter_xor_pair!(b, base + 32, base + 48);
+        scatter_xor_pair!(c, base + 64, base + 80);
+        scatter_xor_pair!(d, base + 96, base + 112);
+    }
+
+    // --- Mid-compress prefetch ---
+    // dst[0] now has its final value: compute the next iteration's ref_index
+    // and prefetch it.
+    {
+        let rand = *dst_ptr;
+        let mut next_ref = reference_index(next_ref_area_size, rand);
+        if store_skipped(next_ref, skip_from) {
+            // Rebuilt from its stored predecessor, so fetch that instead.
+            next_ref -= 1;
+        }
+        prefetch_pow_block::<ISA_AVX2>(&*memory_blocks_base.add(next_ref));
+    }
+
+    // Phase 3b: Pair adjacent columns 1+2, 3+4, and 5+6 after the prefetch.
+    // Their contiguous loads/stores use the same layout as compress_avx2_into.
+    for idx in (1..7).step_by(2) {
+        let base = idx * 2;
+        let a_lo = _mm256_loadu_si256(q_ptr.add(base) as *const __m256i);
+        let a_hi = _mm256_loadu_si256(q_ptr.add(base + 16) as *const __m256i);
+        let mut a0 = _mm256_permute2x128_si256::<0x20>(a_lo, a_hi);
+        let mut a1 = _mm256_permute2x128_si256::<0x31>(a_lo, a_hi);
+        let b_lo = _mm256_loadu_si256(q_ptr.add(base + 32) as *const __m256i);
+        let b_hi = _mm256_loadu_si256(q_ptr.add(base + 48) as *const __m256i);
+        let mut b0 = _mm256_permute2x128_si256::<0x20>(b_lo, b_hi);
+        let mut b1 = _mm256_permute2x128_si256::<0x31>(b_lo, b_hi);
+        let c_lo = _mm256_loadu_si256(q_ptr.add(base + 64) as *const __m256i);
+        let c_hi = _mm256_loadu_si256(q_ptr.add(base + 80) as *const __m256i);
+        let mut c0 = _mm256_permute2x128_si256::<0x20>(c_lo, c_hi);
+        let mut c1 = _mm256_permute2x128_si256::<0x31>(c_lo, c_hi);
+        let d_lo = _mm256_loadu_si256(q_ptr.add(base + 96) as *const __m256i);
+        let d_hi = _mm256_loadu_si256(q_ptr.add(base + 112) as *const __m256i);
+        let mut d0 = _mm256_permute2x128_si256::<0x20>(d_lo, d_hi);
+        let mut d1 = _mm256_permute2x128_si256::<0x31>(d_lo, d_hi);
+        avx2_round_pair(
+            &mut a0, &mut b0, &mut c0, &mut d0, &mut a1, &mut b1, &mut c1, &mut d1,
+        );
+        let a_lo = _mm256_permute2x128_si256::<0x20>(a0, a1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base) as *mut __m256i,
+            _mm256_xor_si256(
+                a_lo,
+                _mm256_loadu_si256(dst_ptr.add(base) as *const __m256i),
+            ),
+        );
+        let a_hi = _mm256_permute2x128_si256::<0x31>(a0, a1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base + 16) as *mut __m256i,
+            _mm256_xor_si256(
+                a_hi,
+                _mm256_loadu_si256(dst_ptr.add(base + 16) as *const __m256i),
+            ),
+        );
+        let b_lo = _mm256_permute2x128_si256::<0x20>(b0, b1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base + 32) as *mut __m256i,
+            _mm256_xor_si256(
+                b_lo,
+                _mm256_loadu_si256(dst_ptr.add(base + 32) as *const __m256i),
+            ),
+        );
+        let b_hi = _mm256_permute2x128_si256::<0x31>(b0, b1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base + 48) as *mut __m256i,
+            _mm256_xor_si256(
+                b_hi,
+                _mm256_loadu_si256(dst_ptr.add(base + 48) as *const __m256i),
+            ),
+        );
+        let c_lo = _mm256_permute2x128_si256::<0x20>(c0, c1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base + 64) as *mut __m256i,
+            _mm256_xor_si256(
+                c_lo,
+                _mm256_loadu_si256(dst_ptr.add(base + 64) as *const __m256i),
+            ),
+        );
+        let c_hi = _mm256_permute2x128_si256::<0x31>(c0, c1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base + 80) as *mut __m256i,
+            _mm256_xor_si256(
+                c_hi,
+                _mm256_loadu_si256(dst_ptr.add(base + 80) as *const __m256i),
+            ),
+        );
+        let d_lo = _mm256_permute2x128_si256::<0x20>(d0, d1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base + 96) as *mut __m256i,
+            _mm256_xor_si256(
+                d_lo,
+                _mm256_loadu_si256(dst_ptr.add(base + 96) as *const __m256i),
+            ),
+        );
+        let d_hi = _mm256_permute2x128_si256::<0x31>(d0, d1);
+        _mm256_storeu_si256(
+            dst_ptr.add(base + 112) as *mut __m256i,
+            _mm256_xor_si256(
+                d_hi,
+                _mm256_loadu_si256(dst_ptr.add(base + 112) as *const __m256i),
+            ),
+        );
+    }
+    // Column 7 is the unpaired tail; a pair here would cross the block boundary.
+    {
+        let base = 7 * 2;
+
+        let mut a = _mm256_inserti128_si256::<1>(
+            _mm256_castsi128_si256(_mm_loadu_si128(q_ptr.add(base) as *const __m128i)),
+            _mm_loadu_si128(q_ptr.add(base + 16) as *const __m128i),
+        );
+        let mut b = _mm256_inserti128_si256::<1>(
+            _mm256_castsi128_si256(_mm_loadu_si128(q_ptr.add(base + 32) as *const __m128i)),
+            _mm_loadu_si128(q_ptr.add(base + 48) as *const __m128i),
+        );
+        let mut c = _mm256_inserti128_si256::<1>(
+            _mm256_castsi128_si256(_mm_loadu_si128(q_ptr.add(base + 64) as *const __m128i)),
+            _mm_loadu_si128(q_ptr.add(base + 80) as *const __m128i),
+        );
+        let mut d = _mm256_inserti128_si256::<1>(
+            _mm256_castsi128_si256(_mm_loadu_si128(q_ptr.add(base + 96) as *const __m128i)),
+            _mm_loadu_si128(q_ptr.add(base + 112) as *const __m128i),
+        );
+
+        avx2_round(&mut a, &mut b, &mut c, &mut d);
+
+        scatter_xor_pair!(a, base, base + 16);
+        scatter_xor_pair!(b, base + 32, base + 48);
+        scatter_xor_pair!(c, base + 64, base + 80);
+        scatter_xor_pair!(d, base + 96, base + 112);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl")]
+unsafe fn compress_avx512(rhs: &PowBlock, lhs: &PowBlock) -> PowBlock {
+    let mut dst = PowBlock::default();
+    compress_avx512_into(rhs, lhs, &mut dst);
+    dst
+}
+
+/// In-place AVX-512 block compression: processes two rows/columns per iteration
+/// using 512-bit registers, each holding two independent 4-element groups.
+///
+/// Column gather/scatter uses 256-bit contiguous loads because each column pair
+/// (base_i, base_i+2) is adjacent in memory. A single `vshufi64x2` converts
+/// between the contiguous memory layout and the round's per-column register
+/// layout.
+///
+/// # Safety
+/// * Requires AVX-512F + AVX-512VL.
+/// * `dst` must not alias `rhs` or `lhs`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl")]
+unsafe fn compress_avx512_into(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBlock) {
+    use std::arch::x86_64::{
+        __m256i, __m512i, _mm256_loadu_si256, _mm256_storeu_si256, _mm256_xor_si256,
+        _mm512_castsi256_si512, _mm512_castsi512_si256, _mm512_extracti64x4_epi64,
+        _mm512_inserti64x4, _mm512_loadu_si512, _mm512_shuffle_i64x2, _mm512_storeu_si512,
+        _mm512_xor_si512,
+    };
+
+    // q lives on the stack as the working buffer for round permutations.
+    // dst doubles as the pre-round XOR backup (r), eliminating the second stack buffer.
+    // Use MaybeUninit — Phase 1 fully writes q before any reads.
+    let mut q = std::mem::MaybeUninit::<PowBlock>::uninit();
+
+    let rhs_ptr = rhs.0.as_ptr();
+    let lhs_ptr = lhs.0.as_ptr();
+    let dst_ptr = dst.0.as_mut_ptr();
+    let q_ptr = q.as_mut_ptr() as *mut u64;
+
+    // Phase 1: XOR rhs ^ lhs → store to both dst (pre-round backup) and q (working copy).
+    for vec_idx in 0..(PowBlock::SIZE / 64) {
+        let offset = vec_idx * 8;
+        let rv = _mm512_xor_si512(
+            _mm512_loadu_si512(rhs_ptr.add(offset) as *const __m512i),
+            _mm512_loadu_si512(lhs_ptr.add(offset) as *const __m512i),
+        );
+        _mm512_storeu_si512(dst_ptr.add(offset) as *mut __m512i, rv);
+        _mm512_storeu_si512(q_ptr.add(offset) as *mut __m512i, rv);
+    }
+
+    // Phase 2: Row rounds — process 2 rows per iteration via 512-bit registers.
+    // Each __m512i packs one 4-u64 segment from each row (lo half = row 2k, hi = row 2k+1).
+    for pair in 0..4 {
+        let base0 = pair * 2 * 16;
+        let base1 = (pair * 2 + 1) * 16;
+        let mut a = _mm512_inserti64x4::<1>(
+            _mm512_castsi256_si512(_mm256_loadu_si256(q_ptr.add(base0) as *const __m256i)),
+            _mm256_loadu_si256(q_ptr.add(base1) as *const __m256i),
+        );
+        let mut b = _mm512_inserti64x4::<1>(
+            _mm512_castsi256_si512(_mm256_loadu_si256(q_ptr.add(base0 + 4) as *const __m256i)),
+            _mm256_loadu_si256(q_ptr.add(base1 + 4) as *const __m256i),
+        );
+        let mut c = _mm512_inserti64x4::<1>(
+            _mm512_castsi256_si512(_mm256_loadu_si256(q_ptr.add(base0 + 8) as *const __m256i)),
+            _mm256_loadu_si256(q_ptr.add(base1 + 8) as *const __m256i),
+        );
+        let mut d = _mm512_inserti64x4::<1>(
+            _mm512_castsi256_si512(_mm256_loadu_si256(q_ptr.add(base0 + 12) as *const __m256i)),
+            _mm256_loadu_si256(q_ptr.add(base1 + 12) as *const __m256i),
+        );
+
+        avx512_round(&mut a, &mut b, &mut c, &mut d);
+
+        _mm256_storeu_si256(q_ptr.add(base0) as *mut __m256i, _mm512_castsi512_si256(a));
+        _mm256_storeu_si256(
+            q_ptr.add(base1) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(a),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base0 + 4) as *mut __m256i,
+            _mm512_castsi512_si256(b),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base1 + 4) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(b),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base0 + 8) as *mut __m256i,
+            _mm512_castsi512_si256(c),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base1 + 8) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(c),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base0 + 12) as *mut __m256i,
+            _mm512_castsi512_si256(d),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base1 + 12) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(d),
+        );
+    }
+
+    // Phase 3: Column rounds — process 2 columns per iteration via 512-bit registers.
+    // Since base_j = base_i + 2, each column pair is contiguous at 256-bit granularity.
+    // Gather: 2 × 256-bit contiguous loads → inserti64x4 → vshufi64x2 to reach the
+    // round's [col_i_row0, col_i_row2, col_j_row0, col_j_row2] layout.
+    // Scatter: same vshufi64x2 back to contiguous → 2 × 256-bit XOR+store to dst.
+    // Swap 128-bit chunks 1↔2 to convert between contiguous and per-column layouts.
+    const DEINTERLEAVE: i32 = 0xD8;
+
+    macro_rules! gather_col_pair {
+        ($lo_off:expr, $hi_off:expr) => {{
+            let raw = _mm512_inserti64x4::<1>(
+                _mm512_castsi256_si512(_mm256_loadu_si256(q_ptr.add($lo_off) as *const __m256i)),
+                _mm256_loadu_si256(q_ptr.add($hi_off) as *const __m256i),
+            );
+            _mm512_shuffle_i64x2::<DEINTERLEAVE>(raw, raw)
+        }};
+    }
+
+    macro_rules! scatter_xor_256 {
+        ($vec:expr, $lo_off:expr, $hi_off:expr) => {{
+            let contiguous = _mm512_shuffle_i64x2::<DEINTERLEAVE>($vec, $vec);
+            let lo = _mm512_castsi512_si256(contiguous);
+            let hi = _mm512_extracti64x4_epi64::<1>(contiguous);
+            _mm256_storeu_si256(
+                dst_ptr.add($lo_off) as *mut __m256i,
+                _mm256_xor_si256(
+                    lo,
+                    _mm256_loadu_si256(dst_ptr.add($lo_off) as *const __m256i),
+                ),
+            );
+            _mm256_storeu_si256(
+                dst_ptr.add($hi_off) as *mut __m256i,
+                _mm256_xor_si256(
+                    hi,
+                    _mm256_loadu_si256(dst_ptr.add($hi_off) as *const __m256i),
+                ),
+            );
+        }};
+    }
+
+    for pair in 0..4 {
+        let base = pair * 4; // base_i; base_j = base + 2 is implicit in 256-bit loads
+
+        let mut a = gather_col_pair!(base, base + 16);
+        let mut b = gather_col_pair!(base + 32, base + 48);
+        let mut c = gather_col_pair!(base + 64, base + 80);
+        let mut d = gather_col_pair!(base + 96, base + 112);
+
+        avx512_round(&mut a, &mut b, &mut c, &mut d);
+
+        scatter_xor_256!(a, base, base + 16);
+        scatter_xor_256!(b, base + 32, base + 48);
+        scatter_xor_256!(c, base + 64, base + 80);
+        scatter_xor_256!(d, base + 96, base + 112);
+    }
+    // No Phase 4 needed — final XOR was fused into the column scatter above.
+}
+
+/// Like [`compress_avx512_into`] but performs a mid-compress prefetch for the
+/// data-dependent phase: after column pair 0 finalises `dst[0]`, this reads
+/// that value, computes the next iteration's ref_index, and prefetches the
+/// target block.
+///
+/// Uses the same 256-bit contiguous gather/scatter as `compress_avx512_into`.
+///
+/// # Safety
+/// * Requires AVX-512F + AVX-512VL.
+/// * `dst` must not alias `rhs` or `lhs`.
+/// * `memory_blocks_base` must point to a valid PowBlock array.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl")]
+unsafe fn compress_avx512_into_mid_prefetch(
+    rhs: &PowBlock,
+    lhs: &PowBlock,
+    dst: &mut PowBlock,
+    next_ref_area_size: usize,
+    memory_blocks_base: *const PowBlock,
+) {
+    use std::arch::x86_64::{
+        __m256i, __m512i, _mm256_loadu_si256, _mm256_storeu_si256, _mm256_xor_si256,
+        _mm512_castsi256_si512, _mm512_castsi512_si256, _mm512_extracti64x4_epi64,
+        _mm512_inserti64x4, _mm512_loadu_si512, _mm512_shuffle_i64x2, _mm512_storeu_si512,
+        _mm512_xor_si512,
+    };
+
+    // Use MaybeUninit — Phase 1 fully writes q before any reads.
+    let mut q = std::mem::MaybeUninit::<PowBlock>::uninit();
+
+    let rhs_ptr = rhs.0.as_ptr();
+    let lhs_ptr = lhs.0.as_ptr();
+    let dst_ptr = dst.0.as_mut_ptr();
+    let q_ptr = q.as_mut_ptr() as *mut u64;
+
+    // Phase 1: XOR rhs ^ lhs → store to both dst (pre-round backup) and q (working copy).
+    for vec_idx in 0..(PowBlock::SIZE / 64) {
+        let offset = vec_idx * 8;
+        let rv = _mm512_xor_si512(
+            _mm512_loadu_si512(rhs_ptr.add(offset) as *const __m512i),
+            _mm512_loadu_si512(lhs_ptr.add(offset) as *const __m512i),
+        );
+        _mm512_storeu_si512(dst_ptr.add(offset) as *mut __m512i, rv);
+        _mm512_storeu_si512(q_ptr.add(offset) as *mut __m512i, rv);
+    }
+
+    // Phase 2: Row rounds (identical to compress_avx512_into).
+    for pair in 0..4 {
+        let base0 = pair * 2 * 16;
+        let base1 = (pair * 2 + 1) * 16;
+        let mut a = _mm512_inserti64x4::<1>(
+            _mm512_castsi256_si512(_mm256_loadu_si256(q_ptr.add(base0) as *const __m256i)),
+            _mm256_loadu_si256(q_ptr.add(base1) as *const __m256i),
+        );
+        let mut b = _mm512_inserti64x4::<1>(
+            _mm512_castsi256_si512(_mm256_loadu_si256(q_ptr.add(base0 + 4) as *const __m256i)),
+            _mm256_loadu_si256(q_ptr.add(base1 + 4) as *const __m256i),
+        );
+        let mut c = _mm512_inserti64x4::<1>(
+            _mm512_castsi256_si512(_mm256_loadu_si256(q_ptr.add(base0 + 8) as *const __m256i)),
+            _mm256_loadu_si256(q_ptr.add(base1 + 8) as *const __m256i),
+        );
+        let mut d = _mm512_inserti64x4::<1>(
+            _mm512_castsi256_si512(_mm256_loadu_si256(q_ptr.add(base0 + 12) as *const __m256i)),
+            _mm256_loadu_si256(q_ptr.add(base1 + 12) as *const __m256i),
+        );
+
+        avx512_round(&mut a, &mut b, &mut c, &mut d);
+
+        _mm256_storeu_si256(q_ptr.add(base0) as *mut __m256i, _mm512_castsi512_si256(a));
+        _mm256_storeu_si256(
+            q_ptr.add(base1) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(a),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base0 + 4) as *mut __m256i,
+            _mm512_castsi512_si256(b),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base1 + 4) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(b),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base0 + 8) as *mut __m256i,
+            _mm512_castsi512_si256(c),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base1 + 8) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(c),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base0 + 12) as *mut __m256i,
+            _mm512_castsi512_si256(d),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base1 + 12) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(d),
+        );
+    }
+
+    // Column gather/scatter helpers (same as compress_avx512_into).
+    const DEINTERLEAVE: i32 = 0xD8;
+
+    macro_rules! gather_col_pair {
+        ($lo_off:expr, $hi_off:expr) => {{
+            let raw = _mm512_inserti64x4::<1>(
+                _mm512_castsi256_si512(_mm256_loadu_si256(q_ptr.add($lo_off) as *const __m256i)),
+                _mm256_loadu_si256(q_ptr.add($hi_off) as *const __m256i),
+            );
+            _mm512_shuffle_i64x2::<DEINTERLEAVE>(raw, raw)
+        }};
+    }
+
+    macro_rules! scatter_xor_256 {
+        ($vec:expr, $lo_off:expr, $hi_off:expr) => {{
+            let contiguous = _mm512_shuffle_i64x2::<DEINTERLEAVE>($vec, $vec);
+            let lo = _mm512_castsi512_si256(contiguous);
+            let hi = _mm512_extracti64x4_epi64::<1>(contiguous);
+            _mm256_storeu_si256(
+                dst_ptr.add($lo_off) as *mut __m256i,
+                _mm256_xor_si256(
+                    lo,
+                    _mm256_loadu_si256(dst_ptr.add($lo_off) as *const __m256i),
+                ),
+            );
+            _mm256_storeu_si256(
+                dst_ptr.add($hi_off) as *mut __m256i,
+                _mm256_xor_si256(
+                    hi,
+                    _mm256_loadu_si256(dst_ptr.add($hi_off) as *const __m256i),
+                ),
+            );
+        }};
+    }
+
+    // Phase 3a: Column pair 0 (columns 0+1) — writes dst[0] to its final value.
+    {
+        let base = 0;
+
+        let mut a = gather_col_pair!(base, base + 16);
+        let mut b = gather_col_pair!(base + 32, base + 48);
+        let mut c = gather_col_pair!(base + 64, base + 80);
+        let mut d = gather_col_pair!(base + 96, base + 112);
+
+        avx512_round(&mut a, &mut b, &mut c, &mut d);
+
+        scatter_xor_256!(a, base, base + 16);
+        scatter_xor_256!(b, base + 32, base + 48);
+        scatter_xor_256!(c, base + 64, base + 80);
+        scatter_xor_256!(d, base + 96, base + 112);
+    }
+
+    // --- Mid-compress prefetch ---
+    // dst[0] now has its final value: compute the next iteration's ref_index
+    // and prefetch it.
+    {
+        let rand = *dst_ptr;
+        let next_ref = reference_index(next_ref_area_size, rand);
+        prefetch_pow_block::<ISA_AVX512>(&*memory_blocks_base.add(next_ref));
+    }
+
+    // Phase 3b: Column pairs 1-3 (columns 2-7).
+    for pair in 1..4 {
+        let base = pair * 4;
+
+        let mut a = gather_col_pair!(base, base + 16);
+        let mut b = gather_col_pair!(base + 32, base + 48);
+        let mut c = gather_col_pair!(base + 64, base + 80);
+        let mut d = gather_col_pair!(base + 96, base + 112);
+
+        avx512_round(&mut a, &mut b, &mut c, &mut d);
+
+        scatter_xor_256!(a, base, base + 16);
+        scatter_xor_256!(b, base + 32, base + 48);
+        scatter_xor_256!(c, base + 64, base + 80);
+        scatter_xor_256!(d, base + 96, base + 112);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AArch64 NEON SIMD path
+// ---------------------------------------------------------------------------
+//
+// Baseline NEON is mandatory on AArch64. The optional SHA3 path is guarded at
+// selection and inlined under fill_blocks_neon_sha3's target-feature boundary.
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn neon_blamka(
+    a: std::arch::aarch64::uint64x2_t,
+    b: std::arch::aarch64::uint64x2_t,
+) -> std::arch::aarch64::uint64x2_t {
+    // a + b + 2*(lo32(a)*lo32(b))  =  (a+b) + lo(a)*lo(b) + lo(a)*lo(b)
+    // Inline asm emits UMLAL.2D (widening multiply-accumulate) twice.
+    let out: std::arch::aarch64::uint64x2_t;
+    std::arch::asm!(
+        "xtn  {lo_a}.2s, {a:v}.2d",
+        "xtn  {lo_b}.2s, {b:v}.2d",
+        "add  {out:v}.2d, {a:v}.2d, {b:v}.2d",
+        "umlal {out:v}.2d, {lo_a}.2s, {lo_b}.2s",
+        "umlal {out:v}.2d, {lo_a}.2s, {lo_b}.2s",
+        a = in(vreg) a,
+        b = in(vreg) b,
+        lo_a = out(vreg) _,
+        lo_b = out(vreg) _,
+        out = out(vreg) out,
+        options(pure, nomem, nostack, preserves_flags),
+    );
+    out
+}
+
+/// XOR-and-rotate: `rotr(a ^ b, N)`.  Uses the single-instruction XAR when the
+/// build target or selected runtime path supports SHA3; otherwise uses shifts.
+#[cfg(target_arch = "aarch64")]
+macro_rules! neon_rotr_xor {
+    ($sha3:expr, $a:expr, $b:expr, $n:literal) => {{
+        if $sha3 || cfg!(target_feature = "sha3") {
+            std::arch::aarch64::vxarq_u64::<$n>($a, $b)
+        } else {
+            let x = std::arch::aarch64::veorq_u64($a, $b);
+            std::arch::aarch64::vorrq_u64(
+                std::arch::aarch64::vshrq_n_u64::<$n>(x),
+                std::arch::aarch64::vshlq_n_u64::<{ 64 - $n }>(x),
+            )
+        }
+    }};
+}
+
+/// Full BLAMKA round on 16 u64 elements packed as 4 lo/hi NEON register pairs.
+///
+/// Performs both the column step and the diagonal step, matching the scalar
+/// `permute!` macro semantics. The diagonal step rotates b/c/d lane assignments
+/// via `vextq_u64` to achieve cross-lane permutation without scatter/gather.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)] // Explicit SIMD register pairs form one round.
+unsafe fn neon_round<const SHA3: bool>(
+    a_lo: &mut std::arch::aarch64::uint64x2_t,
+    a_hi: &mut std::arch::aarch64::uint64x2_t,
+    b_lo: &mut std::arch::aarch64::uint64x2_t,
+    b_hi: &mut std::arch::aarch64::uint64x2_t,
+    c_lo: &mut std::arch::aarch64::uint64x2_t,
+    c_hi: &mut std::arch::aarch64::uint64x2_t,
+    d_lo: &mut std::arch::aarch64::uint64x2_t,
+    d_hi: &mut std::arch::aarch64::uint64x2_t,
+) {
+    use std::arch::aarch64::vextq_u64;
+
+    // Column step: lo and hi half-rounds, interleaved.
+    //
+    // G step 1: a = a + b + 2*lo32(a)*lo32(b);  d = rotr32(d ^ a)
+    *a_lo = neon_blamka(*a_lo, *b_lo);
+    *a_hi = neon_blamka(*a_hi, *b_hi);
+    *d_lo = neon_rotr_xor!(SHA3, *d_lo, *a_lo, 32);
+    *d_hi = neon_rotr_xor!(SHA3, *d_hi, *a_hi, 32);
+    // G step 2: c = c + d + 2*lo32(c)*lo32(d);  b = rotr24(b ^ c)
+    *c_lo = neon_blamka(*c_lo, *d_lo);
+    *c_hi = neon_blamka(*c_hi, *d_hi);
+    *b_lo = neon_rotr_xor!(SHA3, *b_lo, *c_lo, 24);
+    *b_hi = neon_rotr_xor!(SHA3, *b_hi, *c_hi, 24);
+    // G step 3: a = a + b + 2*lo32(a)*lo32(b);  d = rotr16(d ^ a)
+    *a_lo = neon_blamka(*a_lo, *b_lo);
+    *a_hi = neon_blamka(*a_hi, *b_hi);
+    *d_lo = neon_rotr_xor!(SHA3, *d_lo, *a_lo, 16);
+    *d_hi = neon_rotr_xor!(SHA3, *d_hi, *a_hi, 16);
+    // G step 4: c = c + d + 2*lo32(c)*lo32(d);  b = rotr63(b ^ c)
+    *c_lo = neon_blamka(*c_lo, *d_lo);
+    *c_hi = neon_blamka(*c_hi, *d_hi);
+    *b_lo = neon_rotr_xor!(SHA3, *b_lo, *c_lo, 63);
+    *b_hi = neon_rotr_xor!(SHA3, *b_hi, *c_hi, 63);
+
+    // Diagonal step: rotate b by 1, c by 2, d by 3 across the 4-wide logical
+    // vector, then run the half-rounds interleaved, then un-rotate.
+    let mut bb_lo = vextq_u64::<1>(*b_lo, *b_hi);
+    let mut bb_hi = vextq_u64::<1>(*b_hi, *b_lo);
+    let mut cc_lo = *c_hi;
+    let mut cc_hi = *c_lo;
+    let mut dd_lo = vextq_u64::<1>(*d_hi, *d_lo);
+    let mut dd_hi = vextq_u64::<1>(*d_lo, *d_hi);
+
+    // G step 1
+    *a_lo = neon_blamka(*a_lo, bb_lo);
+    *a_hi = neon_blamka(*a_hi, bb_hi);
+    dd_lo = neon_rotr_xor!(SHA3, dd_lo, *a_lo, 32);
+    dd_hi = neon_rotr_xor!(SHA3, dd_hi, *a_hi, 32);
+    // G step 2
+    cc_lo = neon_blamka(cc_lo, dd_lo);
+    cc_hi = neon_blamka(cc_hi, dd_hi);
+    bb_lo = neon_rotr_xor!(SHA3, bb_lo, cc_lo, 24);
+    bb_hi = neon_rotr_xor!(SHA3, bb_hi, cc_hi, 24);
+    // G step 3
+    *a_lo = neon_blamka(*a_lo, bb_lo);
+    *a_hi = neon_blamka(*a_hi, bb_hi);
+    dd_lo = neon_rotr_xor!(SHA3, dd_lo, *a_lo, 16);
+    dd_hi = neon_rotr_xor!(SHA3, dd_hi, *a_hi, 16);
+    // G step 4
+    cc_lo = neon_blamka(cc_lo, dd_lo);
+    cc_hi = neon_blamka(cc_hi, dd_hi);
+    bb_lo = neon_rotr_xor!(SHA3, bb_lo, cc_lo, 63);
+    bb_hi = neon_rotr_xor!(SHA3, bb_hi, cc_hi, 63);
+
+    // Un-rotate.
+    *b_lo = vextq_u64::<1>(bb_hi, bb_lo);
+    *b_hi = vextq_u64::<1>(bb_lo, bb_hi);
+    *c_lo = cc_hi;
+    *c_hi = cc_lo;
+    *d_lo = vextq_u64::<1>(dd_lo, dd_hi);
+    *d_hi = vextq_u64::<1>(dd_hi, dd_lo);
+}
+
+/// Two-column BLAMKA round: two independent columns, instructions interleaved.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)] // Two independent rounds expose register-level ILP.
+unsafe fn neon_round_pair<const SHA3: bool>(
+    // Column 1
+    a1_lo: &mut std::arch::aarch64::uint64x2_t,
+    a1_hi: &mut std::arch::aarch64::uint64x2_t,
+    b1_lo: &mut std::arch::aarch64::uint64x2_t,
+    b1_hi: &mut std::arch::aarch64::uint64x2_t,
+    c1_lo: &mut std::arch::aarch64::uint64x2_t,
+    c1_hi: &mut std::arch::aarch64::uint64x2_t,
+    d1_lo: &mut std::arch::aarch64::uint64x2_t,
+    d1_hi: &mut std::arch::aarch64::uint64x2_t,
+    // Column 2
+    a2_lo: &mut std::arch::aarch64::uint64x2_t,
+    a2_hi: &mut std::arch::aarch64::uint64x2_t,
+    b2_lo: &mut std::arch::aarch64::uint64x2_t,
+    b2_hi: &mut std::arch::aarch64::uint64x2_t,
+    c2_lo: &mut std::arch::aarch64::uint64x2_t,
+    c2_hi: &mut std::arch::aarch64::uint64x2_t,
+    d2_lo: &mut std::arch::aarch64::uint64x2_t,
+    d2_hi: &mut std::arch::aarch64::uint64x2_t,
+) {
+    use std::arch::aarch64::vextq_u64;
+
+    // ---- Column step: interleave both columns at the G-step level ----
+
+    // G step 1: a = a + b + 2*lo32(a)*lo32(b);  d = rotr32(d ^ a)
+    *a1_lo = neon_blamka(*a1_lo, *b1_lo);
+    *a2_lo = neon_blamka(*a2_lo, *b2_lo);
+    *a1_hi = neon_blamka(*a1_hi, *b1_hi);
+    *a2_hi = neon_blamka(*a2_hi, *b2_hi);
+    *d1_lo = neon_rotr_xor!(SHA3, *d1_lo, *a1_lo, 32);
+    *d2_lo = neon_rotr_xor!(SHA3, *d2_lo, *a2_lo, 32);
+    *d1_hi = neon_rotr_xor!(SHA3, *d1_hi, *a1_hi, 32);
+    *d2_hi = neon_rotr_xor!(SHA3, *d2_hi, *a2_hi, 32);
+    // G step 2: c = c + d + 2*lo32(c)*lo32(d);  b = rotr24(b ^ c)
+    *c1_lo = neon_blamka(*c1_lo, *d1_lo);
+    *c2_lo = neon_blamka(*c2_lo, *d2_lo);
+    *c1_hi = neon_blamka(*c1_hi, *d1_hi);
+    *c2_hi = neon_blamka(*c2_hi, *d2_hi);
+    *b1_lo = neon_rotr_xor!(SHA3, *b1_lo, *c1_lo, 24);
+    *b2_lo = neon_rotr_xor!(SHA3, *b2_lo, *c2_lo, 24);
+    *b1_hi = neon_rotr_xor!(SHA3, *b1_hi, *c1_hi, 24);
+    *b2_hi = neon_rotr_xor!(SHA3, *b2_hi, *c2_hi, 24);
+    // G step 3: a = a + b + 2*lo32(a)*lo32(b);  d = rotr16(d ^ a)
+    *a1_lo = neon_blamka(*a1_lo, *b1_lo);
+    *a2_lo = neon_blamka(*a2_lo, *b2_lo);
+    *a1_hi = neon_blamka(*a1_hi, *b1_hi);
+    *a2_hi = neon_blamka(*a2_hi, *b2_hi);
+    *d1_lo = neon_rotr_xor!(SHA3, *d1_lo, *a1_lo, 16);
+    *d2_lo = neon_rotr_xor!(SHA3, *d2_lo, *a2_lo, 16);
+    *d1_hi = neon_rotr_xor!(SHA3, *d1_hi, *a1_hi, 16);
+    *d2_hi = neon_rotr_xor!(SHA3, *d2_hi, *a2_hi, 16);
+    // G step 4: c = c + d + 2*lo32(c)*lo32(d);  b = rotr63(b ^ c)
+    *c1_lo = neon_blamka(*c1_lo, *d1_lo);
+    *c2_lo = neon_blamka(*c2_lo, *d2_lo);
+    *c1_hi = neon_blamka(*c1_hi, *d1_hi);
+    *c2_hi = neon_blamka(*c2_hi, *d2_hi);
+    *b1_lo = neon_rotr_xor!(SHA3, *b1_lo, *c1_lo, 63);
+    *b2_lo = neon_rotr_xor!(SHA3, *b2_lo, *c2_lo, 63);
+    *b1_hi = neon_rotr_xor!(SHA3, *b1_hi, *c1_hi, 63);
+    *b2_hi = neon_rotr_xor!(SHA3, *b2_hi, *c2_hi, 63);
+
+    // ---- Diagonal step: rotate, interleaved round, un-rotate ----
+
+    let mut bb1_lo = vextq_u64::<1>(*b1_lo, *b1_hi);
+    let mut bb1_hi = vextq_u64::<1>(*b1_hi, *b1_lo);
+    let mut cc1_lo = *c1_hi;
+    let mut cc1_hi = *c1_lo;
+    let mut dd1_lo = vextq_u64::<1>(*d1_hi, *d1_lo);
+    let mut dd1_hi = vextq_u64::<1>(*d1_lo, *d1_hi);
+
+    let mut bb2_lo = vextq_u64::<1>(*b2_lo, *b2_hi);
+    let mut bb2_hi = vextq_u64::<1>(*b2_hi, *b2_lo);
+    let mut cc2_lo = *c2_hi;
+    let mut cc2_hi = *c2_lo;
+    let mut dd2_lo = vextq_u64::<1>(*d2_hi, *d2_lo);
+    let mut dd2_hi = vextq_u64::<1>(*d2_lo, *d2_hi);
+
+    // G step 1
+    *a1_lo = neon_blamka(*a1_lo, bb1_lo);
+    *a2_lo = neon_blamka(*a2_lo, bb2_lo);
+    *a1_hi = neon_blamka(*a1_hi, bb1_hi);
+    *a2_hi = neon_blamka(*a2_hi, bb2_hi);
+    dd1_lo = neon_rotr_xor!(SHA3, dd1_lo, *a1_lo, 32);
+    dd2_lo = neon_rotr_xor!(SHA3, dd2_lo, *a2_lo, 32);
+    dd1_hi = neon_rotr_xor!(SHA3, dd1_hi, *a1_hi, 32);
+    dd2_hi = neon_rotr_xor!(SHA3, dd2_hi, *a2_hi, 32);
+    // G step 2
+    cc1_lo = neon_blamka(cc1_lo, dd1_lo);
+    cc2_lo = neon_blamka(cc2_lo, dd2_lo);
+    cc1_hi = neon_blamka(cc1_hi, dd1_hi);
+    cc2_hi = neon_blamka(cc2_hi, dd2_hi);
+    bb1_lo = neon_rotr_xor!(SHA3, bb1_lo, cc1_lo, 24);
+    bb2_lo = neon_rotr_xor!(SHA3, bb2_lo, cc2_lo, 24);
+    bb1_hi = neon_rotr_xor!(SHA3, bb1_hi, cc1_hi, 24);
+    bb2_hi = neon_rotr_xor!(SHA3, bb2_hi, cc2_hi, 24);
+    // G step 3
+    *a1_lo = neon_blamka(*a1_lo, bb1_lo);
+    *a2_lo = neon_blamka(*a2_lo, bb2_lo);
+    *a1_hi = neon_blamka(*a1_hi, bb1_hi);
+    *a2_hi = neon_blamka(*a2_hi, bb2_hi);
+    dd1_lo = neon_rotr_xor!(SHA3, dd1_lo, *a1_lo, 16);
+    dd2_lo = neon_rotr_xor!(SHA3, dd2_lo, *a2_lo, 16);
+    dd1_hi = neon_rotr_xor!(SHA3, dd1_hi, *a1_hi, 16);
+    dd2_hi = neon_rotr_xor!(SHA3, dd2_hi, *a2_hi, 16);
+    // G step 4
+    cc1_lo = neon_blamka(cc1_lo, dd1_lo);
+    cc2_lo = neon_blamka(cc2_lo, dd2_lo);
+    cc1_hi = neon_blamka(cc1_hi, dd1_hi);
+    cc2_hi = neon_blamka(cc2_hi, dd2_hi);
+    bb1_lo = neon_rotr_xor!(SHA3, bb1_lo, cc1_lo, 63);
+    bb2_lo = neon_rotr_xor!(SHA3, bb2_lo, cc2_lo, 63);
+    bb1_hi = neon_rotr_xor!(SHA3, bb1_hi, cc1_hi, 63);
+    bb2_hi = neon_rotr_xor!(SHA3, bb2_hi, cc2_hi, 63);
+
+    // Un-rotate column 1.
+    *b1_lo = vextq_u64::<1>(bb1_hi, bb1_lo);
+    *b1_hi = vextq_u64::<1>(bb1_lo, bb1_hi);
+    *c1_lo = cc1_hi;
+    *c1_hi = cc1_lo;
+    *d1_lo = vextq_u64::<1>(dd1_lo, dd1_hi);
+    *d1_hi = vextq_u64::<1>(dd1_hi, dd1_lo);
+
+    // Un-rotate column 2.
+    *b2_lo = vextq_u64::<1>(bb2_hi, bb2_lo);
+    *b2_hi = vextq_u64::<1>(bb2_lo, bb2_hi);
+    *c2_lo = cc2_hi;
+    *c2_hi = cc2_lo;
+    *d2_lo = vextq_u64::<1>(dd2_lo, dd2_hi);
+    *d2_hi = vextq_u64::<1>(dd2_hi, dd2_lo);
+}
+
+/// By-value NEON compress (used in `update_address_block` where dst may alias lhs).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn compress_neon<const SHA3: bool>(rhs: &PowBlock, lhs: &PowBlock) -> PowBlock {
+    let mut result = PowBlock::default();
+    compress_neon_into::<SHA3>(rhs, lhs, &mut result);
+    result
+}
+
+/// In-place NEON block compression with fused phases.
+///
+/// Fuses Phase 1 (XOR) with Phase 2 (row rounds) and Phase 3 (column rounds)
+/// with Phase 4 (final XOR).  This eliminates 128 stores to q in Phase 1 and
+/// 128 loads from q in Phase 2/4, reducing total memory ops by ~36%.
+///
+/// # Safety
+/// `dst` must not alias `rhs` or `lhs`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn compress_neon_into<const SHA3: bool>(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBlock) {
+    use std::arch::aarch64::{uint64x2_t, veorq_u64, vld1q_u64, vst1q_u64};
+
+    // q is the working buffer between row and column rounds.
+    // Use MaybeUninit — the fused Phase 1+2 loop fully writes q.
+    let mut q = std::mem::MaybeUninit::<PowBlock>::uninit();
+
+    let rhs_ptr = rhs.0.as_ptr();
+    let lhs_ptr = lhs.0.as_ptr();
+    let dst_ptr = dst.0.as_mut_ptr();
+    let q_ptr = q.as_mut_ptr() as *mut u64;
+
+    // Fused Phase 1+2: XOR rhs^lhs directly into registers, store backup to
+    // dst, row-round in registers, store result to q. Rows are processed in pairs.
+    for pair in 0..4 {
+        let base1 = pair * 32;
+        let base2 = base1 + 16;
+
+        let mut a1_lo: uint64x2_t =
+            veorq_u64(vld1q_u64(rhs_ptr.add(base1)), vld1q_u64(lhs_ptr.add(base1)));
+        let mut a1_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base1 + 2)),
+            vld1q_u64(lhs_ptr.add(base1 + 2)),
+        );
+        let mut b1_lo: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base1 + 4)),
+            vld1q_u64(lhs_ptr.add(base1 + 4)),
+        );
+        let mut b1_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base1 + 6)),
+            vld1q_u64(lhs_ptr.add(base1 + 6)),
+        );
+        let mut c1_lo: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base1 + 8)),
+            vld1q_u64(lhs_ptr.add(base1 + 8)),
+        );
+        let mut c1_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base1 + 10)),
+            vld1q_u64(lhs_ptr.add(base1 + 10)),
+        );
+        let mut d1_lo: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base1 + 12)),
+            vld1q_u64(lhs_ptr.add(base1 + 12)),
+        );
+        let mut d1_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base1 + 14)),
+            vld1q_u64(lhs_ptr.add(base1 + 14)),
+        );
+
+        let mut a2_lo: uint64x2_t =
+            veorq_u64(vld1q_u64(rhs_ptr.add(base2)), vld1q_u64(lhs_ptr.add(base2)));
+        let mut a2_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base2 + 2)),
+            vld1q_u64(lhs_ptr.add(base2 + 2)),
+        );
+        let mut b2_lo: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base2 + 4)),
+            vld1q_u64(lhs_ptr.add(base2 + 4)),
+        );
+        let mut b2_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base2 + 6)),
+            vld1q_u64(lhs_ptr.add(base2 + 6)),
+        );
+        let mut c2_lo: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base2 + 8)),
+            vld1q_u64(lhs_ptr.add(base2 + 8)),
+        );
+        let mut c2_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base2 + 10)),
+            vld1q_u64(lhs_ptr.add(base2 + 10)),
+        );
+        let mut d2_lo: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base2 + 12)),
+            vld1q_u64(lhs_ptr.add(base2 + 12)),
+        );
+        let mut d2_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base2 + 14)),
+            vld1q_u64(lhs_ptr.add(base2 + 14)),
+        );
+
+        // Store pre-round XOR to dst as backup for Phase 4.
+        vst1q_u64(dst_ptr.add(base1), a1_lo);
+        vst1q_u64(dst_ptr.add(base1 + 2), a1_hi);
+        vst1q_u64(dst_ptr.add(base1 + 4), b1_lo);
+        vst1q_u64(dst_ptr.add(base1 + 6), b1_hi);
+        vst1q_u64(dst_ptr.add(base1 + 8), c1_lo);
+        vst1q_u64(dst_ptr.add(base1 + 10), c1_hi);
+        vst1q_u64(dst_ptr.add(base1 + 12), d1_lo);
+        vst1q_u64(dst_ptr.add(base1 + 14), d1_hi);
+
+        vst1q_u64(dst_ptr.add(base2), a2_lo);
+        vst1q_u64(dst_ptr.add(base2 + 2), a2_hi);
+        vst1q_u64(dst_ptr.add(base2 + 4), b2_lo);
+        vst1q_u64(dst_ptr.add(base2 + 6), b2_hi);
+        vst1q_u64(dst_ptr.add(base2 + 8), c2_lo);
+        vst1q_u64(dst_ptr.add(base2 + 10), c2_hi);
+        vst1q_u64(dst_ptr.add(base2 + 12), d2_lo);
+        vst1q_u64(dst_ptr.add(base2 + 14), d2_hi);
+
+        // Row rounds in registers — no load/store needed.
+        neon_round_pair::<SHA3>(
+            &mut a1_lo, &mut a1_hi, &mut b1_lo, &mut b1_hi, &mut c1_lo, &mut c1_hi, &mut d1_lo,
+            &mut d1_hi, &mut a2_lo, &mut a2_hi, &mut b2_lo, &mut b2_hi, &mut c2_lo, &mut c2_hi,
+            &mut d2_lo, &mut d2_hi,
+        );
+
+        // Store row-rounded result to q for column rounds.
+        vst1q_u64(q_ptr.add(base1), a1_lo);
+        vst1q_u64(q_ptr.add(base1 + 2), a1_hi);
+        vst1q_u64(q_ptr.add(base1 + 4), b1_lo);
+        vst1q_u64(q_ptr.add(base1 + 6), b1_hi);
+        vst1q_u64(q_ptr.add(base1 + 8), c1_lo);
+        vst1q_u64(q_ptr.add(base1 + 10), c1_hi);
+        vst1q_u64(q_ptr.add(base1 + 12), d1_lo);
+        vst1q_u64(q_ptr.add(base1 + 14), d1_hi);
+
+        vst1q_u64(q_ptr.add(base2), a2_lo);
+        vst1q_u64(q_ptr.add(base2 + 2), a2_hi);
+        vst1q_u64(q_ptr.add(base2 + 4), b2_lo);
+        vst1q_u64(q_ptr.add(base2 + 6), b2_hi);
+        vst1q_u64(q_ptr.add(base2 + 8), c2_lo);
+        vst1q_u64(q_ptr.add(base2 + 10), c2_hi);
+        vst1q_u64(q_ptr.add(base2 + 12), d2_lo);
+        vst1q_u64(q_ptr.add(base2 + 14), d2_hi);
+    }
+
+    // Fused Phase 3+4: Column-round q, then XOR with dst backup and store
+    // directly to dst. Columns are processed in pairs.
+    for pair in 0..4 {
+        let base1 = pair * 4;
+        let base2 = pair * 4 + 2;
+
+        // Load column 1 from q.
+        let mut a1_lo: uint64x2_t = vld1q_u64(q_ptr.add(base1));
+        let mut a1_hi: uint64x2_t = vld1q_u64(q_ptr.add(base1 + 16));
+        let mut b1_lo: uint64x2_t = vld1q_u64(q_ptr.add(base1 + 32));
+        let mut b1_hi: uint64x2_t = vld1q_u64(q_ptr.add(base1 + 48));
+        let mut c1_lo: uint64x2_t = vld1q_u64(q_ptr.add(base1 + 64));
+        let mut c1_hi: uint64x2_t = vld1q_u64(q_ptr.add(base1 + 80));
+        let mut d1_lo: uint64x2_t = vld1q_u64(q_ptr.add(base1 + 96));
+        let mut d1_hi: uint64x2_t = vld1q_u64(q_ptr.add(base1 + 112));
+
+        // Load column 2 from q.
+        let mut a2_lo: uint64x2_t = vld1q_u64(q_ptr.add(base2));
+        let mut a2_hi: uint64x2_t = vld1q_u64(q_ptr.add(base2 + 16));
+        let mut b2_lo: uint64x2_t = vld1q_u64(q_ptr.add(base2 + 32));
+        let mut b2_hi: uint64x2_t = vld1q_u64(q_ptr.add(base2 + 48));
+        let mut c2_lo: uint64x2_t = vld1q_u64(q_ptr.add(base2 + 64));
+        let mut c2_hi: uint64x2_t = vld1q_u64(q_ptr.add(base2 + 80));
+        let mut d2_lo: uint64x2_t = vld1q_u64(q_ptr.add(base2 + 96));
+        let mut d2_hi: uint64x2_t = vld1q_u64(q_ptr.add(base2 + 112));
+
+        // Interleaved round for both columns.
+        neon_round_pair::<SHA3>(
+            &mut a1_lo, &mut a1_hi, &mut b1_lo, &mut b1_hi, &mut c1_lo, &mut c1_hi, &mut d1_lo,
+            &mut d1_hi, &mut a2_lo, &mut a2_hi, &mut b2_lo, &mut b2_hi, &mut c2_lo, &mut c2_hi,
+            &mut d2_lo, &mut d2_hi,
+        );
+
+        // Writeback column 1: XOR with pre-round backup in dst.
+        vst1q_u64(
+            dst_ptr.add(base1),
+            veorq_u64(a1_lo, vld1q_u64(dst_ptr.add(base1))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base1 + 16),
+            veorq_u64(a1_hi, vld1q_u64(dst_ptr.add(base1 + 16))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base1 + 32),
+            veorq_u64(b1_lo, vld1q_u64(dst_ptr.add(base1 + 32))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base1 + 48),
+            veorq_u64(b1_hi, vld1q_u64(dst_ptr.add(base1 + 48))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base1 + 64),
+            veorq_u64(c1_lo, vld1q_u64(dst_ptr.add(base1 + 64))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base1 + 80),
+            veorq_u64(c1_hi, vld1q_u64(dst_ptr.add(base1 + 80))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base1 + 96),
+            veorq_u64(d1_lo, vld1q_u64(dst_ptr.add(base1 + 96))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base1 + 112),
+            veorq_u64(d1_hi, vld1q_u64(dst_ptr.add(base1 + 112))),
+        );
+
+        // Writeback column 2: XOR with pre-round backup in dst.
+        vst1q_u64(
+            dst_ptr.add(base2),
+            veorq_u64(a2_lo, vld1q_u64(dst_ptr.add(base2))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base2 + 16),
+            veorq_u64(a2_hi, vld1q_u64(dst_ptr.add(base2 + 16))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base2 + 32),
+            veorq_u64(b2_lo, vld1q_u64(dst_ptr.add(base2 + 32))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base2 + 48),
+            veorq_u64(b2_hi, vld1q_u64(dst_ptr.add(base2 + 48))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base2 + 64),
+            veorq_u64(c2_lo, vld1q_u64(dst_ptr.add(base2 + 64))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base2 + 80),
+            veorq_u64(c2_hi, vld1q_u64(dst_ptr.add(base2 + 80))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base2 + 96),
+            veorq_u64(d2_lo, vld1q_u64(dst_ptr.add(base2 + 96))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base2 + 112),
+            veorq_u64(d2_hi, vld1q_u64(dst_ptr.add(base2 + 112))),
+        );
+    }
+}
+
+/// Like [`compress_neon_into`] but issues a prefetch for the next iteration's
+/// ref block after column round 0 completes, when `dst[0]` has its final value.
+///
+/// Used for data-dependent slices (2, 3) where the next ref_index depends on
+/// the current block's output.
+///
+/// # Safety
+/// Same as `compress_neon_into`.  Additionally, `memory_blocks_base` must
+/// point to a valid PowBlock array of at least `block_count` elements.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn compress_neon_into_mid_prefetch<const SHA3: bool>(
+    rhs: &PowBlock,
+    lhs: &PowBlock,
+    dst: &mut PowBlock,
+    next_ref_area_size: usize,
+    memory_blocks_base: *const PowBlock,
+) {
+    use std::arch::aarch64::{uint64x2_t, veorq_u64, vld1q_u64, vst1q_u64};
+
+    let mut q = std::mem::MaybeUninit::<PowBlock>::uninit();
+
+    let rhs_ptr = rhs.0.as_ptr();
+    let lhs_ptr = lhs.0.as_ptr();
+    let dst_ptr = dst.0.as_mut_ptr();
+    let q_ptr = q.as_mut_ptr() as *mut u64;
+
+    // Fused Phase 1+2 (same row-pair strategy as compress_neon_into).
+    for pair in 0..4 {
+        let base1 = pair * 32;
+        let base2 = base1 + 16;
+
+        let mut a1_lo: uint64x2_t =
+            veorq_u64(vld1q_u64(rhs_ptr.add(base1)), vld1q_u64(lhs_ptr.add(base1)));
+        let mut a1_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base1 + 2)),
+            vld1q_u64(lhs_ptr.add(base1 + 2)),
+        );
+        let mut b1_lo: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base1 + 4)),
+            vld1q_u64(lhs_ptr.add(base1 + 4)),
+        );
+        let mut b1_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base1 + 6)),
+            vld1q_u64(lhs_ptr.add(base1 + 6)),
+        );
+        let mut c1_lo: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base1 + 8)),
+            vld1q_u64(lhs_ptr.add(base1 + 8)),
+        );
+        let mut c1_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base1 + 10)),
+            vld1q_u64(lhs_ptr.add(base1 + 10)),
+        );
+        let mut d1_lo: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base1 + 12)),
+            vld1q_u64(lhs_ptr.add(base1 + 12)),
+        );
+        let mut d1_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base1 + 14)),
+            vld1q_u64(lhs_ptr.add(base1 + 14)),
+        );
+
+        let mut a2_lo: uint64x2_t =
+            veorq_u64(vld1q_u64(rhs_ptr.add(base2)), vld1q_u64(lhs_ptr.add(base2)));
+        let mut a2_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base2 + 2)),
+            vld1q_u64(lhs_ptr.add(base2 + 2)),
+        );
+        let mut b2_lo: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base2 + 4)),
+            vld1q_u64(lhs_ptr.add(base2 + 4)),
+        );
+        let mut b2_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base2 + 6)),
+            vld1q_u64(lhs_ptr.add(base2 + 6)),
+        );
+        let mut c2_lo: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base2 + 8)),
+            vld1q_u64(lhs_ptr.add(base2 + 8)),
+        );
+        let mut c2_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base2 + 10)),
+            vld1q_u64(lhs_ptr.add(base2 + 10)),
+        );
+        let mut d2_lo: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base2 + 12)),
+            vld1q_u64(lhs_ptr.add(base2 + 12)),
+        );
+        let mut d2_hi: uint64x2_t = veorq_u64(
+            vld1q_u64(rhs_ptr.add(base2 + 14)),
+            vld1q_u64(lhs_ptr.add(base2 + 14)),
+        );
+
+        vst1q_u64(dst_ptr.add(base1), a1_lo);
+        vst1q_u64(dst_ptr.add(base1 + 2), a1_hi);
+        vst1q_u64(dst_ptr.add(base1 + 4), b1_lo);
+        vst1q_u64(dst_ptr.add(base1 + 6), b1_hi);
+        vst1q_u64(dst_ptr.add(base1 + 8), c1_lo);
+        vst1q_u64(dst_ptr.add(base1 + 10), c1_hi);
+        vst1q_u64(dst_ptr.add(base1 + 12), d1_lo);
+        vst1q_u64(dst_ptr.add(base1 + 14), d1_hi);
+
+        vst1q_u64(dst_ptr.add(base2), a2_lo);
+        vst1q_u64(dst_ptr.add(base2 + 2), a2_hi);
+        vst1q_u64(dst_ptr.add(base2 + 4), b2_lo);
+        vst1q_u64(dst_ptr.add(base2 + 6), b2_hi);
+        vst1q_u64(dst_ptr.add(base2 + 8), c2_lo);
+        vst1q_u64(dst_ptr.add(base2 + 10), c2_hi);
+        vst1q_u64(dst_ptr.add(base2 + 12), d2_lo);
+        vst1q_u64(dst_ptr.add(base2 + 14), d2_hi);
+
+        neon_round_pair::<SHA3>(
+            &mut a1_lo, &mut a1_hi, &mut b1_lo, &mut b1_hi, &mut c1_lo, &mut c1_hi, &mut d1_lo,
+            &mut d1_hi, &mut a2_lo, &mut a2_hi, &mut b2_lo, &mut b2_hi, &mut c2_lo, &mut c2_hi,
+            &mut d2_lo, &mut d2_hi,
+        );
+
+        vst1q_u64(q_ptr.add(base1), a1_lo);
+        vst1q_u64(q_ptr.add(base1 + 2), a1_hi);
+        vst1q_u64(q_ptr.add(base1 + 4), b1_lo);
+        vst1q_u64(q_ptr.add(base1 + 6), b1_hi);
+        vst1q_u64(q_ptr.add(base1 + 8), c1_lo);
+        vst1q_u64(q_ptr.add(base1 + 10), c1_hi);
+        vst1q_u64(q_ptr.add(base1 + 12), d1_lo);
+        vst1q_u64(q_ptr.add(base1 + 14), d1_hi);
+
+        vst1q_u64(q_ptr.add(base2), a2_lo);
+        vst1q_u64(q_ptr.add(base2 + 2), a2_hi);
+        vst1q_u64(q_ptr.add(base2 + 4), b2_lo);
+        vst1q_u64(q_ptr.add(base2 + 6), b2_hi);
+        vst1q_u64(q_ptr.add(base2 + 8), c2_lo);
+        vst1q_u64(q_ptr.add(base2 + 10), c2_hi);
+        vst1q_u64(q_ptr.add(base2 + 12), d2_lo);
+        vst1q_u64(q_ptr.add(base2 + 14), d2_hi);
+    }
+
+    // Fused Phase 3+4, column 0: this writes dst[0] to its final value.
+    {
+        let mut a_lo: uint64x2_t = vld1q_u64(q_ptr.add(0));
+        let mut a_hi: uint64x2_t = vld1q_u64(q_ptr.add(16));
+        let mut b_lo: uint64x2_t = vld1q_u64(q_ptr.add(32));
+        let mut b_hi: uint64x2_t = vld1q_u64(q_ptr.add(48));
+        let mut c_lo: uint64x2_t = vld1q_u64(q_ptr.add(64));
+        let mut c_hi: uint64x2_t = vld1q_u64(q_ptr.add(80));
+        let mut d_lo: uint64x2_t = vld1q_u64(q_ptr.add(96));
+        let mut d_hi: uint64x2_t = vld1q_u64(q_ptr.add(112));
+
+        neon_round::<SHA3>(
+            &mut a_lo, &mut a_hi, &mut b_lo, &mut b_hi, &mut c_lo, &mut c_hi, &mut d_lo, &mut d_hi,
+        );
+
+        vst1q_u64(dst_ptr.add(0), veorq_u64(a_lo, vld1q_u64(dst_ptr.add(0))));
+        vst1q_u64(dst_ptr.add(16), veorq_u64(a_hi, vld1q_u64(dst_ptr.add(16))));
+        vst1q_u64(dst_ptr.add(32), veorq_u64(b_lo, vld1q_u64(dst_ptr.add(32))));
+        vst1q_u64(dst_ptr.add(48), veorq_u64(b_hi, vld1q_u64(dst_ptr.add(48))));
+        vst1q_u64(dst_ptr.add(64), veorq_u64(c_lo, vld1q_u64(dst_ptr.add(64))));
+        vst1q_u64(dst_ptr.add(80), veorq_u64(c_hi, vld1q_u64(dst_ptr.add(80))));
+        vst1q_u64(dst_ptr.add(96), veorq_u64(d_lo, vld1q_u64(dst_ptr.add(96))));
+        vst1q_u64(
+            dst_ptr.add(112),
+            veorq_u64(d_hi, vld1q_u64(dst_ptr.add(112))),
+        );
+    }
+
+    // --- Mid-compress prefetch ---
+    // dst[0] now has its final value: compute the next iteration's ref_index
+    // and prefetch it.
+    {
+        let rand = *dst_ptr;
+        let next_ref = reference_index(next_ref_area_size, rand);
+        if SHA3 {
+            prefetch_pow_block::<ISA_NEON_SHA3>(&*memory_blocks_base.add(next_ref));
+        } else {
+            prefetch_pow_block::<ISA_NEON>(&*memory_blocks_base.add(next_ref));
+        }
+    }
+
+    // Remaining column rounds (idx=1..8): process in pairs (1,2), (3,4), (5,6),
+    // then column 7 alone.
+    for pair in 0..3 {
+        let base1 = (1 + pair * 2) * 2; // columns 1, 3, 5
+        let base2 = (2 + pair * 2) * 2; // columns 2, 4, 6
+
+        let mut a1_lo: uint64x2_t = vld1q_u64(q_ptr.add(base1));
+        let mut a1_hi: uint64x2_t = vld1q_u64(q_ptr.add(base1 + 16));
+        let mut b1_lo: uint64x2_t = vld1q_u64(q_ptr.add(base1 + 32));
+        let mut b1_hi: uint64x2_t = vld1q_u64(q_ptr.add(base1 + 48));
+        let mut c1_lo: uint64x2_t = vld1q_u64(q_ptr.add(base1 + 64));
+        let mut c1_hi: uint64x2_t = vld1q_u64(q_ptr.add(base1 + 80));
+        let mut d1_lo: uint64x2_t = vld1q_u64(q_ptr.add(base1 + 96));
+        let mut d1_hi: uint64x2_t = vld1q_u64(q_ptr.add(base1 + 112));
+
+        let mut a2_lo: uint64x2_t = vld1q_u64(q_ptr.add(base2));
+        let mut a2_hi: uint64x2_t = vld1q_u64(q_ptr.add(base2 + 16));
+        let mut b2_lo: uint64x2_t = vld1q_u64(q_ptr.add(base2 + 32));
+        let mut b2_hi: uint64x2_t = vld1q_u64(q_ptr.add(base2 + 48));
+        let mut c2_lo: uint64x2_t = vld1q_u64(q_ptr.add(base2 + 64));
+        let mut c2_hi: uint64x2_t = vld1q_u64(q_ptr.add(base2 + 80));
+        let mut d2_lo: uint64x2_t = vld1q_u64(q_ptr.add(base2 + 96));
+        let mut d2_hi: uint64x2_t = vld1q_u64(q_ptr.add(base2 + 112));
+
+        neon_round_pair::<SHA3>(
+            &mut a1_lo, &mut a1_hi, &mut b1_lo, &mut b1_hi, &mut c1_lo, &mut c1_hi, &mut d1_lo,
+            &mut d1_hi, &mut a2_lo, &mut a2_hi, &mut b2_lo, &mut b2_hi, &mut c2_lo, &mut c2_hi,
+            &mut d2_lo, &mut d2_hi,
+        );
+
+        vst1q_u64(
+            dst_ptr.add(base1),
+            veorq_u64(a1_lo, vld1q_u64(dst_ptr.add(base1))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base1 + 16),
+            veorq_u64(a1_hi, vld1q_u64(dst_ptr.add(base1 + 16))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base1 + 32),
+            veorq_u64(b1_lo, vld1q_u64(dst_ptr.add(base1 + 32))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base1 + 48),
+            veorq_u64(b1_hi, vld1q_u64(dst_ptr.add(base1 + 48))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base1 + 64),
+            veorq_u64(c1_lo, vld1q_u64(dst_ptr.add(base1 + 64))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base1 + 80),
+            veorq_u64(c1_hi, vld1q_u64(dst_ptr.add(base1 + 80))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base1 + 96),
+            veorq_u64(d1_lo, vld1q_u64(dst_ptr.add(base1 + 96))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base1 + 112),
+            veorq_u64(d1_hi, vld1q_u64(dst_ptr.add(base1 + 112))),
+        );
+
+        vst1q_u64(
+            dst_ptr.add(base2),
+            veorq_u64(a2_lo, vld1q_u64(dst_ptr.add(base2))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base2 + 16),
+            veorq_u64(a2_hi, vld1q_u64(dst_ptr.add(base2 + 16))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base2 + 32),
+            veorq_u64(b2_lo, vld1q_u64(dst_ptr.add(base2 + 32))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base2 + 48),
+            veorq_u64(b2_hi, vld1q_u64(dst_ptr.add(base2 + 48))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base2 + 64),
+            veorq_u64(c2_lo, vld1q_u64(dst_ptr.add(base2 + 64))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base2 + 80),
+            veorq_u64(c2_hi, vld1q_u64(dst_ptr.add(base2 + 80))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base2 + 96),
+            veorq_u64(d2_lo, vld1q_u64(dst_ptr.add(base2 + 96))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base2 + 112),
+            veorq_u64(d2_hi, vld1q_u64(dst_ptr.add(base2 + 112))),
+        );
+    }
+
+    // Column 7 (solo).
+    {
+        let base = 7 * 2;
+        let mut a_lo: uint64x2_t = vld1q_u64(q_ptr.add(base));
+        let mut a_hi: uint64x2_t = vld1q_u64(q_ptr.add(base + 16));
+        let mut b_lo: uint64x2_t = vld1q_u64(q_ptr.add(base + 32));
+        let mut b_hi: uint64x2_t = vld1q_u64(q_ptr.add(base + 48));
+        let mut c_lo: uint64x2_t = vld1q_u64(q_ptr.add(base + 64));
+        let mut c_hi: uint64x2_t = vld1q_u64(q_ptr.add(base + 80));
+        let mut d_lo: uint64x2_t = vld1q_u64(q_ptr.add(base + 96));
+        let mut d_hi: uint64x2_t = vld1q_u64(q_ptr.add(base + 112));
+
+        neon_round::<SHA3>(
+            &mut a_lo, &mut a_hi, &mut b_lo, &mut b_hi, &mut c_lo, &mut c_hi, &mut d_lo, &mut d_hi,
+        );
+
+        vst1q_u64(
+            dst_ptr.add(base),
+            veorq_u64(a_lo, vld1q_u64(dst_ptr.add(base))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base + 16),
+            veorq_u64(a_hi, vld1q_u64(dst_ptr.add(base + 16))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base + 32),
+            veorq_u64(b_lo, vld1q_u64(dst_ptr.add(base + 32))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base + 48),
+            veorq_u64(b_hi, vld1q_u64(dst_ptr.add(base + 48))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base + 64),
+            veorq_u64(c_lo, vld1q_u64(dst_ptr.add(base + 64))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base + 80),
+            veorq_u64(c_hi, vld1q_u64(dst_ptr.add(base + 80))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base + 96),
+            veorq_u64(d_lo, vld1q_u64(dst_ptr.add(base + 96))),
+        );
+        vst1q_u64(
+            dst_ptr.add(base + 112),
+            veorq_u64(d_hi, vld1q_u64(dst_ptr.add(base + 112))),
+        );
+    }
+}
+
+fn blake2b_long(inputs: &[&[u8]], out: &mut [u8]) -> Result<()> {
+    if out.is_empty() {
+        return Err(Error::OutputTooShort);
+    }
+    if out.len() > u32::MAX as usize {
+        return Err(Error::OutputTooLong);
+    }
+    let len_bytes = (out.len() as u32).to_le_bytes();
+
+    if out.len() <= Blake2b512::output_size() {
+        let mut digest = Blake2bVar::new(out.len()).map_err(|_| Error::OutputTooLong)?;
+        blake2::digest::Update::update(&mut digest, &len_bytes);
+        for input in inputs {
+            blake2::digest::Update::update(&mut digest, input);
+        }
+        digest
+            .finalize_variable(out)
+            .map_err(|_| Error::OutputTooLong)?;
+        return Ok(());
+    }
+
+    let half_hash_len = Blake2b512::output_size() / 2;
+    let mut digest = Blake2b512::new();
+    Digest::update(&mut digest, len_bytes);
+    for input in inputs {
+        Digest::update(&mut digest, input);
+    }
+    let mut last_output = digest.finalize();
+    out[..half_hash_len].copy_from_slice(&last_output[..half_hash_len]);
+
+    let mut counter = 0usize;
+    let out_len = out.len();
+    for chunk in out[half_hash_len..]
+        .chunks_exact_mut(half_hash_len)
+        .take_while(|_| {
+            counter = counter.saturating_add(half_hash_len);
+            out_len.saturating_sub(counter) > 64
+        })
+    {
+        last_output = Blake2b512::digest(last_output);
+        chunk.copy_from_slice(&last_output[..half_hash_len]);
+    }
+
+    let last_block_size = out.len().saturating_sub(counter);
+    let mut digest = Blake2bVar::new(last_block_size).map_err(|_| Error::OutputTooLong)?;
+    blake2::digest::Update::update(&mut digest, &last_output);
+    digest
+        .finalize_variable(&mut out[counter..])
+        .map_err(|_| Error::OutputTooLong)?;
+    Ok(())
+}
+
+#[rustfmt::skip]
+macro_rules! permute_step {
+    ($a:expr, $b:expr, $c:expr, $d:expr) => {
+        $a = (Wrapping($a) + Wrapping($b) + (Wrapping(2) * Wrapping(($a & TRUNC) * ($b & TRUNC)))).0;
+        $d = ($d ^ $a).rotate_right(32);
+        $c = (Wrapping($c) + Wrapping($d) + (Wrapping(2) * Wrapping(($c & TRUNC) * ($d & TRUNC)))).0;
+        $b = ($b ^ $c).rotate_right(24);
+
+        $a = (Wrapping($a) + Wrapping($b) + (Wrapping(2) * Wrapping(($a & TRUNC) * ($b & TRUNC)))).0;
+        $d = ($d ^ $a).rotate_right(16);
+        $c = (Wrapping($c) + Wrapping($d) + (Wrapping(2) * Wrapping(($c & TRUNC) * ($d & TRUNC)))).0;
+        $b = ($b ^ $c).rotate_right(63);
+    };
+}
+
+macro_rules! permute {
+    (
+        $v0:expr, $v1:expr, $v2:expr, $v3:expr,
+        $v4:expr, $v5:expr, $v6:expr, $v7:expr,
+        $v8:expr, $v9:expr, $v10:expr, $v11:expr,
+        $v12:expr, $v13:expr, $v14:expr, $v15:expr,
+    ) => {
+        permute_step!($v0, $v4, $v8, $v12);
+        permute_step!($v1, $v5, $v9, $v13);
+        permute_step!($v2, $v6, $v10, $v14);
+        permute_step!($v3, $v7, $v11, $v15);
+        permute_step!($v0, $v5, $v10, $v15);
+        permute_step!($v1, $v6, $v11, $v12);
+        permute_step!($v2, $v7, $v8, $v13);
+        permute_step!($v3, $v4, $v9, $v14);
+    };
+}
+
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(target_arch = "aarch64", repr(align(128)))]
+#[cfg_attr(not(target_arch = "aarch64"), repr(align(64)))]
+pub struct PowBlock([u64; Self::SIZE / 8]);
+
+impl PowBlock {
+    pub const SIZE: usize = 1024;
+
+    #[inline(always)]
+    fn load(&mut self, input: &[u8; Self::SIZE]) {
+        for (idx, chunk) in input.chunks(8).enumerate() {
+            self.0[idx] = u64::from_le_bytes(chunk.try_into().expect("chunk must be 8 bytes"));
+        }
+    }
+
+    #[inline(always)]
+    fn iter(&self) -> std::slice::Iter<'_, u64> {
+        self.0.iter()
+    }
+
+    #[inline(always)]
+    fn compress(rhs: &Self, lhs: &Self) -> Self {
+        let r = *rhs ^ lhs;
+        let mut q = r;
+
+        for chunk in q.0.chunks_exact_mut(16) {
+            #[rustfmt::skip]
+            permute!(
+                chunk[0], chunk[1], chunk[2], chunk[3],
+                chunk[4], chunk[5], chunk[6], chunk[7],
+                chunk[8], chunk[9], chunk[10], chunk[11],
+                chunk[12], chunk[13], chunk[14], chunk[15],
+            );
+        }
+
+        for idx in 0..8 {
+            let base = idx * 2;
+            #[rustfmt::skip]
+            permute!(
+                q.0[base], q.0[base + 1],
+                q.0[base + 16], q.0[base + 17],
+                q.0[base + 32], q.0[base + 33],
+                q.0[base + 48], q.0[base + 49],
+                q.0[base + 64], q.0[base + 65],
+                q.0[base + 80], q.0[base + 81],
+                q.0[base + 96], q.0[base + 97],
+                q.0[base + 112], q.0[base + 113],
+            );
+        }
+
+        q ^= &r;
+        q
+    }
+}
+
+impl Default for PowBlock {
+    fn default() -> Self {
+        Self([0u64; Self::SIZE / 8])
+    }
+}
+
+impl AsRef<[u64]> for PowBlock {
+    fn as_ref(&self) -> &[u64] {
+        &self.0
+    }
+}
+
+impl AsMut<[u64]> for PowBlock {
+    fn as_mut(&mut self) -> &mut [u64] {
+        &mut self.0
+    }
+}
+
+impl std::ops::BitXor<&PowBlock> for PowBlock {
+    type Output = PowBlock;
+
+    fn bitxor(mut self, rhs: &PowBlock) -> Self::Output {
+        self ^= rhs;
+        self
+    }
+}
+
+impl std::ops::BitXorAssign<&PowBlock> for PowBlock {
+    fn bitxor_assign(&mut self, rhs: &PowBlock) {
+        for (dst, src) in self.0.iter_mut().zip(rhs.0.iter()) {
+            *dst ^= src;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    use super::{FixedArgon2id, PowBlock};
+
+    #[test]
+    fn changing_kernels_reuses_precomputation_and_matches_reference() {
+        let memory = 32;
+        let mut fixed = FixedArgon2id::new(memory);
+        let table = fixed.data_independent_ref_indexes.as_ptr();
+        let mut arena = vec![PowBlock::default(); fixed.block_count()];
+        let reference = Argon2::new(
+            Algorithm::Argon2id,
+            Version::V0x13,
+            Params::new(memory, 1, 1, Some(32)).unwrap(),
+        );
+        for (nonce, kernel) in crate::CpuKernel::ALL
+            .into_iter()
+            .cycle()
+            .take(crate::CpuKernel::ALL.len())
+            .enumerate()
+        {
+            let previous = fixed.isa_label();
+            if !kernel.is_supported() {
+                assert_eq!(
+                    fixed.set_kernel(kernel),
+                    Err(super::Error::UnsupportedKernel)
+                );
+                assert_eq!(fixed.isa_label(), previous);
+                continue;
+            }
+            fixed.set_kernel(kernel).unwrap();
+            assert_eq!(fixed.data_independent_ref_indexes.as_ptr(), table);
+            let mut expected = [0u8; 32];
+            let mut actual = [0u8; 32];
+            reference
+                .hash_password_into(&nonce.to_le_bytes(), b"kernel-switch", &mut expected)
+                .unwrap();
+            fixed
+                .hash_password_into_with_memory(
+                    &nonce.to_le_bytes(),
+                    b"kernel-switch",
+                    &mut actual,
+                    &mut arena,
+                )
+                .unwrap();
+            assert_eq!(actual, expected, "path {kernel}");
+        }
+    }
+
+    #[test]
+    fn stopped_hashes_are_abandoned_and_the_arena_stays_usable() {
+        use std::cell::Cell;
+        let memory = 4096;
+        let reference = Argon2::new(
+            Algorithm::Argon2id,
+            Version::V0x13,
+            Params::new(memory, 1, 1, Some(32)).unwrap(),
+        );
+        for kernel in crate::CpuKernel::ALL {
+            if !kernel.is_supported() {
+                continue;
+            }
+            let fixed = FixedArgon2id::with_kernel(memory, kernel).unwrap();
+            let mut arena = vec![PowBlock::default(); fixed.block_count()];
+            for stop_at in 1..super::SYNC_POINTS {
+                let asked = Cell::new(0);
+                let mut out = [0x5au8; 32];
+                let completed = fixed
+                    .hash_password_into_with_memory_until(
+                        &[7; 8],
+                        b"stop-test",
+                        &mut out,
+                        &mut arena,
+                        &|| {
+                            asked.set(asked.get() + 1);
+                            asked.get() >= stop_at
+                        },
+                    )
+                    .unwrap();
+                assert!(!completed, "path {kernel} stop_at {stop_at}");
+                assert_eq!(out, [0x5au8; 32], "abandoned hash wrote output");
+                assert_eq!(asked.get(), stop_at);
+
+                // The next hash on the same arena is unaffected.
+                let mut expected = [0u8; 32];
+                let mut actual = [0u8; 32];
+                reference
+                    .hash_password_into(&[9; 8], b"stop-test", &mut expected)
+                    .unwrap();
+                let completed = fixed
+                    .hash_password_into_with_memory_until(
+                        &[9; 8],
+                        b"stop-test",
+                        &mut actual,
+                        &mut arena,
+                        &|| false,
+                    )
+                    .unwrap();
+                assert!(completed);
+                assert_eq!(actual, expected, "path {kernel} after stop_at {stop_at}");
+            }
+        }
+    }
+
+    #[test]
+    fn hashes_stop_inside_a_slice_and_the_arena_stays_usable() {
+        use std::cell::Cell;
+        // 64Ki blocks per slice, so each slice has inner stop checks.
+        let memory = 256 * 1024;
+        let reference = Argon2::new(
+            Algorithm::Argon2id,
+            Version::V0x13,
+            Params::new(memory, 1, 1, Some(32)).unwrap(),
+        );
+        let mut expected = [0u8; 32];
+        reference
+            .hash_password_into(&[3; 8], b"inner-stop", &mut expected)
+            .unwrap();
+        let mut arena = Vec::new();
+        for kernel in crate::CpuKernel::ALL {
+            if !kernel.is_supported() {
+                continue;
+            }
+            let fixed = FixedArgon2id::with_kernel(memory, kernel).unwrap();
+            arena.resize(fixed.block_count(), PowBlock::default());
+            // Slice 0 asks at block 32767 first; stop at the second ask,
+            // which falls inside slice 0 or right at slice 1.
+            for stop_at in [1, 2, 5] {
+                let asked = Cell::new(0);
+                let mut out = [0u8; 32];
+                let completed = fixed
+                    .hash_password_into_with_memory_until(
+                        &[1; 8],
+                        b"inner-stop",
+                        &mut out,
+                        &mut arena,
+                        &|| {
+                            asked.set(asked.get() + 1);
+                            asked.get() >= stop_at
+                        },
+                    )
+                    .unwrap();
+                assert!(!completed, "path {kernel} stop_at {stop_at}");
+                assert_eq!(asked.get(), stop_at);
+            }
+            let mut actual = [0u8; 32];
+            assert!(fixed
+                .hash_password_into_with_memory_until(
+                    &[3; 8],
+                    b"inner-stop",
+                    &mut actual,
+                    &mut arena,
+                    &|| false,
+                )
+                .unwrap());
+            assert_eq!(actual, expected, "path {kernel}");
+        }
+    }
+
+    #[test]
+    fn side_cache_schedule_serves_only_live_copies() {
+        let mut fixed = FixedArgon2id::new(4096);
+        // Few slots and a short window force slot reuse and refusals.
+        fixed.side_cache = Some(super::SideCacheSchedule::new(
+            &fixed.data_independent_ref_indexes,
+            2,
+            16,
+            256,
+        ));
+        let schedule = fixed.side_cache.as_ref().unwrap();
+        let refs = &fixed.data_independent_ref_indexes;
+        assert_eq!(schedule.slots, 16);
+        assert_eq!(schedule.read_slot.len(), refs.len());
+        let mut served = 0usize;
+        for reader in 2..refs.len() {
+            let slot = schedule.read_slot[reader];
+            if slot == super::NO_SLOT {
+                continue;
+            }
+            served += 1;
+            let block = refs[reader];
+            assert!(
+                reader - block >= 2 && reader - block <= 256,
+                "reader={reader}"
+            );
+            assert_eq!(
+                schedule.write_slot[block], slot,
+                "reader={reader} block={block}"
+            );
+            // No other block took the slot between the write and this read.
+            for other in block + 1..reader {
+                assert_ne!(
+                    schedule.write_slot[other], slot,
+                    "slot {slot} reused at {other} before {reader}"
+                );
+            }
+        }
+        assert!(served > 0, "the schedule should serve some references");
+        assert!(
+            schedule
+                .write_slot
+                .iter()
+                .filter(|&&s| s != super::NO_SLOT)
+                .count()
+                >= served / 4,
+            "kept blocks should cover the served reads"
+        );
+        assert_eq!(schedule.read(refs.len() + 10), super::NO_SLOT);
+        for reader in 2..refs.len() {
+            if reader - refs[reader] < 2 {
+                assert_eq!(
+                    schedule.read_slot[reader],
+                    super::NO_SLOT,
+                    "ring distance is never scheduled"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn skip_kernel_matches_reference_with_and_without_side_cache() {
+        for kernel in [
+            super::CpuKernel::Avx512StreamSkip,
+            super::CpuKernel::Avx2StreamSkip,
+        ] {
+            skip_kernel_matches_reference(kernel);
+        }
+    }
+
+    fn skip_kernel_matches_reference(kernel: super::CpuKernel) {
+        if !kernel.is_supported() {
+            return;
+        }
+        let memory_kib = 4096u32;
+        let params = Params::new(memory_kib, 1, 1, Some(32)).unwrap();
+        let reference = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.clone());
+        let mut reference_memory = vec![argon2::Block::default(); params.block_count()];
+        for side_cache in [0usize, 512] {
+            let mut fixed = FixedArgon2id::with_kernel(memory_kib, kernel).unwrap();
+            fixed.set_side_cache_blocks(side_cache);
+            assert!(fixed.kernel_skip);
+            let mut fixed_memory =
+                vec![PowBlock([0x5a5a_5a5a_5a5a_5a5a; 128]); fixed.block_count()];
+            for nonce in [1u64, 9, 2_000_011] {
+                let nonce_bytes = nonce.to_le_bytes();
+                let (mut expected, mut actual) = ([0u8; 32], [0u8; 32]);
+                reference
+                    .hash_password_into_with_memory(
+                        &nonce_bytes,
+                        b"skip-kernel",
+                        &mut expected,
+                        &mut reference_memory,
+                    )
+                    .unwrap();
+                fixed
+                    .hash_password_into_with_memory(
+                        &nonce_bytes,
+                        b"skip-kernel",
+                        &mut actual,
+                        &mut fixed_memory,
+                    )
+                    .unwrap();
+                assert_eq!(actual, expected, "side cache {side_cache} nonce {nonce}");
+            }
+            // Skipped blocks are never written: the fill pattern survives.
+            let skipped = (fixed.block_count() * super::KERNEL_SKIP_PERMILLE / 1000) | 1;
+            assert_eq!(
+                fixed_memory[skipped].0[0], 0x5a5a_5a5a_5a5a_5a5a,
+                "{kernel:?} wrote block {skipped}"
+            );
+            assert_ne!(fixed_memory[skipped - 1].0[0], 0x5a5a_5a5a_5a5a_5a5a);
+            // Switching back to the plain path stops skipping.
+            let plain = if kernel == super::CpuKernel::Avx2StreamSkip {
+                super::CpuKernel::Avx2Stream
+            } else {
+                super::CpuKernel::Avx512Stream
+            };
+            fixed.set_kernel(plain).unwrap();
+            assert!(!fixed.kernel_skip);
+        }
+    }
+
+    #[test]
+    fn skipped_stores_match_reference_on_streaming_kernels() {
+        let mut isas = Vec::new();
+        if super::CpuKernel::Avx2Stream.is_supported() {
+            isas.push(super::ISA_AVX2_STREAM);
+        }
+        if super::CpuKernel::Avx512Stream.is_supported() {
+            isas.extend([
+                super::ISA_AVX512_STREAM,
+                super::ISA_AVX512_256_STREAM,
+                super::ISA_AVX512_256_STREAM_L2,
+                super::ISA_AVX512_STREAM_L2,
+            ]);
+        }
+        for isa in isas {
+            for permille in [500u16, 600, 900] {
+                let memory_kib = 4096u32;
+                let params = Params::new(memory_kib, 1, 1, Some(32)).unwrap();
+                let reference = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.clone());
+                let mut reference_memory = vec![argon2::Block::default(); params.block_count()];
+                let mut fixed = FixedArgon2id::new(memory_kib);
+                fixed.isa = isa;
+                fixed.set_skip_store_permille(permille);
+                assert_eq!(fixed.skip_store_permille(), permille);
+                // Stale contents must never be read: skipped slots keep garbage.
+                let mut fixed_memory =
+                    vec![PowBlock([0xa5a5_a5a5_a5a5_a5a5; 128]); fixed.block_count()];
+                for nonce in [0u64, 7, 1_000_003] {
+                    let nonce_bytes = nonce.to_le_bytes();
+                    let (mut expected, mut actual) = ([0u8; 32], [0u8; 32]);
+                    reference
+                        .hash_password_into_with_memory(
+                            &nonce_bytes,
+                            b"skip-store-salt",
+                            &mut expected,
+                            &mut reference_memory,
+                        )
+                        .unwrap();
+                    fixed
+                        .hash_password_into_with_memory(
+                            &nonce_bytes,
+                            b"skip-store-salt",
+                            &mut actual,
+                            &mut fixed_memory,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "isa {isa} permille {permille} nonce {nonce}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn side_cache_matches_reference_on_streaming_kernels() {
+        if !super::CpuKernel::Avx512Stream.is_supported() {
+            return;
+        }
+        for isa in [
+            super::ISA_AVX512_STREAM,
+            super::ISA_AVX512_256_STREAM,
+            super::ISA_AVX512_256_STREAM_L2,
+            super::ISA_AVX512_STREAM_L2,
+        ] {
+            for slots in [8usize, 256] {
+                let memory_kib = 4096u32;
+                let params = Params::new(memory_kib, 1, 1, Some(32)).unwrap();
+                let reference = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.clone());
+                let mut reference_memory = vec![argon2::Block::default(); params.block_count()];
+                let mut fixed = FixedArgon2id::new(memory_kib);
+                fixed.isa = isa;
+                fixed.set_side_cache_blocks(slots);
+                assert_eq!(fixed.side_cache_blocks(), slots);
+                let mut fixed_memory = vec![PowBlock::default(); fixed.block_count()];
+                for nonce in [0u64, 7, 1_000_003] {
+                    let nonce_bytes = nonce.to_le_bytes();
+                    let (mut expected, mut actual) = ([0u8; 32], [0u8; 32]);
+                    reference
+                        .hash_password_into_with_memory(
+                            &nonce_bytes,
+                            b"side-cache-salt",
+                            &mut expected,
+                            &mut reference_memory,
+                        )
+                        .unwrap();
+                    fixed
+                        .hash_password_into_with_memory(
+                            &nonce_bytes,
+                            b"side-cache-salt",
+                            &mut actual,
+                            &mut fixed_memory,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        actual,
+                        expected,
+                        "isa={} slots={slots} nonce={nonce}",
+                        fixed.isa_label()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_kernel_matches_reference_for_small_memory_configs() {
+        assert_fixed_kernel_matches_reference(None);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fixed_avx2_kernel_matches_reference_even_on_avx512_hosts() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // Runtime dispatch would otherwise skip AVX2 on newer test hosts.
+        assert_fixed_kernel_matches_reference(Some(super::ISA_AVX2));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn fixed_neon_sha3_matches_reference_at_segment_boundaries() {
+        if !crate::CpuKernel::NeonSha3.is_supported() {
+            return;
+        }
+        assert_fixed_kernel_matches_reference(Some(super::ISA_NEON_SHA3));
+    }
+
+    fn assert_fixed_kernel_matches_reference(isa: Option<u8>) {
+        let memory_kib_values = [8u32, 32u32, 65u32, 4096u32];
+        let extended_header = [0xabu8; 156];
+        let long_header = [0x73u8; 512];
+        let salts = [
+            b"12345678".as_slice(),
+            b"headerbase0123456789abcdefghijklmnop".as_slice(),
+            extended_header.as_slice(),
+            long_header.as_slice(),
+        ];
+        let nonces = [0u64, 1u64, 7u64, 42u64, 1_000_003u64];
+
+        for memory_kib in memory_kib_values {
+            let params =
+                Params::new(memory_kib, 1, 1, Some(32)).expect("reference params should be valid");
+            let reference_block_count = params.block_count();
+            let reference = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+            let mut fixed = FixedArgon2id::new(memory_kib);
+            if let Some(isa) = isa {
+                fixed.isa = isa;
+            }
+            let mut fixed_memory = vec![PowBlock::default(); fixed.block_count()];
+            let mut reference_memory = vec![argon2::Block::default(); reference_block_count];
+
+            for salt in salts {
+                for nonce in nonces {
+                    let nonce_bytes = nonce.to_le_bytes();
+                    let mut expected = [0u8; 32];
+                    let mut actual = [0u8; 32];
+
+                    reference
+                        .hash_password_into_with_memory(
+                            &nonce_bytes,
+                            salt,
+                            &mut expected,
+                            &mut reference_memory,
+                        )
+                        .expect("reference hashing should succeed");
+                    fixed
+                        .hash_password_into_with_memory(
+                            &nonce_bytes,
+                            salt,
+                            &mut actual,
+                            &mut fixed_memory,
+                        )
+                        .expect("fixed hashing should succeed");
+                    assert_eq!(
+                        actual,
+                        expected,
+                        "mismatch for isa={} m_cost={memory_kib} nonce={nonce}",
+                        fixed.isa_label(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_compression_matches_scalar_with_prefetch_and_shared_inputs() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next_word = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let prefetch_memory = [PowBlock::default(); 16];
+        for case in 0..64 {
+            let mut lhs = PowBlock::default();
+            let mut rhs = PowBlock::default();
+            for (a, b) in lhs.0.iter_mut().zip(rhs.0.iter_mut()) {
+                *a = match case {
+                    0 => 0,
+                    1 => u64::MAX,
+                    2 => 0xaaaa_aaaa_aaaa_aaaa,
+                    _ => next_word(),
+                };
+                *b = match case {
+                    0 | 1 => 0,
+                    2 => 0x5555_5555_5555_5555,
+                    _ => next_word(),
+                };
+            }
+
+            // A reference block can be the preceding block, so immutable inputs
+            // may alias. Guard blocks detect writes outside the 1 KiB output.
+            for rhs in [&rhs, &lhs] {
+                let expected = PowBlock::compress(&lhs, rhs);
+                for prefetch in [false, true] {
+                    let guard = PowBlock([0xa5a5_a5a5_a5a5_a5a5; 128]);
+                    let mut output = [guard; 3];
+                    // AVX2 is checked above. Inputs and output are disjoint;
+                    // reference_index maps this area size inside prefetch_memory.
+                    unsafe {
+                        if prefetch {
+                            super::compress_avx2_into_mid_prefetch(
+                                &lhs,
+                                rhs,
+                                &mut output[1],
+                                prefetch_memory.len(),
+                                prefetch_memory.as_ptr(),
+                                usize::MAX,
+                            );
+                        } else {
+                            super::compress_avx2_into(&lhs, rhs, &mut output[1]);
+                        }
+                    }
+                    assert_eq!(output[1].0, expected.0, "case={case} prefetch={prefetch}");
+                    assert_eq!(output[0].0, guard.0);
+                    assert_eq!(output[2].0, guard.0);
+                }
+            }
+        }
+    }
+}

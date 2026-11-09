@@ -1,0 +1,82 @@
+---
+title: 'Cách đào Blocknet trên Windows'
+description: 'Đào Blocknet trên Windows bằng seine. Chọn ZIP, giải nén tệp, nhập địa chỉ và kiểm tra share được chấp nhận khi đào đồng thời bằng CPU và NVIDIA.'
+tags: ['Hướng dẫn đào coin', 'Windows', 'NVIDIA']
+faq:
+  - q: 'Tôi có cần CUDA Toolkit để đào Blocknet trên Windows không?'
+    a: 'Không. Tệp ZIP phát hành cho Windows đã chứa các thư viện thời gian chạy NVIDIA mà seine cần. Hãy cài trình điều khiển NVIDIA mới và giữ các tệp đã giải nén cùng nhau. seine nhận diện các card NVIDIA được hỗ trợ cùng với CPU và tự động tinh chỉnh chúng. Máy không có card NVIDIA vẫn đào được bằng CPU.'
+  - q: 'seine lưu thiết lập đào trên Windows ở đâu?'
+    a: 'Theo mặc định, seine lưu địa chỉ nhận thưởng, pool và tên máy đào trong seine-data/seine.config.json, bên dưới thư mục bạn dùng để khởi chạy. Hãy chạy từ cùng thư mục đã giải nén để dùng lại các thiết lập đó. Tùy chọn data-dir cho phép chọn thư mục khác khi cần.'
+  - q: 'Tôi có cần bật large pages của Windows trước khi bắt đầu đào không?'
+    a: 'Không. seine tự động thử dùng large pages và dùng trang thông thường khi không khả dụng. Bạn có thể bắt đầu đào với thiết lập mặc định. Để tùy chọn thiết lập large pages, hãy cấp quyền Lock pages in memory cho tài khoản đào, rồi đăng xuất và đăng nhập lại trước khi khởi động lại seine.'
+sourceHash: 1878d05f199d
+translation: draft
+---
+
+Hướng dẫn này đưa bạn từ bước tải ZIP cho Windows đến khi có share được chấp nhận trên bntpool.com. Bạn sẽ giải nén tệp, nhập địa chỉ nhận thưởng và xác nhận CPU cùng các card NVIDIA được hỗ trợ đang đào. Các lệnh dưới đây dùng PowerShell chạy trực tiếp trên Windows.
+
+## Làm thế nào để bắt đầu đào Blocknet trên Windows?
+
+<Answer>
+Tải `seine-windows-x86_64.zip`, giải nén toàn bộ rồi mở `seine.exe`. Nhập địa chỉ Blocknet hoặc `@name` đã đăng ký, sau đó chấp nhận pool `stratum+tcp://bntpool.com:3333`. seine chọn các backend CPU và NVIDIA khả dụng, điều chỉnh số luồng theo bộ nhớ và bắt đầu tinh chỉnh trong khi đào.
+</Answer>
+
+Chuẩn bị sẵn địa chỉ nhận thưởng công khai trước khi mở phần mềm đào. [Hướng dẫn ví](/vi/blog/blocknet-wallet-for-mining/) giải thích cách lấy địa chỉ. Chỉ nhập địa chỉ nhận: phần mềm đào không cần cụm từ khôi phục hay khóa chi tiêu của ví. [Blocknet ID](/vi/blog/blocknet-id-pay-by-name/) đã đăng ký cũng dùng được, nên bạn có thể dùng `@name` thay cho địa chỉ dài.
+
+## Bước 1: tải đúng phiên bản
+
+Mở [mục tải xuống](/vi/#download) và chọn Windows x86_64. Tệp nén có tên `seine-windows-x86_64.zip`.
+
+![ZIP cho Windows trong bảng tải xuống chính thức của seine](/assets/blog/setup-download.webp)
+
+## Bước 2: giải nén và chạy
+
+Trong File Explorer, nhấp chuột phải vào ZIP vừa tải và chọn **Extract All (Giải nén tất cả)**. Chọn thư mục bạn có quyền ghi rồi mở thư mục đã giải nén. Giữ `seine.exe` cùng các DLL đi kèm: tệp nén cho Windows chứa các thư viện thời gian chạy NVIDIA mà phần mềm đào sử dụng.
+
+Nhấp đúp `seine.exe` trong thư mục đã giải nén. Nếu thích terminal, hãy mở PowerShell tại thư mục đó rồi chạy:
+
+```powershell
+.\seine.exe
+```
+
+## Bước 3: nhập địa chỉ ví
+
+Dán địa chỉ nhận Blocknet công khai hoặc `@name` đã đăng ký, rồi nhấn Enter để chấp nhận `stratum+tcp://bntpool.com:3333`. [Hướng dẫn ví](/vi/blog/blocknet-wallet-for-mining/) chỉ nơi tìm địa chỉ. Seine không cần cụm từ khôi phục hay khóa chi tiêu của bạn. Chương trình tự động đặt tên worker trong pool.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="Lời nhắc nhập địa chỉ và pool ở lần chạy đầu. Thay ví dụ bằng địa chỉ hoặc tên đã đăng ký của bạn." loading="lazy" />
+  </picture>
+  <figcaption>Lời nhắc nhập địa chỉ và pool ở lần chạy đầu. Thay ví dụ bằng địa chỉ hoặc tên đã đăng ký của bạn.</figcaption>
+</figure>
+
+Seine tự chọn luồng và tinh chỉnh hiệu năng. Ở những lần chạy sau, hãy mở từ cùng thư mục để dùng lại `seine-data/seine.config.json`.
+
+## Bước 4: kiểm tra share được chấp nhận
+
+<Answer>
+Kiểm tra bảng điều khiển seine có hiển thị tốc độ băm và share được chấp nhận, rồi tra cùng địa chỉ nhận thưởng trên trang My Stats của bntpool.com. Bảng điều khiển mô tả công việc hiện tại của phần mềm đào; pool ghi nhận share đã gửi và phần thưởng. Hãy chờ quá trình tự động tinh chỉnh ổn định trước khi so sánh tốc độ hoặc đổi thiết lập.
+</Answer>
+
+[Hướng dẫn bảng điều khiển](/vi/blog/seine-dashboard-explained/) giải thích tốc độ băm, trạng thái đào và các bảng thông tin pool. Tốc độ băm đang chạy thể hiện hoạt động băm cục bộ; share được chấp nhận xác nhận công việc đã đến pool. Mở [My Stats](https://bntpool.com/stats?lang=vi), nhập cùng địa chỉ hoặc tên ngắn để theo dõi share và số dư của máy đào này.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="Bảng điều khiển thật của seine với dữ liệu minh họa. Tìm Accepted; các số liệu này không phải kết quả benchmark." loading="lazy" />
+  </picture>
+  <figcaption>Bảng điều khiển thật của seine với dữ liệu minh họa. Tìm Accepted; các số liệu này không phải kết quả benchmark.</figcaption>
+</figure>
+
+## Đào bằng CPU và NVIDIA trên cùng một PC
+
+Theo mặc định, seine dùng đồng thời CPU và các card NVIDIA được hỗ trợ. Cài trình điều khiển NVIDIA mới; ZIP cho Windows đã chứa các thư viện thời gian chạy nên không cần cài riêng CUDA Toolkit. Khi di chuyển thư mục phần mềm đào, hãy giữ các DLL đã giải nén bên cạnh tệp thực thi.
+
+Ở lần khởi chạy đầu, seine tinh chỉnh từng GPU và ghi nhớ thiết lập. CPU cũng được tinh chỉnh trong lúc đào. [Hướng dẫn phần cứng](/vi/blog/blocknet-mining-hardware-hashrate/) giải thích cách chọn dung lượng bộ nhớ và các kết quả đo, còn [hướng dẫn NVIDIA](https://github.com/zpalmtree/seine/blob/master/docs/guides/nvidia.md) đề cập việc dùng nhiều card. Để dừng đúng cách, nhấn `q` trong bảng điều khiển hoặc `Ctrl+C` trong terminal.
+
+<MinerSettings os="windows" />
+
+<CTA target="seine" title="Tải seine cho Windows" text="Giải nén ZIP, nhập địa chỉ nhận thưởng và bắt đầu đào trên bntpool.com với CPU và NVIDIA được tự động tinh chỉnh." />
+
+Mở [Thống kê của tôi](https://bntpool.com/stats?lang=vi) và nhập cùng địa chỉ hoặc tên đã đăng ký để tìm worker, share và số dư.

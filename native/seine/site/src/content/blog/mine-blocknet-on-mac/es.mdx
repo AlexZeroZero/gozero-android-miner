@@ -1,0 +1,144 @@
+---
+title: Cómo minar Blocknet en un Mac
+description: "macOS: Descarga seine, extrae los archivos, introduce tu dirección de Blocknet y confirma las participaciones aceptadas en bntpool.com. Empieza con los ajustes automáticos; los consejos de rendimiento vienen después."
+tags: [Guía de minería, macOS, Apple Silicon, seine]
+faq:
+  - q: '¿Se puede minar Blocknet en un MacBook Air?'
+    a: 'Sí. Todos los Mac con Apple Silicon ejecutan seine, incluido el MacBook Air. Descarga seine-macos-aarch64.tar.gz, descomprímelo en Terminal y ejecuta ./seine. Cada hilo necesita unos 2 GB de memoria, así que un MacBook Air de 16 GB admite hasta siete hilos, y seine fija el número por ti según la memoria libre.'
+  - q: '¿seine usa la GPU al minar Blocknet en un Mac?'
+    a: 'En Apple Silicon, seine mina con la CPU de forma predeterminada, porque es la opción más rápida. La CPU y los núcleos gráficos comparten la misma memoria unificada, y la prueba de trabajo Argon2id de Blocknet depende del ancho de banda de memoria. En el M4 Max, minar solo con la CPU dio la tasa de hash más alta, así que seine lo usa automáticamente.'
+  - q: '¿Cuánta memoria necesita un Mac para minar Blocknet?'
+    a: 'Cada hilo de minería trabaja sobre un bloque de memoria de 2 GiB, así que calcula unos 2 GB por hilo. Un Mac de 16 GB admite hasta siete hilos, uno de 32 GB hasta 15 y uno de 64 GB hasta 31. seine cuenta la memoria libre y además ajusta los hilos a tus núcleos.'
+  - q: '¿Se puede minar Blocknet en un Mac con Intel?'
+    a: 'Sí. seine publica un archivo aparte para los Mac con Intel, seine-macos-x86_64.tar.gz, y los pasos son los mismos que en Apple Silicon. Descárgalo, descomprímelo en Terminal, ejecuta ./seine y pega tu dirección de Blocknet o tu @name. seine ajusta sus hilos a tu memoria y empieza a minar en bntpool.com de forma predeterminada.'
+sourceHash: 10bf5cec430a
+translation: draft
+---
+
+## ¿Se puede minar Blocknet en un Mac?
+
+<Answer>
+Descarga seine, extrae los archivos, introduce tu dirección de Blocknet y confirma las participaciones aceptadas en bntpool.com. Empieza con los ajustes automáticos; los consejos de rendimiento vienen después.
+</Answer>
+
+## Paso 1: descarga la versión adecuada
+
+En el menú Apple → Acerca de este Mac, consulta el chip o procesador. En la [sección de descargas](/es/#download), elige `seine-macos-aarch64.tar.gz` para Apple Silicon o `seine-macos-x86_64.tar.gz` para Intel.
+
+## Paso 2: extrae y ejecuta
+
+Abre Terminal. Estos comandos suponen que el archivo está en la carpeta Downloads; usa su ubicación real si es distinta. En un Mac Intel, sustituye `seine-macos-aarch64.tar.gz` por `seine-macos-x86_64.tar.gz`. Extraen seine en tu carpeta personal y lo ejecutan:
+
+```sh
+mkdir -p "$HOME/seine"
+tar -xzf "$HOME/Downloads/seine-macos-aarch64.tar.gz" -C "$HOME/seine"
+cd "$HOME/seine"
+./seine
+```
+
+## Paso 3: introduce la dirección de tu monedero
+
+Pega tu dirección pública de recepción de Blocknet o tu `@name` registrado y pulsa Intro para aceptar `stratum+tcp://bntpool.com:3333`. La [guía del monedero](/es/blog/blocknet-wallet-for-mining/) explica dónde encontrar la dirección. Seine no necesita tu frase de recuperación ni tus claves de gasto. Asigna automáticamente un nombre al equipo en el pool.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="Preguntas de dirección y pool del primer inicio. Sustituye el ejemplo por tu dirección o nombre registrado." loading="lazy" />
+  </picture>
+  <figcaption>Preguntas de dirección y pool del primer inicio. Sustituye el ejemplo por tu dirección o nombre registrado.</figcaption>
+</figure>
+
+Seine elige los hilos y se ajusta automáticamente. En futuros inicios, ejecútalo desde la misma carpeta para reutilizar `seine-data/seine.config.json`.
+
+## Paso 4: comprueba las participaciones aceptadas
+
+Busca una tasa de hash y un contador **Accepted** que aumente en el [panel](/es/blog/seine-dashboard-explained/). Una participación aceptada confirma que el pool recibió tu trabajo; no significa que ya se haya realizado un pago. Pulsa `q` o `Ctrl+C` para detenerlo.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="Panel real de seine con datos de ejemplo. Busca Accepted; estas cifras no son una prueba de rendimiento." loading="lazy" />
+  </picture>
+  <figcaption>Panel real de seine con datos de ejemplo. Busca Accepted; estas cifras no son una prueba de rendimiento.</figcaption>
+</figure>
+
+Abre [Mis estadísticas](https://bntpool.com/stats?lang=es) e introduce la misma dirección o nombre registrado para ver tu equipo, participaciones y saldo.
+
+## Si macOS bloquea el primer inicio
+
+La versión para macOS tiene una firma ad hoc. Si macOS detiene el primer arranque, abre Ajustes del Sistema, ve a Privacidad y seguridad y permite `seine`. También puedes quitar la marca de descarga desde Terminal y volver a ejecutarlo:
+
+```sh
+xattr -d com.apple.quarantine ./seine
+./seine
+```
+
+<MinerSettings os="mac" />
+
+## ¿Por qué los Mac con Apple Silicon minan bien Blocknet?
+
+La prueba de trabajo de Blocknet es [Argon2id](/es/blog/argon2id-proof-of-work-explained/) con 2 GiB de memoria por hash. Cada hash llena un bloque de memoria de 2 GiB y va releyendo partes anteriores a medida que avanza, así que la velocidad de un hilo de minería depende sobre todo de lo rápido que el chip mueve datos hacia y desde la memoria. Por eso cada hilo de seine necesita unos 2 GB de RAM propios.
+
+Apple Silicon se basa en la memoria unificada, que [Apple describe](https://www.apple.com/newsroom/2020/11/apple-unleashes-m1/) como memoria de alto ancho de banda y baja latencia reunida en un único conjunto. Eso da a cada hilo de minería mucho ancho de banda, justo lo que necesita un hash intensivo en memoria. El resultado es un portátil que mina Blocknet en el mismo rango que los procesadores de servidor.
+
+## ¿A qué velocidad mina Blocknet un M4 Max?
+
+<Answer>
+Un MacBook Pro de 48 GB con el chip M4 Max minó Blocknet a 30,94 H/s con 16 hilos, solo con su CPU. Con 14 hilos y asignación a los núcleos de rendimiento, el ajuste equilibrado que seine usa por defecto en esa máquina, minó a 29,26 H/s y dejó más memoria libre para otras aplicaciones.
+</Answer>
+
+Estos resultados proceden de la batería de validación de seine en un M4 Max de 48 GB (12 núcleos de rendimiento y 4 de eficiencia), realizada el 10 de julio de 2026:
+
+| Ajuste | Hilos | Tasa de hash |
+|---|---|---|
+| Rendimiento máximo | 16, asignación `auto` | 30,94 H/s |
+| Equilibrado (el límite predeterminado de seine en este Mac) | 14, asignación `pcore-only` | 29,26 H/s |
+
+## ¿Cuántos hilos puede ejecutar tu Mac?
+
+Cada hilo necesita sus propios 2 GiB de memoria, así que la memoria marca el límite. seine también deja libre un 5% (como máximo 1 GiB por defecto) de la memoria de tu Mac como margen cuando se dimensiona. Eso da estos límites máximos:
+
+| Memoria del Mac | Hilos que admite la memoria |
+|---|---|
+| 16 GB | hasta 7 |
+| 24 GB | hasta 11 |
+| 32 GB | hasta 15 |
+| 36 GB | hasta 17 |
+| 48 GB | hasta 23 |
+| 64 GB | hasta 31 |
+
+Dos factores ajustan la cifra final a lo que mejor le va a tu Mac:
+
+- **Memoria libre.** seine cuenta la memoria realmente libre al iniciarse, así que las aplicaciones que tengas abiertas reducen un poco el número. Si la memoria se queda justa mientras funciona, seine aparca hilos y libera su memoria.
+- **Núcleos.** De forma predeterminada en un Mac, seine usa todos los núcleos de rendimiento más la mitad de los núcleos de eficiencia. En el M4 Max de 12+4 núcleos, eso son 14 hilos, el ajuste equilibrado de la tabla anterior.
+
+No tienes que calcular nada de esto. seine elige el número de hilos al iniciarse y sigue probando valores cercanos mientras mina.
+
+## ¿Por qué seine mina solo con la CPU en un Mac?
+
+En Apple Silicon, la CPU y los núcleos gráficos comparten un único conjunto de memoria unificada. Argon2id depende del ancho de banda de memoria, así que la CPU y los núcleos gráficos competirían por el mismo ancho de banda. En las pruebas de seine con el M4 Max, minar solo con la CPU dio la tasa de hash más alta, así que seine lo selecciona automáticamente en todos los Mac con Apple Silicon. Obtienes la configuración más rápida sin tener que poner ningún flag.
+
+## ¿Cómo sacarle el máximo partido a un Mac?
+
+- **Deja que seine se ajuste solo.** Compara números de hilos y kernels de CPU con trabajo de minería real, solo cambia tras confirmar una mejora y recuerda el resultado para el siguiente arranque.
+- **Mantén el Mac despierto.** macOS pone en reposo un Mac inactivo, lo que pausa la minería. Inicia seine con el comando integrado `caffeinate` para mantener el Mac despierto mientras seine esté en marcha:
+
+  ```sh
+  caffeinate -i ./seine
+  ```
+
+- **Busca el rendimiento máximo en un Mac dedicado.** Si el Mac no hace otra cosa que minar, el ajuste con el que el M4 Max registró 30,94 H/s usa los 16 núcleos y más memoria que el ajuste equilibrado predeterminado:
+
+  ```sh
+  ./seine --backend cpu --threads 16 --cpu-affinity auto
+  ```
+
+Para ver todas las opciones, consulta la [guía de configuración](https://github.com/zpalmtree/seine/blob/master/docs/guides/configuration.md). La [guía principal de minería](/es/blog/how-to-mine-blocknet/) explica los pagos y las demás plataformas.
+
+<Note>
+Estos resultados corresponden a la prueba de trabajo Argon2id actual de Blocknet. Según [blocknetcrypto.com](https://blocknetcrypto.com/#faraday), Blocknet planea una actualización de red llamada Faraday hacia el 16 de febrero de 2027 que prevé cambiar la prueba de trabajo. seine busca nuevas versiones al iniciarse y cada 12 horas, así que mantenlo actualizado.
+</Note>
+
+<CTA target="seine" title="Descarga seine para macOS" text="La versión para Apple Silicon mina con la CPU de tu Mac y elige automáticamente su número de hilos." />
+
+Abre [Mis estadísticas](https://bntpool.com/stats?lang=es) e introduce la misma dirección o nombre registrado para ver tu equipo, participaciones y saldo.

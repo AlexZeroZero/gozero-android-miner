@@ -1,0 +1,82 @@
+---
+title: Blocknet minen op Windows
+description: 'Mine Blocknet op Windows met seine. Kies de ZIP, pak de bestanden uit, voer je adres in en bekijk geaccepteerde shares terwijl CPU en NVIDIA samen minen.'
+tags: [Mininghandleiding, Windows, NVIDIA]
+faq:
+  - q: 'Heb ik de CUDA Toolkit nodig om Blocknet op Windows te minen?'
+    a: 'Nee. De ZIP van de Windows-release bevat de NVIDIA-runtimebibliotheken die seine nodig heeft. Installeer een recente NVIDIA-driver en houd de uitgepakte bestanden bij elkaar. seine detecteert ondersteunde NVIDIA-kaarten naast de CPU en stemt ze automatisch af. CPU-mining werkt ook op computers zonder NVIDIA-kaart.'
+  - q: 'Waar bewaart seine mijn mininginstellingen op Windows?'
+    a: 'Standaard bewaart seine het uitbetalingsadres, de pool en de naam van de rig in seine-data/seine.config.json onder de map waaruit je het programma start. Start het vanuit dezelfde uitgepakte map om die instellingen opnieuw te gebruiken. Met de optie data-dir kun je zo nodig een andere map kiezen.'
+  - q: 'Heb ik grote geheugenpagina’s in Windows nodig voordat ik begin met minen?'
+    a: 'Nee. seine probeert automatisch grote geheugenpagina’s te gebruiken en gebruikt gewone pagina’s als die niet beschikbaar zijn. Je kunt met de standaardinstellingen beginnen met minen. Voor de optionele instelling van grote pagina’s geef je je miningaccount het recht Pagina’s in het geheugen vergrendelen. Meld je daarna af en weer aan voordat je seine opnieuw start.'
+sourceHash: 1878d05f199d
+translation: draft
+---
+
+Deze handleiding brengt je van de Windows-ZIP-download naar geaccepteerde shares op bntpool.com. Je pakt de bestanden uit, voert je uitbetalingsadres in en bevestigt dat je CPU en eventuele ondersteunde NVIDIA-kaarten minen. De onderstaande opdrachten gebruiken PowerShell en native Windows.
+
+## Hoe begin je met Blocknet minen op Windows?
+
+<Answer>
+Download `seine-windows-x86_64.zip`, pak het hele archief uit en open `seine.exe`. Voer je Blocknet-adres of geregistreerde `@name` in en accepteer `stratum+tcp://bntpool.com:3333` als pool. seine selecteert de beschikbare CPU- en NVIDIA-backends, past het aantal threads aan het geheugen aan en begint met afstemmen terwijl het minet.
+</Answer>
+
+Houd je openbare uitbetalingsadres bij de hand voordat je de miner opent. De [wallethandleiding](/nl/blog/blocknet-wallet-for-mining/) legt uit hoe je er een krijgt. Voer alleen het ontvangstadres in: de miner heeft je herstelzin of uitgavesleutels van je wallet niet nodig. Een geregistreerde [Blocknet ID](/nl/blog/blocknet-id-pay-by-name/) werkt ook, dus je kunt `@name` gebruiken in plaats van het lange adres.
+
+## Stap 1: download de juiste versie
+
+Open de [downloadsectie](/nl/#download) en kies Windows x86_64. Het archief heet `seine-windows-x86_64.zip`.
+
+![Windows-ZIP in de officiële downloadtabel van seine](/assets/blog/setup-download.webp)
+
+## Stap 2: pak uit en start
+
+Klik in Verkenner met de rechtermuisknop op de gedownloade ZIP en kies **Alles uitpakken**. Selecteer een map waarin je kunt schrijven en open vervolgens de uitgepakte map. Houd `seine.exe` en de bijbehorende DLL’s bij elkaar: het Windows-archief bevat de NVIDIA-runtimebibliotheken die de miner gebruikt.
+
+Dubbelklik op `seine.exe` vanuit de uitgepakte map. Als je liever een terminal gebruikt, open dan PowerShell in die map en voer dit uit:
+
+```powershell
+.\seine.exe
+```
+
+## Stap 3: voer je walletadres in
+
+Plak je openbare Blocknet-ontvangstadres of geregistreerde `@name` en druk op Enter om `stratum+tcp://bntpool.com:3333` te accepteren. De [walletgids](/nl/blog/blocknet-wallet-for-mining/) laat zien waar je het adres vindt. Seine heeft je herstelzin of uitgavesleutels niet nodig. Het wijst automatisch een poolworkernaam toe.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="De adres- en poolvragen bij de eerste start. Vervang het voorbeeld door je eigen adres of geregistreerde naam." loading="lazy" />
+  </picture>
+  <figcaption>De adres- en poolvragen bij de eerste start. Vervang het voorbeeld door je eigen adres of geregistreerde naam.</figcaption>
+</figure>
+
+Seine kiest de threads en stelt zichzelf automatisch af. Start het later vanuit dezelfde map om `seine-data/seine.config.json` opnieuw te gebruiken.
+
+## Stap 4: controleer geaccepteerde shares
+
+<Answer>
+Controleer of het dashboard van seine een hashrate en geaccepteerde shares toont en zoek vervolgens hetzelfde uitbetalingsadres op de pagina My Stats van bntpool.com. Het dashboard beschrijft het huidige werk van de miner; de pool registreert ingediende shares en beloningen. Laat de automatische afstemming tot rust komen voordat je snelheden vergelijkt of instellingen wijzigt.
+</Answer>
+
+De [dashboardhandleiding](/nl/blog/seine-dashboard-explained/) legt de hashrate, miningstatus en poolpanelen uit. Een actieve hashrate toont lokale hashingactiviteit; een geaccepteerde share bevestigt dat het werk de pool heeft bereikt. Open [My Stats](https://bntpool.com/stats?lang=nl) en voer hetzelfde adres of dezelfde korte naam in om de shares en het saldo van deze rig te volgen.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="Het echte Seine-dashboard met voorbeeldgegevens. Kijk naar Accepted; deze cijfers zijn geen benchmark." loading="lazy" />
+  </picture>
+  <figcaption>Het echte Seine-dashboard met voorbeeldgegevens. Kijk naar Accepted; deze cijfers zijn geen benchmark.</figcaption>
+</figure>
+
+## CPU- en NVIDIA-mining op dezelfde pc
+
+seine gebruikt standaard de CPU en ondersteunde NVIDIA-kaarten samen. Installeer een recente NVIDIA-driver; de Windows-ZIP bevat al de runtimebibliotheken, dus je hoeft de CUDA Toolkit niet apart te installeren. Laat de uitgepakte DLL’s naast het uitvoerbare bestand staan wanneer je de map van de miner verplaatst.
+
+Bij de eerste start stemt seine elke GPU af en onthoudt de instellingen. Ook de CPU-afstemming draait tijdens het minen. De [hardwarehandleiding](/nl/blog/blocknet-mining-hardware-hashrate/) legt de benodigde geheugencapaciteit en gemeten resultaten uit, terwijl de [NVIDIA-handleiding](https://github.com/zpalmtree/seine/blob/master/docs/guides/nvidia.md) meerdere kaarten behandelt. Druk op `q` in het dashboard of `Ctrl+C` in de terminal om het programma netjes te stoppen.
+
+<MinerSettings os="windows" />
+
+<CTA target="seine" title="Download seine voor Windows" text="Pak de ZIP uit, voer je uitbetalingsadres in en begin met minen op bntpool.com met automatische afstemming van CPU en NVIDIA." />
+
+Open [Mijn statistieken](https://bntpool.com/stats?lang=nl) en voer hetzelfde adres of dezelfde geregistreerde naam in om je worker, shares en saldo te vinden.

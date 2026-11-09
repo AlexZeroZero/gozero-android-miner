@@ -1,0 +1,145 @@
+---
+title: 'seineの設定変更：スレッド、CPU、GPU、プール'
+description: 'seineでCPUやGPUのマイニングをオフにし、スレッド数やカードを選び、設定を保存してアドレスやプールを変更する方法を説明します。'
+tags: ['マイニングガイド', '設定', 'seine']
+faq:
+  - q: 'seineでCPUマイニングをオフにするには？'
+    a: 'backendオプションにお使いのグラフィックスカード（nvidiaまたはamd）を指定してseineを起動します。両方のカードがある場合は、カンマで区切って両方指定します。seineはグラフィックスカードだけでマイニングし、プロセッサーを他の作業用に空けておきます。'
+  - q: 'seineでGPUマイニングをオフにするには？'
+    a: 'backendオプションをcpuに指定してseineを起動します。seineはプロセッサーだけでマイニングし、すべてのグラフィックスカードをゲームや他のアプリ用に空けておきます。オプションを外すと、プロセッサーとグラフィックスカードの両方で再びマイニングします。'
+  - q: 'CPUスレッドはいくつ使えばよいですか？'
+    a: 'seineがスレッド数を自動で選ぶため、他の作業用に余裕を残したいときだけ設定すれば十分です。スレッド1つにつき約2 GBのRAMを使います。ダッシュボードでマイナスキーを押し、パソコンの動作がちょうどよくなったら、その数を使います。'
+  - q: 'seineは設定をどこに保存しますか？'
+    a: 'seineはアドレス、プール、ワーカー名を、起動したフォルダー内のseine-data/seine.config.jsonに保存します。スレッドとbackendのオプションはここには保存されないため、起動のたびに使いたい場合は小さな起動ファイルに書いておきます。'
+sourceHash: b5ca5a9a16d8
+translation: draft
+---
+
+seineは設定なしでも問題なく動作します。このガイドでは、変更したくなる可能性が高い項目を説明します。CPUやGPUのマイニングをオフにする、スレッド数を減らす、グラフィックスカードを選ぶ、アドレスやプールを変更する、の4つです。
+
+## seineの設定を変更するには？
+
+<Answer>
+seineを閉じ、そのフォルダーでターミナルを開き、設定をコマンドに追加して再び起動します（例：`./seine --threads 4`）。Windowsでは、PowerShellで `.\seine.exe --threads 4` と入力します。seineは保存済みのアドレスとプールを覚えているので、変更したい項目だけを入力すれば済みます。
+</Answer>
+
+- **Windows：** エクスプローラーでseineのフォルダーを開き、アドレスバーに `powershell` と入力してEnterキーを押します。
+- **macOSとLinux：** ターミナルを開き、`cd` でseineのフォルダーに移動します。
+
+以下の例では `./seine` を使います。Windowsでは代わりに `.\seine.exe` と入力してください。
+
+## CPUまたはGPUのマイニングをオフにするには？
+
+seineは標準でCPUと、対応しているすべてのグラフィックスカードでマイニングします。`--backend` で使うものを選べます。
+
+| やりたいこと | 追加するもの |
+|---|---|
+| CPUのみ、GPUはオフ | `--backend cpu` |
+| NVIDIA GPUのみ、CPUはオフ | `--backend nvidia` |
+| AMD GPUのみ、CPUはオフ | `--backend amd` |
+| NVIDIAとAMDのGPU、CPUはオフ | `--backend nvidia,amd` |
+
+たとえば、NVIDIAカードでマイニングしてCPUを空けておくには次のようにします。
+
+```sh
+./seine --backend nvidia
+```
+
+[ダッシュボード](/ja/blog/seine-dashboard-explained/)のDevicesパネルには、マイニング中のデバイスごとに1行が表示されます。
+
+## CPUスレッドを減らすには？
+
+`--threads` に希望の数を付けて指定します。
+
+```sh
+./seine --threads 4
+```
+
+スレッド1つにつき約2 GBのRAMを使うので、4スレッドでは約8 GBです。seineは設定を外すまでその数を使い続けます。
+
+ちょうどよい数を見つけるには、seineを通常どおり起動し、ダッシュボードで `-` を押してスレッドを1つ減らすか、`+` を押して1つ増やします。反映には少し時間がかかり、ダッシュボードに新しい数が表示されます。パソコンの動作がちょうどよくなったところで止め、その数を `--threads` に指定します。キー操作はseineを閉じるまでしか有効ではないためです。
+
+seineに少なめのスレッド数を自動で選ばせるには、代わりに次を使います。
+
+```sh
+./seine --cpu-profile efficiency
+```
+
+パソコンを使いながらマイニングする方法は、[デスクトップガイド](/ja/blog/mine-while-using-pc/)で詳しく説明しています。
+
+## グラフィックスカードを1枚だけ選ぶには？
+
+カードの番号を指定します。最初のカードは `0` です。
+
+```sh
+./seine --backend cpu,nvidia --nvidia-devices 0
+```
+
+これでCPUと最初のNVIDIAカードでマイニングします。カード2枚なら `--nvidia-devices 0,1` を使い、CPUをオフにするには `cpu,` を外します。AMDカードも同じ要領です。
+
+```sh
+./seine --backend cpu,amd --amd-devices 0
+```
+
+他のアプリ用にビデオメモリを空けるには、`--nvidia-max-lanes 2` または `--amd-max-lanes 2` を使います。レーン1つにつき約2 GBのビデオメモリを使います。内蔵のRadeonグラフィックスは、自分で `--backend amd` を追加しない限りオフのままです。
+
+## 起動のたびに設定を使うには？
+
+seineはアドレス、プール、ワーカー名を自動で保存します。`--threads` や `--backend` などの設定はその1回の実行だけ有効なので、小さな起動ファイルに書き、seineの代わりにそのファイルを開いて起動します。
+
+Windowsでは、メモ帳を開いて次の行を自分の設定で入力し、seineのフォルダーに `start-mining.bat` として保存します。このとき**ファイルの種類**は**すべてのファイル**にします。
+
+```bat
+seine.exe --backend cpu --threads 4
+pause
+```
+
+`start-mining.bat` をダブルクリックするとマイニングが始まります。`pause` の行は、seineが止まったときもウィンドウを開いたままにするので、最後のメッセージを読めます。
+
+macOSまたはLinuxでは、次の行をseineのフォルダーに `start-mining.sh` として保存します。
+
+```sh
+#!/bin/sh
+cd "$(dirname "$0")"
+./seine --backend cpu --threads 4
+```
+
+`chmod +x start-mining.sh` を一度実行すれば、`./start-mining.sh` でマイニングを開始できます。自動アップデートでは、同じ設定でseineが再起動します。Windowsにサインインするたびにマイニングを始めるには、[自動起動ガイド](/ja/blog/start-miner-automatically-windows/)に従ってください。
+
+## アドレス、プール、ワーカー名を変更するには？
+
+seineを閉じ、`seine-data/seine.config.json` をテキストエディターで開きます。このフォルダーは、seineを起動するフォルダーの中にあります。必要な値を変更して保存します。
+
+```json
+{
+  "schema_version": 1,
+  "mode": "pool",
+  "address": "@yourname",
+  "pool_url": "stratum+tcp://bntpool.com:3333",
+  "pool_worker": "desktop-01"
+}
+```
+
+ほかの行はそのままにします。引用符とカンマは残し、このファイルにリカバリーフレーズや秘密鍵を書かないでください。
+
+1回の実行だけ別の値を使うには、コマンドに追加します。保存済みのファイルは変わりません。
+
+```sh
+./seine --pool-worker desktop-02
+```
+
+ほかの2つの設定は `--address` と `--pool-url` です。アドレスを変更した後にプールがあなたの作業をどう反映するかは、[アドレス変更ガイド](https://bntpool.com/blog/ja/change-mining-wallet-address/)で説明しています。
+
+## 設定が機能しないときは？
+
+| 表示される内容 | 対処 |
+|---|---|
+| `--nvidia-devices requires selecting nvidia in --backend` | backendに `nvidia` を追加します：`--backend cpu,nvidia`。`amd` も同様です。 |
+| `configured CPU lanes need` さらに多くのRAM | `--threads` に小さい数を指定します。空きRAM 2 GBにつきスレッド1つが目安です。 |
+| `all GPU backends failed to start` | お使いのカードの最新ドライバーをインストールします。LinuxでAMDカードに必要なものは[AMDガイド](https://github.com/zpalmtree/seine/blob/master/docs/guides/amd.md)にまとめています。 |
+| seineがまたアドレスを尋ねる | 前回と同じフォルダーからseineを起動するか、`--data-dir` でフォルダーを指定します。 |
+| 設定が自動に戻った | 起動ファイルからseineを起動します。`-` と `+` のキーはseineを閉じるまでしか有効ではありません。 |
+
+すべての設定は[フラグリファレンス](https://github.com/zpalmtree/seine/blob/master/docs/MINER_FLAGS.md)に載っています。
+
+<CTA target="seine" title="最新のseineをダウンロード" text="seineをダウンロードして一度起動し、変更したい設定だけを追加します。" />

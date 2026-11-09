@@ -1,0 +1,87 @@
+---
+title: 'วิธีขุด Blocknet บน Linux'
+description: "Linux: ดาวน์โหลด seine แตกไฟล์ ใส่ที่อยู่ Blocknet แล้วตรวจสอบ share ที่ยอมรับบน bntpool.com เริ่มด้วยการตั้งค่าอัตโนมัติ ส่วนคำแนะนำด้านประสิทธิภาพอยู่หลังขั้นตอนติดตั้ง"
+tags: ['คู่มือการขุด', 'Linux', 'NVIDIA']
+faq:
+  - q: 'ควรดาวน์โหลดไฟล์บีบอัด Linux ตัวใด?'
+    a: "เปิดส่วนดาวน์โหลด รัน uname -m: ถ้าได้ x86_64 ให้เลือก seine-linux-x86_64.tar.gz ถ้าได้ aarch64 ให้เลือก seine-linux-aarch64.tar.gz รุ่น Linux ต้องใช้ glibc 2.31 ขึ้นไป รุ่น x86_64 รองรับ CPU และ NVIDIA ส่วน ARM64 รองรับการขุดด้วย CPU"
+  - q: 'ต้องใช้ sudo เพื่อเรียกใช้ seine หรือไม่?'
+    a: 'เรียกใช้โปรแกรมขุดตามปกติด้วยบัญชีผู้ใช้ของคุณจากโฟลเดอร์ที่เขียนข้อมูลได้ แตกไฟล์บีบอัด ให้สิทธิ์เจ้าของไฟล์ในการเรียกใช้หากจำเป็น แล้วเริ่มด้วย ./seine การเตรียม huge pages ที่จองไว้เป็นงานผู้ดูแลระบบแยกต่างหาก ส่วนการเริ่มใช้งานปกติสามารถใช้หน้าหน่วยความจำทั่วไปได้'
+  - q: 'ต้องใช้ CUDA หรือ NVRTC สำหรับการขุดด้วย NVIDIA บน Linux หรือไม่?'
+    a: 'ไม่ต้อง แค่มีไดรเวอร์ NVIDIA ก็พอ seine จะใช้ NVRTC เมื่อติดตั้งไว้ และหากไม่มีก็จะโหลดเคอร์เนลที่ฝังอยู่ใน seine ซึ่งรองรับการ์ด GeForce GTX 10 series และใหม่กว่า ติดตั้งไดรเวอร์ เริ่ม seine แล้วตรวจสอบว่าการ์ดของคุณแสดงในแผง Devices'
+sourceHash: acdcb56b3c1f
+translation: draft
+---
+
+## จะเริ่มขุด Blocknet บน Linux ได้อย่างไร?
+
+<Answer>
+ดาวน์โหลด seine แตกไฟล์ ใส่ที่อยู่ Blocknet แล้วตรวจสอบ share ที่ยอมรับบน bntpool.com เริ่มด้วยการตั้งค่าอัตโนมัติ ส่วนคำแนะนำด้านประสิทธิภาพอยู่หลังขั้นตอนติดตั้ง
+</Answer>
+
+## ขั้นตอนที่ 1: ดาวน์โหลดรุ่นที่ตรงกับเครื่อง
+
+เปิด[ส่วนดาวน์โหลด](/th/#download) รัน `uname -m`: ถ้าได้ `x86_64` ให้เลือก `seine-linux-x86_64.tar.gz` ถ้าได้ `aarch64` ให้เลือก `seine-linux-aarch64.tar.gz` รุ่น Linux ต้องใช้ glibc 2.31 ขึ้นไป รุ่น x86_64 รองรับ CPU และ NVIDIA ส่วน ARM64 รองรับการขุดด้วย CPU
+
+<img src="/assets/blog/setup-download.webp" alt="ตารางดาวน์โหลดทางการที่มีไฟล์บีบอัด Linux และ Linux ARM64" loading="lazy" />
+
+## ขั้นตอนที่ 2: แตกไฟล์และเปิดโปรแกรม
+
+เปิด Terminal คำสั่งเหล่านี้สมมติว่าไฟล์บีบอัดอยู่ในโฟลเดอร์ Downloads หากอยู่ที่อื่นให้ใช้ตำแหน่งจริง บน ARM64 ให้เปลี่ยน `seine-linux-x86_64.tar.gz` เป็น `seine-linux-aarch64.tar.gz` คำสั่งจะแตกไฟล์ seine ลงในโฟลเดอร์บ้านแล้วเปิดโปรแกรม:
+
+```sh
+mkdir -p "$HOME/seine"
+tar -xzf "$HOME/Downloads/seine-linux-x86_64.tar.gz" -C "$HOME/seine"
+cd "$HOME/seine"
+./seine
+```
+
+## ขั้นตอนที่ 3: ใส่ที่อยู่กระเป๋าเงิน
+
+วางที่อยู่รับ Blocknet สาธารณะหรือ `@name` ที่ลงทะเบียนไว้ แล้วกด Enter เพื่อใช้ `stratum+tcp://bntpool.com:3333` [คู่มือกระเป๋าเงิน](/th/blog/blocknet-wallet-for-mining/) อธิบายวิธีหาที่อยู่ seine ไม่ต้องใช้วลีกู้คืนหรือคีย์ใช้จ่าย และจะตั้งชื่อ worker ในพูลให้โดยอัตโนมัติ
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="หน้าจอถามที่อยู่และพูลเมื่อเปิดครั้งแรก เปลี่ยนตัวอย่างเป็นที่อยู่หรือชื่อที่ลงทะเบียนของคุณ" loading="lazy" />
+  </picture>
+  <figcaption>หน้าจอถามที่อยู่และพูลเมื่อเปิดครั้งแรก เปลี่ยนตัวอย่างเป็นที่อยู่หรือชื่อที่ลงทะเบียนของคุณ</figcaption>
+</figure>
+
+seine เลือกจำนวนเธรดและปรับแต่งโดยอัตโนมัติ ครั้งต่อไปให้เปิดจากโฟลเดอร์เดิมเพื่อใช้ `seine-data/seine.config.json` ซ้ำ
+
+## ขั้นตอนที่ 4: ตรวจสอบ share ที่ยอมรับ
+
+ดูค่า hashrate และตัวนับ **Accepted** ที่เพิ่มขึ้นใน[แดชบอร์ด](/th/blog/seine-dashboard-explained/) share ที่ยอมรับยืนยันว่าพูลได้รับงานของคุณ แต่ไม่ได้หมายความว่ามีการจ่ายเงินแล้ว กด `q` หรือ `Ctrl+C` เพื่อหยุด
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="แดชบอร์ดจริงของ seine พร้อมข้อมูลตัวอย่าง ให้ดู Accepted ตัวเลขเหล่านี้ไม่ใช่ผล benchmark" loading="lazy" />
+  </picture>
+  <figcaption>แดชบอร์ดจริงของ seine พร้อมข้อมูลตัวอย่าง ให้ดู Accepted ตัวเลขเหล่านี้ไม่ใช่ผล benchmark</figcaption>
+</figure>
+
+เปิด[สถิติของฉัน](https://bntpool.com/stats?lang=th) แล้วใส่ที่อยู่หรือชื่อที่ลงทะเบียนเดิมเพื่อดู worker, share และยอดคงเหลือ
+
+## ต้องมีอะไรบ้างสำหรับการขุดด้วย GPU บน Linux?
+
+การ์ด NVIDIA ต้องใช้เพียงไดรเวอร์ NVIDIA ส่วนการ์ด AMD ต้องใช้ไดรเวอร์ amdgpu และ ROCm HIP runtime ตามที่[คู่มือ AMD](https://github.com/zpalmtree/seine/blob/master/docs/guides/amd.md)อธิบาย seine จะค้นหาการ์ดของคุณเองและขุดด้วยการ์ดเหล่านั้นควบคู่กับ CPU ในบิลด์ x86_64 [คู่มือ NVIDIA](/th/blog/mine-blocknet-nvidia-gpu/)อธิบายการเลือกการ์ดและการตรวจสอบ share ของ GPU
+
+<MinerSettings os="linux" />
+
+## จะแก้ไขข้อผิดพลาดตอนเริ่ม Linux ได้อย่างไร?
+
+ใช้ข้อความผิดพลาดแรกเพื่อเลือกสิ่งที่จะตรวจสอบต่อ:
+
+| ข้อความหรืออาการ | สิ่งที่ควรตรวจสอบ |
+|---|---|
+| `Exec format error` | สถาปัตยกรรมไม่ตรงกัน: เปรียบเทียบ `uname -m` กับชื่อไฟล์บีบอัด |
+| `GLIBC_... not found` | ไบนารีต้องใช้ glibc รุ่นใหม่กว่า ใช้ระบบที่เข้ากันได้หรือบิลด์จากซอร์ส และให้ดิสทริบิวชันดูแลไลบรารี C ของระบบต่อไป |
+| `Permission denied` | ตรวจสอบสิทธิ์การเรียกใช้ของผู้ใช้ และใช้โฟลเดอร์บนระบบไฟล์ที่อนุญาตให้เรียกใช้โปรแกรม |
+
+เมื่อแชร์ได้รับการยอมรับแล้ว [คู่มือ huge pages](/th/blog/huge-pages-blocknet-mining/) อธิบายการตั้งค่าหน้าหน่วยความจำ Linux ที่เลือกทำเพิ่มเติมได้ ส่วน[คู่มือเซิร์ฟเวอร์](/th/blog/mine-blocknet-on-servers/) ครอบคลุมการทำงานแบบไม่มีจอและการจัดวาง NUMA ทั้งสองอย่างไม่ใช่ข้อกำหนดในการทำตามคู่มือเริ่มใช้งานครั้งแรกนี้ ควรเปลี่ยนทีละอย่างเพื่อแยกได้ว่าเครื่องของคุณเปลี่ยนแปลงอะไรไป
+
+<CTA target="seine" title="ดาวน์โหลด seine สำหรับ Linux" text="แตกไฟล์ที่ดาวน์โหลดสำหรับ Linux ใส่ที่อยู่ แล้วเริ่มขุดด้วยการปรับแต่ง CPU อัตโนมัติ" />
+
+เปิด[สถิติของฉัน](https://bntpool.com/stats?lang=th) แล้วใส่ที่อยู่หรือชื่อที่ลงทะเบียนเดิมเพื่อดู worker, share และยอดคงเหลือ

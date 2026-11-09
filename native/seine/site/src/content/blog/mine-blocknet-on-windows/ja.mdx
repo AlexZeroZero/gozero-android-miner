@@ -1,0 +1,82 @@
+---
+title: 'WindowsでBlocknetをマイニングする方法'
+description: 'seineでWindowsからBlocknetをマイニング。ZIPの選択と展開、アドレスの入力、CPUとNVIDIAの同時稼働、承認されたシェアの確認までを説明します。'
+tags: ['マイニングガイド', 'Windows', 'NVIDIA']
+faq:
+  - q: 'WindowsでBlocknetをマイニングするにはCUDA Toolkitが必要ですか？'
+    a: 'いいえ。Windows版のリリースZIPには、seineに必要なNVIDIAランタイムライブラリが含まれています。新しいNVIDIAドライバーをインストールし、展開したファイルは一緒に保存してください。seineはCPUとともに対応NVIDIAカードを検出し、自動調整します。NVIDIAカードのないマシンでもCPUマイニングは動作します。'
+  - q: 'seineはWindowsのマイニング設定をどこに保存しますか？'
+    a: 'デフォルトでは、seineは起動したフォルダー内のseine-data/seine.config.jsonに受取アドレス、プール、リグ名を保存します。同じ展開先フォルダーから実行すると、その設定を再利用できます。必要な場合はdata-dirオプションで別のディレクトリを指定できます。'
+  - q: 'マイニングを始める前にWindowsのラージページが必要ですか？'
+    a: 'いいえ。seineはラージページを自動的に試し、利用できない場合は通常のページを使います。デフォルト設定でマイニングを始められます。任意でラージページを設定する場合は、マイニング用アカウントに「メモリ内のページのロック」権限を与え、サインアウトして再びサインインした後にseineを再起動してください。'
+sourceHash: 1878d05f199d
+translation: draft
+---
+
+このガイドでは、Windows版ZIPのダウンロードから、bntpool.comでシェアが承認されるまでを説明します。ファイルを展開し、受取アドレスを入力して、CPUと対応NVIDIAカードがマイニングしていることを確かめます。以下のコマンドはWindows上で直接動かすPowerShell用です。
+
+## WindowsでBlocknetのマイニングを始めるには？
+
+<Answer>
+`seine-windows-x86_64.zip`をダウンロードし、アーカイブ全体を展開して`seine.exe`を開きます。Blocknetアドレスまたは登録済みの`@name`を入力し、プールには`stratum+tcp://bntpool.com:3333`をそのまま使います。seineは利用可能なCPUとNVIDIAのバックエンドを選び、メモリに合わせてスレッド数を決め、マイニングしながら調整を始めます。
+</Answer>
+
+マイナーを開く前に公開の受取アドレスを用意してください。取得方法は[ウォレットガイド](/ja/blog/blocknet-wallet-for-mining/)で説明しています。入力するのは受取アドレスだけです。マイナーにウォレットのシードフレーズや支出鍵は必要ありません。登録済みの[Blocknet ID](/ja/blog/blocknet-id-pay-by-name/)も使えるため、長いアドレスの代わりに`@name`を指定できます。
+
+## ステップ1：適切なビルドをダウンロード
+
+[ダウンロードセクション](/ja/#download)を開き、Windows x86_64を選びます。アーカイブ名は`seine-windows-x86_64.zip`です。
+
+![seine公式ダウンロード一覧のWindows版ZIP](/assets/blog/setup-download.webp)
+
+## ステップ2：展開して起動
+
+エクスプローラーでダウンロードしたZIPを右クリックし、**すべて展開**を選びます。書き込み可能なフォルダーを指定し、展開先フォルダーを開きます。`seine.exe`と付属のDLLは一緒に保存してください。Windows版アーカイブにはマイナーが使うNVIDIAランタイムライブラリが含まれています。
+
+展開先フォルダー内の`seine.exe`をダブルクリックします。ターミナルを使う場合は、そのフォルダーでPowerShellを開いて次を実行します。
+
+```powershell
+.\seine.exe
+```
+
+## ステップ3：ウォレットアドレスを入力
+
+公開用のBlocknet受取アドレスまたは登録済みの`@name`を貼り付け、Enterを押して`stratum+tcp://bntpool.com:3333`を選びます。アドレスの確認方法は[ウォレットガイド](/ja/blog/blocknet-wallet-for-mining/)をご覧ください。seineにリカバリーフレーズや支出鍵は不要です。プールのワーカー名は自動で設定されます。
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="初回起動時のアドレスとプールの入力画面。例を自分のアドレスまたは登録済みの名前に置き換えてください。" loading="lazy" />
+  </picture>
+  <figcaption>初回起動時のアドレスとプールの入力画面。例を自分のアドレスまたは登録済みの名前に置き換えてください。</figcaption>
+</figure>
+
+seineはスレッド数を選び、自動で調整します。次回からも同じフォルダから起動すると、`seine-data/seine.config.json`を再利用できます。
+
+## ステップ4：受理されたシェアを確認
+
+<Answer>
+seineのダッシュボードにハッシュレートと承認されたシェアが表示されていることを確認し、bntpool.comのMy Statsページで同じ受取アドレスを検索します。ダッシュボードはマイナーの現在の作業を示し、プールは送信されたシェアと報酬を記録します。速度の比較や設定の変更は、自動調整が落ち着くまで待ってください。
+</Answer>
+
+[ダッシュボードガイド](/ja/blog/seine-dashboard-explained/)では、ハッシュレート、マイニング状態、プールのパネルを説明しています。稼働中のハッシュレートはローカルでのハッシュ計算を示し、承認されたシェアは作業がプールに届いたことを確認するものです。[My Stats](https://bntpool.com/stats?lang=ja)を開いて同じアドレスまたは短縮名を入力すると、このリグのシェアと残高を追跡できます。
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="seineの実際のダッシュボードにサンプルデータを表示しています。Acceptedを確認してください。数値はベンチマーク結果ではありません。" loading="lazy" />
+  </picture>
+  <figcaption>seineの実際のダッシュボードにサンプルデータを表示しています。Acceptedを確認してください。数値はベンチマーク結果ではありません。</figcaption>
+</figure>
+
+## 同じPCでCPUとNVIDIAを使ってマイニングする
+
+seineはデフォルトでCPUと対応NVIDIAカードを同時に使います。新しいNVIDIAドライバーをインストールしてください。Windows版ZIPにはランタイムライブラリが含まれているので、CUDA Toolkitを別途インストールする必要はありません。マイナーのフォルダーを移動するときも、展開したDLLは実行ファイルと同じ場所に置いてください。
+
+初回起動時に、seineは各GPUを調整して設定を記憶します。CPUの調整もマイニング中に行われます。[ハードウェアガイド](/ja/blog/blocknet-mining-hardware-hashrate/)ではメモリの割り当てと測定結果を、[NVIDIAガイド](https://github.com/zpalmtree/seine/blob/master/docs/guides/nvidia.md)では複数カードの使用を説明しています。正常に停止するには、ダッシュボードで`q`を押すか、ターミナルで`Ctrl+C`を押します。
+
+<MinerSettings os="windows" />
+
+<CTA target="seine" title="Windows版seineをダウンロード" text="ZIPを展開して受取アドレスを入力し、CPUとNVIDIAの自動調整でbntpool.comのマイニングを始めましょう。" />
+
+[マイ統計](https://bntpool.com/stats?lang=ja)を開き、同じアドレスまたは登録済みの名前を入力して、ワーカー、シェア、残高を確認します。

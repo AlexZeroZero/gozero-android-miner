@@ -1,0 +1,34 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'trade.gozero.bnt'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'trade.gozero.bnt'
+        minSdk 28
+        targetSdk 35
+        versionCode 15
+        versionName '0.2.10'
+        ndk { abiFilters 'arm64-v8a', 'x86_64' }
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+    }
+    signingConfigs {
+        release {
+            if (System.getenv('BNT_KEYSTORE')) {
+                storeFile file(System.getenv('BNT_KEYSTORE'))
+                storePassword System.getenv('BNT_STORE_PASSWORD')
+                keyAlias 'gozero-bnt'
+                keyPassword System.getenv('BNT_STORE_PASSWORD')
+            }
+        }
+    }
+    buildTypes { release { minifyEnabled false; signingConfig signingConfigs.release } }
+    splits { abi { enable true; reset(); include 'arm64-v8a', 'x86_64'; universalApk true } }
+    packaging { jniLibs { useLegacyPackaging = true; keepDebugSymbols += ['**/libseine.so', '**/libtowerminer.so'] } }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+}
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+}

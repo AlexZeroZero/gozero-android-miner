@@ -1,0 +1,87 @@
+---
+title: 'Jak kopać Blocknet w systemie Linux'
+description: "Linux: Pobierz seine, rozpakuj go, wpisz swój adres Blocknet i sprawdź zaakceptowane udziały na bntpool.com. Zacznij od ustawień automatycznych; wskazówki dotyczące wydajności znajdziesz po instrukcji konfiguracji."
+tags: ['Poradnik kopania', 'Linux', 'NVIDIA']
+faq:
+  - q: 'Które archiwum dla Linuksa pobrać?'
+    a: "Otwórz sekcję pobierania. Uruchom uname -m: wybierz seine-linux-x86_64.tar.gz dla x86_64 lub seine-linux-aarch64.tar.gz dla aarch64. Wersje dla Linuksa wymagają glibc 2.31 lub nowszej. Wersja x86_64 obsługuje CPU i NVIDIA, a ARM64 — kopanie na CPU."
+  - q: 'Czy seine trzeba uruchamiać przez sudo?'
+    a: 'Uruchamiaj zwykły miner na własnym koncie z katalogu z prawem zapisu. Rozpakuj archiwum, w razie potrzeby nadaj właścicielowi prawo wykonywania i uruchom ./seine. Rezerwowanie huge pages to osobne zadanie administracyjne; zwykły start może korzystać ze standardowych stron pamięci.'
+  - q: 'Czy potrzebuję CUDA lub NVRTC do kopania na NVIDIA w Linuksie?'
+    a: 'Nie. Wystarczy sterownik NVIDIA. Seine używa NVRTC, gdy jest zainstalowany, a w przeciwnym razie ładuje kernele wbudowane w seine, które obejmują karty GeForce z serii GTX 10 i nowsze. Zainstaluj sterownik, uruchom seine i sprawdź, czy Twoja karta pojawia się w panelu Devices.'
+sourceHash: acdcb56b3c1f
+translation: draft
+---
+
+## Jak rozpocząć kopanie Blocknet w Linuksie?
+
+<Answer>
+Pobierz seine, rozpakuj go, wpisz swój adres Blocknet i sprawdź zaakceptowane udziały na bntpool.com. Zacznij od ustawień automatycznych; wskazówki dotyczące wydajności znajdziesz po instrukcji konfiguracji.
+</Answer>
+
+## Krok 1: pobierz właściwą wersję
+
+Otwórz [sekcję pobierania](/pl/#download). Uruchom `uname -m`: wybierz `seine-linux-x86_64.tar.gz` dla `x86_64` lub `seine-linux-aarch64.tar.gz` dla `aarch64`. Wersje dla Linuksa wymagają glibc 2.31 lub nowszej. Wersja x86_64 obsługuje CPU i NVIDIA, a ARM64 — kopanie na CPU.
+
+<img src="/assets/blog/setup-download.webp" alt="Oficjalna tabela pobierania z archiwami Linux i Linux ARM64" loading="lazy" />
+
+## Krok 2: rozpakuj i uruchom
+
+Otwórz Terminal. Polecenia zakładają, że archiwum znajduje się w katalogu Downloads; w razie potrzeby podaj właściwą ścieżkę. Na ARM64 zamień `seine-linux-x86_64.tar.gz` na `seine-linux-aarch64.tar.gz`. Rozpakują seine w katalogu domowym i go uruchomią:
+
+```sh
+mkdir -p "$HOME/seine"
+tar -xzf "$HOME/Downloads/seine-linux-x86_64.tar.gz" -C "$HOME/seine"
+cd "$HOME/seine"
+./seine
+```
+
+## Krok 3: wpisz adres portfela
+
+Wklej publiczny adres odbiorczy Blocknet lub zarejestrowaną nazwę `@name`, a następnie naciśnij Enter, aby zaakceptować `stratum+tcp://bntpool.com:3333`. [Poradnik portfela](/pl/blog/blocknet-wallet-for-mining/) pokazuje, gdzie znaleźć adres. Seine nie potrzebuje frazy odzyskiwania ani kluczy wydawania. Automatycznie nadaje nazwę workerowi w puli.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="Pytania o adres i pulę przy pierwszym uruchomieniu. Zastąp przykład swoim adresem lub zarejestrowaną nazwą." loading="lazy" />
+  </picture>
+  <figcaption>Pytania o adres i pulę przy pierwszym uruchomieniu. Zastąp przykład swoim adresem lub zarejestrowaną nazwą.</figcaption>
+</figure>
+
+Seine sam wybiera wątki i dostraja wydajność. Przy kolejnych uruchomieniach używaj tego samego katalogu, aby ponownie korzystać z `seine-data/seine.config.json`.
+
+## Krok 4: sprawdź zaakceptowane udziały
+
+W [panelu](/pl/blog/seine-dashboard-explained/) sprawdź hashrate i rosnący licznik **Accepted**. Zaakceptowany udział potwierdza otrzymanie pracy przez pulę; nie oznacza jeszcze wypłaty. Naciśnij `q` lub `Ctrl+C`, aby zakończyć.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="Rzeczywisty panel seine z przykładowymi danymi. Znajdź Accepted; te wartości nie są wynikami benchmarku." loading="lazy" />
+  </picture>
+  <figcaption>Rzeczywisty panel seine z przykładowymi danymi. Znajdź Accepted; te wartości nie są wynikami benchmarku.</figcaption>
+</figure>
+
+Otwórz [Moje statystyki](https://bntpool.com/stats?lang=pl) i wpisz ten sam adres lub zarejestrowaną nazwę, aby znaleźć swojego workera, udziały i saldo.
+
+## Czego potrzebujesz do kopania na GPU w Linuksie?
+
+Karty NVIDIA potrzebują tylko sterownika NVIDIA. Karty AMD potrzebują sterownika amdgpu i środowiska ROCm HIP, jak wyjaśnia [poradnik AMD](https://github.com/zpalmtree/seine/blob/master/docs/guides/amd.md). Seine sam znajduje Twoje karty i kopie na nich razem z CPU w wersji x86_64. [Poradnik NVIDIA](/pl/blog/mine-blocknet-nvidia-gpu/) opisuje wybór kart i sprawdzanie udziałów GPU.
+
+<MinerSettings os="linux" />
+
+## Jak rozwiązać błąd uruchamiania w Linuksie?
+
+Wybierz kolejną kontrolę na podstawie pierwszego komunikatu o błędzie:
+
+| Komunikat lub objaw | Co sprawdzić |
+|---|---|
+| `Exec format error` | Niewłaściwa architektura: porównaj `uname -m` z nazwą archiwum. |
+| `GLIBC_... not found` | Program wymaga nowszej glibc. Użyj zgodnego systemu lub skompiluj źródła; pozostaw zarządzanie systemową biblioteką C dystrybucji. |
+| `Permission denied` | Sprawdź prawo wykonywania użytkownika i użyj folderu na systemie plików zezwalającym na wykonywanie. |
+
+Po zaakceptowaniu udziałów [poradnik huge pages](/pl/blog/huge-pages-blocknet-mining/) opisuje opcjonalną konfigurację stron w Linuksie. [Poradnik serwerów](/pl/blog/mine-blocknet-on-servers/) obejmuje pracę bez interfejsu graficznego i rozmieszczenie NUMA. Żadne z tych przygotowań nie jest potrzebne do pierwszego uruchomienia; wprowadzaj zmiany oddzielnie, aby rozpoznać ich wpływ na komputer.
+
+<CTA target="seine" title="Pobierz seine dla Linuksa" text="Rozpakuj plik dla Linuksa, wpisz adres i zacznij kopać z automatycznym dostrajaniem CPU." />
+
+Otwórz [Moje statystyki](https://bntpool.com/stats?lang=pl) i wpisz ten sam adres lub zarejestrowaną nazwę, aby znaleźć swojego workera, udziały i saldo.

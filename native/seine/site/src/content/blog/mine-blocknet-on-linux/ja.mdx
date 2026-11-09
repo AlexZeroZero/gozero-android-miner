@@ -1,0 +1,87 @@
+---
+title: 'LinuxでBlocknetをマイニングする方法'
+description: "Linux: seineをダウンロードして展開し、Blocknetアドレスを入力して、bntpool.comでシェアの受理を確認します。まず自動設定で始めましょう。性能調整の説明はセットアップの後にあります。"
+tags: ['マイニングガイド', 'Linux', 'NVIDIA']
+faq:
+  - q: 'どのLinuxアーカイブをダウンロードすればよいですか？'
+    a: "ダウンロード欄を開きます。uname -mを実行し、x86_64ならseine-linux-x86_64.tar.gz、aarch64ならseine-linux-aarch64.tar.gzを選びます。Linux版にはglibc 2.31以降が必要です。x86_64版はCPUとNVIDIA、ARM64版はCPUマイニングに対応します。"
+  - q: 'seineはsudoで実行する必要がありますか？'
+    a: '通常のマイナーは、書き込み可能なフォルダーから自分のユーザーで実行します。アーカイブを展開し、必要なら所有者に実行権限を付与して、./seineで起動します。予約ヒュージページの準備は別の管理作業です。通常の起動では標準のメモリページを使用できます。'
+  - q: 'LinuxでNVIDIA GPUマイニングをするのにCUDAやNVRTCは必要ですか？'
+    a: 'いいえ。NVIDIAドライバーがあれば十分です。seineはNVRTCがインストールされていればそれを使い、なければseineに組み込まれたカーネルを読み込みます。これはGeForce GTX 10 series以降のカードに対応しています。ドライバーをインストールしてseineを起動し、Devicesパネルにカードが表示されることを確認してください。'
+sourceHash: acdcb56b3c1f
+translation: draft
+---
+
+## LinuxでBlocknetのマイニングを始めるには？
+
+<Answer>
+seineをダウンロードして展開し、Blocknetアドレスを入力して、bntpool.comでシェアの受理を確認します。まず自動設定で始めましょう。性能調整の説明はセットアップの後にあります。
+</Answer>
+
+## ステップ1：適切なビルドをダウンロード
+
+[ダウンロード欄](/ja/#download)を開きます。`uname -m`を実行し、`x86_64`なら`seine-linux-x86_64.tar.gz`、`aarch64`なら`seine-linux-aarch64.tar.gz`を選びます。Linux版にはglibc 2.31以降が必要です。x86_64版はCPUとNVIDIA、ARM64版はCPUマイニングに対応します。
+
+<img src="/assets/blog/setup-download.webp" alt="LinuxとLinux ARM64のアーカイブが並ぶ公式ダウンロード表" loading="lazy" />
+
+## ステップ2：展開して起動
+
+ターミナルを開きます。以下のコマンドはアーカイブがDownloadsフォルダにある前提です。異なる場合は実際の場所に変更してください。ARM64では`seine-linux-x86_64.tar.gz`を`seine-linux-aarch64.tar.gz`に置き換えます。ホームフォルダ内にseineを展開して起動します。
+
+```sh
+mkdir -p "$HOME/seine"
+tar -xzf "$HOME/Downloads/seine-linux-x86_64.tar.gz" -C "$HOME/seine"
+cd "$HOME/seine"
+./seine
+```
+
+## ステップ3：ウォレットアドレスを入力
+
+公開用のBlocknet受取アドレスまたは登録済みの`@name`を貼り付け、Enterを押して`stratum+tcp://bntpool.com:3333`を選びます。アドレスの確認方法は[ウォレットガイド](/ja/blog/blocknet-wallet-for-mining/)をご覧ください。seineにリカバリーフレーズや支出鍵は不要です。プールのワーカー名は自動で設定されます。
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="初回起動時のアドレスとプールの入力画面。例を自分のアドレスまたは登録済みの名前に置き換えてください。" loading="lazy" />
+  </picture>
+  <figcaption>初回起動時のアドレスとプールの入力画面。例を自分のアドレスまたは登録済みの名前に置き換えてください。</figcaption>
+</figure>
+
+seineはスレッド数を選び、自動で調整します。次回からも同じフォルダから起動すると、`seine-data/seine.config.json`を再利用できます。
+
+## ステップ4：受理されたシェアを確認
+
+[ダッシュボード](/ja/blog/seine-dashboard-explained/)でハッシュレートと増加する**Accepted**カウンターを確認します。シェアの受理はプールが作業を受け取ったことを示し、支払いの完了を意味するものではありません。停止するには`q`または`Ctrl+C`を押します。
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="seineの実際のダッシュボードにサンプルデータを表示しています。Acceptedを確認してください。数値はベンチマーク結果ではありません。" loading="lazy" />
+  </picture>
+  <figcaption>seineの実際のダッシュボードにサンプルデータを表示しています。Acceptedを確認してください。数値はベンチマーク結果ではありません。</figcaption>
+</figure>
+
+[マイ統計](https://bntpool.com/stats?lang=ja)を開き、同じアドレスまたは登録済みの名前を入力して、ワーカー、シェア、残高を確認します。
+
+## LinuxでのGPUマイニングに必要なものは何ですか？
+
+NVIDIAカードに必要なのはNVIDIAドライバーだけです。AMDカードには、[AMDガイド](https://github.com/zpalmtree/seine/blob/master/docs/guides/amd.md)で説明しているとおり、amdgpuドライバーとROCm HIPランタイムが必要です。seineはカードを自動で見つけ、x86_64ビルドではCPUと一緒にそれらでマイニングします。カードの選び方とGPUシェアの確認方法は[NVIDIAガイド](/ja/blog/mine-blocknet-nvidia-gpu/)で説明しています。
+
+<MinerSettings os="linux" />
+
+## Linuxの起動エラーはどう解決する？
+
+最初のエラーメッセージから、次に確認する項目を選びます。
+
+| メッセージまたは症状 | 確認する項目 |
+|---|---|
+| `Exec format error` | アーキテクチャが不一致です。`uname -m`とアーカイブのファイル名を照合してください。 |
+| `GLIBC_... not found` | バイナリには新しいglibcが必要です。互換性のあるシステムを使うかソースからビルドし、システムのCライブラリはディストリビューションの管理に任せてください。 |
+| `Permission denied` | ユーザーの実行権限を確認し、実行を許可するファイルシステム上のフォルダーを使用してください。 |
+
+シェアの受理を確認したら、必要に応じて[ヒュージページガイド](/ja/blog/huge-pages-blocknet-mining/)でLinuxのページ設定を確認できます。[サーバーガイド](/ja/blog/mine-blocknet-on-servers/)ではヘッドレス運用とNUMA配置を説明しています。どちらの準備も、この初回起動の手順には必須ではありません。マシン上で何が変わったか判断できるよう、変更は1つずつ行ってください。
+
+<CTA target="seine" title="Linux用seineをダウンロード" text="Linux版を展開してアドレスを入力し、自動CPU調整でマイニングを始めましょう。" />
+
+[マイ統計](https://bntpool.com/stats?lang=ja)を開き、同じアドレスまたは登録済みの名前を入力して、ワーカー、シェア、残高を確認します。

@@ -1,0 +1,145 @@
+---
+title: 'Ubah pengaturan seine: thread, CPU, GPU, dan pool'
+description: 'Matikan penambangan CPU atau GPU di seine, atur jumlah thread, pilih kartu grafis, simpan pengaturan untuk setiap start, dan ubah alamat atau pool Anda.'
+tags: ['Panduan penambangan', 'Konfigurasi', 'seine']
+faq:
+  - q: 'Bagaimana cara mematikan penambangan CPU di seine?'
+    a: 'Jalankan seine dengan opsi backend diatur ke kartu grafis Anda, yaitu nvidia atau amd. Gunakan keduanya, dipisahkan koma, jika komputer memiliki kedua jenis kartu. Seine lalu menambang hanya dengan kartu grafis dan membiarkan prosesor bebas untuk pekerjaan lain.'
+  - q: 'Bagaimana cara mematikan penambangan GPU di seine?'
+    a: 'Jalankan seine dengan opsi backend diatur ke cpu. Seine lalu menambang hanya dengan prosesor dan membiarkan semua kartu grafis bebas untuk game dan aplikasi lain. Hapus opsi itu untuk menambang lagi dengan prosesor dan kartu grafis sekaligus.'
+  - q: 'Berapa thread CPU yang sebaiknya saya gunakan?'
+    a: 'Seine memilih jumlah thread untuk Anda, jadi Anda hanya perlu mengaturnya saat ingin menyisakan ruang untuk pekerjaan lain. Setiap thread memakai sekitar 2 GB RAM. Tekan tombol minus di dasbor sampai komputer terasa nyaman, lalu gunakan angka itu.'
+  - q: 'Di mana seine menyimpan pengaturannya?'
+    a: 'Seine menyimpan alamat, pool, dan nama worker Anda di seine-data/seine.config.json, di dalam folder tempat Anda menjalankannya. Opsi thread dan backend tidak disimpan di sana, jadi taruh di file start kecil jika Anda menginginkannya di setiap start.'
+sourceHash: b5ca5a9a16d8
+translation: draft
+---
+
+Seine berjalan baik tanpa pengaturan apa pun. Panduan ini membahas perubahan yang paling mungkin Anda inginkan: mematikan penambangan CPU atau GPU, memakai lebih sedikit thread, memilih kartu grafis, dan mengubah alamat atau pool Anda.
+
+## Bagaimana cara mengubah pengaturan seine?
+
+<Answer>
+Tutup seine, buka terminal di foldernya, lalu jalankan lagi dengan pengaturan ditambahkan ke perintah, misalnya `./seine --threads 4`. Di Windows, gunakan PowerShell dan `.\seine.exe --threads 4`. Seine menyimpan alamat dan pool Anda, jadi Anda hanya mengetik apa yang ingin diubah.
+</Answer>
+
+- **Windows:** buka folder seine di File Explorer, ketik `powershell` di bilah alamat, lalu tekan Enter.
+- **macOS dan Linux:** buka Terminal dan masuk ke folder seine dengan `cd`.
+
+Contoh di bawah memakai `./seine`. Di Windows, ketik `.\seine.exe` sebagai gantinya.
+
+## Bagaimana cara mematikan penambangan CPU atau GPU?
+
+Secara default, seine menambang dengan CPU Anda dan setiap kartu grafis yang didukung. Pengaturan `--backend` memilih mana yang dipakai:
+
+| Yang Anda inginkan | Tambahkan ini |
+|---|---|
+| Hanya CPU, GPU mati | `--backend cpu` |
+| Hanya GPU NVIDIA, CPU mati | `--backend nvidia` |
+| Hanya GPU AMD, CPU mati | `--backend amd` |
+| GPU NVIDIA dan AMD, CPU mati | `--backend nvidia,amd` |
+
+Misalnya, untuk menambang dengan kartu NVIDIA dan membiarkan CPU bebas:
+
+```sh
+./seine --backend nvidia
+```
+
+Panel Devices di [dasbor](/id/blog/seine-dashboard-explained/) menampilkan satu baris untuk setiap perangkat yang sedang menambang.
+
+## Bagaimana cara memakai lebih sedikit thread CPU?
+
+Tambahkan `--threads` dengan angka yang Anda inginkan:
+
+```sh
+./seine --threads 4
+```
+
+Setiap thread memakai sekitar 2 GB RAM, jadi 4 thread memakai sekitar 8 GB. Seine tetap di angka itu sampai Anda menghapus pengaturannya.
+
+Untuk menemukan angka yang pas, jalankan seine seperti biasa dan tekan `-` di dasbor untuk mengurangi satu thread, atau `+` untuk menambah satu. Perubahan butuh beberapa saat, dan dasbor menampilkan jumlah barunya. Berhentilah saat komputer terasa nyaman, lalu gunakan angka itu dengan `--threads`, karena tombol hanya berlaku sampai Anda menutup seine.
+
+Agar seine memilih jumlah thread yang lebih ringan sendiri, gunakan ini:
+
+```sh
+./seine --cpu-profile efficiency
+```
+
+[Panduan desktop](/id/blog/mine-while-using-pc/) membahas lebih lanjut tentang menambang saat Anda memakai komputer.
+
+## Bagaimana cara memilih satu kartu grafis?
+
+Tambahkan nomor kartu. Kartu pertama adalah `0`:
+
+```sh
+./seine --backend cpu,nvidia --nvidia-devices 0
+```
+
+Ini menambang dengan CPU dan kartu NVIDIA pertama. Gunakan `--nvidia-devices 0,1` untuk dua kartu, dan hapus `cpu,` untuk mematikan CPU. Kartu AMD bekerja dengan cara yang sama:
+
+```sh
+./seine --backend cpu,amd --amd-devices 0
+```
+
+Untuk menyisakan memori video bagi aplikasi lain, gunakan `--nvidia-max-lanes 2` atau `--amd-max-lanes 2`. Setiap lane memakai sekitar 2 GB memori video. Grafis Radeon terintegrasi tetap mati kecuali Anda sendiri menambahkan `--backend amd`.
+
+## Bagaimana cara menyimpan pengaturan untuk setiap start?
+
+Seine menyimpan alamat, pool, dan nama worker Anda sendiri. Pengaturan seperti `--threads` dan `--backend` hanya berlaku untuk satu kali jalan, jadi taruh di file start kecil dan buka file itu sebagai ganti seine.
+
+Di Windows, buka Notepad, ketik baris-baris ini dengan pengaturan Anda sendiri, lalu simpan file di folder seine sebagai `start-mining.bat`, dengan **Save as type** diatur ke **All files**:
+
+```bat
+seine.exe --backend cpu --threads 4
+pause
+```
+
+Klik dua kali `start-mining.bat` untuk mulai menambang. Baris `pause` menjaga jendela tetap terbuka jika seine berhenti, sehingga Anda bisa membaca pesan terakhirnya.
+
+Di macOS atau Linux, simpan baris-baris ini di folder seine sebagai `start-mining.sh`:
+
+```sh
+#!/bin/sh
+cd "$(dirname "$0")"
+./seine --backend cpu --threads 4
+```
+
+Jalankan `chmod +x start-mining.sh` sekali, lalu mulai menambang dengan `./start-mining.sh`. Pembaruan otomatis memulai ulang seine dengan pengaturan yang sama. Untuk mulai menambang setiap kali Anda masuk ke Windows, ikuti [panduan start otomatis](/id/blog/start-miner-automatically-windows/).
+
+## Bagaimana cara mengubah alamat, pool, atau nama worker?
+
+Tutup seine dan buka `seine-data/seine.config.json` di editor teks. Folder itu berada di dalam folder tempat Anda menjalankan seine. Ubah nilai yang Anda perlukan dan simpan file:
+
+```json
+{
+  "schema_version": 1,
+  "mode": "pool",
+  "address": "@yourname",
+  "pool_url": "stratum+tcp://bntpool.com:3333",
+  "pool_worker": "desktop-01"
+}
+```
+
+Biarkan baris lainnya apa adanya. Pertahankan tanda kutip dan koma, dan jangan menambahkan frasa pemulihan atau kunci privat ke file ini.
+
+Untuk memakai nilai berbeda hanya sekali jalan, tambahkan ke perintah. File yang tersimpan tetap sama:
+
+```sh
+./seine --pool-worker desktop-02
+```
+
+Dua pengaturan lainnya adalah `--address` dan `--pool-url`. [Panduan mengubah alamat](https://bntpool.com/blog/id/change-mining-wallet-address/) menjelaskan bagaimana pool mengkreditkan pekerjaan Anda setelah Anda mengubah alamat.
+
+## Bagaimana jika sebuah pengaturan tidak berfungsi?
+
+| Yang Anda lihat | Yang harus dilakukan |
+|---|---|
+| `--nvidia-devices requires selecting nvidia in --backend` | Tambahkan `nvidia` ke backend: `--backend cpu,nvidia`. Hal yang sama berlaku untuk `amd`. |
+| `configured CPU lanes need` RAM lebih banyak | Gunakan angka yang lebih rendah dengan `--threads`, sekitar satu thread untuk setiap 2 GB RAM kosong. |
+| `all GPU backends failed to start` | Instal driver terbaru untuk kartu Anda. [Panduan AMD](https://github.com/zpalmtree/seine/blob/master/docs/guides/amd.md) mencantumkan kebutuhan kartu AMD di Linux. |
+| Seine meminta alamat Anda lagi | Jalankan seine dari folder yang sama seperti sebelumnya, atau atur foldernya dengan `--data-dir`. |
+| Pengaturan Anda kembali ke otomatis | Jalankan seine dari file start Anda. Tombol `-` dan `+` hanya berlaku sampai Anda menutup seine. |
+
+[Referensi flag](https://github.com/zpalmtree/seine/blob/master/docs/MINER_FLAGS.md) mencantumkan setiap pengaturan.
+
+<CTA target="seine" title="Dapatkan rilis seine terbaru" text="Unduh seine, jalankan sekali, lalu tambahkan hanya pengaturan yang ingin Anda ubah." />

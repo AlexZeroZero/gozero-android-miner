@@ -1,0 +1,82 @@
+---
+title: '如何在 Windows 上挖 Blocknet'
+description: '使用 seine 在 Windows 上挖 Blocknet。从选择 ZIP、解压文件和填写地址，到确认 CPU 与 NVIDIA 同时运行并提交已接受的份额，本指南逐步说明。'
+tags: ['挖矿指南', 'Windows', 'NVIDIA']
+faq:
+  - q: '在 Windows 上挖 Blocknet 需要 CUDA Toolkit 吗？'
+    a: '不需要。Windows 发布版 ZIP 已包含 seine 所需的 NVIDIA 运行时库。安装当前版本的 NVIDIA 驱动，并将解压后的文件保存在一起即可。seine 会检测 CPU 和受支持的 NVIDIA 显卡，并自动调优。没有 NVIDIA 显卡的电脑也能使用 CPU 挖矿。'
+  - q: 'seine 将 Windows 挖矿设置保存在哪里？'
+    a: '默认情况下，seine 将收款地址、矿池和矿机名称保存在启动目录下的 seine-data/seine.config.json 中。从同一个解压目录运行即可复用这些设置。需要其他目录时，可以使用 data-dir 选项指定。'
+  - q: '开始挖矿前需要启用 Windows 大页吗？'
+    a: '不需要。seine 会自动尝试使用大页，无法使用时则采用普通页。你可以直接使用默认设置开始挖矿。如需进行可选的大页设置，请为挖矿账户授予“锁定内存页”权限，然后注销并重新登录，再重启 seine。'
+sourceHash: 1878d05f199d
+translation: draft
+---
+
+本指南将带你从下载 Windows ZIP，一直到在 bntpool.com 获得已接受的份额。你将解压文件、填写收款地址，并确认 CPU 和受支持的 NVIDIA 显卡正在挖矿。以下命令使用直接运行在 Windows 上的 PowerShell。
+
+## 如何在 Windows 上开始挖 Blocknet？
+
+<Answer>
+下载 `seine-windows-x86_64.zip`，完整解压，然后打开 `seine.exe`。输入 Blocknet 地址或已注册的 `@name`，再接受 `stratum+tcp://bntpool.com:3333` 作为矿池。seine 会选择可用的 CPU 和 NVIDIA 后端，根据内存确定线程数，并在挖矿的同时开始调优。
+</Answer>
+
+打开矿工程序前，请准备好公开收款地址。[钱包指南](/zh-hans/blog/blocknet-wallet-for-mining/)说明了如何获取地址。只需输入收款地址：矿工程序不需要钱包助记词或花费密钥。已注册的 [Blocknet ID](/zh-hans/blog/blocknet-id-pay-by-name/) 也可以使用，因此你能用 `@name` 代替长地址。
+
+## 第 1 步：下载适合的版本
+
+打开[下载区域](/zh-hans/#download)，选择 Windows x86_64。压缩包名为 `seine-windows-x86_64.zip`。
+
+![seine 官方下载列表中的 Windows ZIP](/assets/blog/setup-download.webp)
+
+## 第 2 步：解压并启动
+
+在文件资源管理器中，右键点击下载的 ZIP，选择**全部解压缩**。选择一个有写入权限的文件夹，然后打开解压后的文件夹。将 `seine.exe` 与附带的 DLL 保存在一起：Windows 压缩包包含矿工程序使用的 NVIDIA 运行时库。
+
+在解压后的文件夹中双击 `seine.exe`。如果更喜欢终端，可以在该文件夹打开 PowerShell 并运行：
+
+```powershell
+.\seine.exe
+```
+
+## 第 3 步：输入钱包地址
+
+粘贴你的公开 Blocknet 收款地址或已注册的 `@name`，然后按 Enter 接受 `stratum+tcp://bntpool.com:3333`。[钱包指南](/zh-hans/blog/blocknet-wallet-for-mining/)说明了在哪里找到地址。seine 不需要恢复短语或支出密钥，并会自动分配矿池矿机名称。
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="首次启动时的地址和矿池提示。请将示例替换为你自己的地址或已注册名称。" loading="lazy" />
+  </picture>
+  <figcaption>首次启动时的地址和矿池提示。请将示例替换为你自己的地址或已注册名称。</figcaption>
+</figure>
+
+seine 会自动选择线程并调优。之后从同一文件夹启动，即可复用 `seine-data/seine.config.json`。
+
+## 第 4 步：查看已接受的份额
+
+<Answer>
+检查 seine 仪表盘是否显示哈希率和已接受的份额，然后在 bntpool.com 的 My Stats 页面查询同一收款地址。仪表盘展示矿工程序当前的工作；矿池记录提交的份额与奖励。比较速率或修改设置前，请先等待自动调优稳定下来。
+</Answer>
+
+[仪表盘指南](/zh-hans/blog/seine-dashboard-explained/)介绍了哈希率、挖矿状态和矿池面板。正在运行的哈希率表示本地正在计算哈希；已接受的份额则确认工作已到达矿池。打开 [My Stats](https://bntpool.com/stats?lang=zh-hans)，输入相同的地址或短名，即可跟踪这台矿机的份额和余额。
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="使用示例数据渲染的 seine 实际控制台。请关注 Accepted；这些数字不是性能测试结果。" loading="lazy" />
+  </picture>
+  <figcaption>使用示例数据渲染的 seine 实际控制台。请关注 Accepted；这些数字不是性能测试结果。</figcaption>
+</figure>
+
+## 在同一台 PC 上使用 CPU 和 NVIDIA 挖矿
+
+seine 默认同时使用 CPU 和受支持的 NVIDIA 显卡。安装当前版本的 NVIDIA 驱动即可；Windows ZIP 已包含运行时库，因此不必单独安装 CUDA Toolkit。移动矿工程序文件夹时，请将解压后的 DLL 留在可执行文件旁边。
+
+首次启动时，seine 会调优每块 GPU 并记住设置。CPU 调优也会在挖矿期间进行。[硬件指南](/zh-hans/blog/blocknet-mining-hardware-hashrate/)介绍了内存分配和实测结果，[NVIDIA 指南](https://github.com/zpalmtree/seine/blob/master/docs/guides/nvidia.md)则涵盖多显卡使用。要正常停止，请在仪表盘按 `q`，或在终端按 `Ctrl+C`。
+
+<MinerSettings os="windows" />
+
+<CTA target="seine" title="下载 Windows 版 seine" text="解压 ZIP，输入收款地址，即可在 bntpool.com 开始挖矿，CPU 和 NVIDIA 都会自动调优。" />
+
+打开[我的统计](https://bntpool.com/stats?lang=zh-hans)，输入相同的地址或已注册名称，即可查看矿机、份额和余额。

@@ -1,0 +1,87 @@
+---
+title: 'Blocknet unter Linux minen'
+description: "Linux: Lade seine herunter, entpacke es, gib deine Blocknet-Adresse ein und prüfe akzeptierte Shares auf bntpool.com. Beginne mit den automatischen Einstellungen; Tipps zur Optimierung folgen nach der Einrichtung."
+tags: ['Mining-Anleitung', 'Linux', 'NVIDIA']
+faq:
+  - q: 'Welches Linux-Archiv soll ich herunterladen?'
+    a: "Öffne den Downloadbereich. Führe uname -m aus: Wähle seine-linux-x86_64.tar.gz für x86_64 oder seine-linux-aarch64.tar.gz für aarch64. Die Linux-Versionen benötigen glibc 2.31 oder neuer. Die x86_64-Version unterstützt CPU und NVIDIA, ARM64 unterstützt CPU-Mining."
+  - q: 'Muss ich seine mit sudo starten?'
+    a: 'Starte den normalen Miner als eigener Benutzer aus einem beschreibbaren Ordner. Entpacke das Archiv, erteile dem Besitzer bei Bedarf Ausführungsrechte und starte mit ./seine. Reservierte Huge Pages einzurichten ist eine separate Verwaltungsaufgabe; für den normalen Start reichen gewöhnliche Speicherseiten.'
+  - q: 'Brauche ich CUDA oder NVRTC für NVIDIA-Mining unter Linux?'
+    a: 'Nein. Der NVIDIA-Treiber reicht. Seine nutzt NVRTC, wenn es installiert ist, und lädt sonst die in seine eingebauten Kernels, die GeForce-Karten der GTX-10-Serie und neuer abdecken. Installiere den Treiber, starte seine und prüfe, ob deine Karte im Devices-Panel erscheint.'
+sourceHash: acdcb56b3c1f
+translation: draft
+---
+
+## Wie startet man Blocknet-Mining unter Linux?
+
+<Answer>
+Lade seine herunter, entpacke es, gib deine Blocknet-Adresse ein und prüfe akzeptierte Shares auf bntpool.com. Beginne mit den automatischen Einstellungen; Tipps zur Optimierung folgen nach der Einrichtung.
+</Answer>
+
+## Schritt 1: die passende Version herunterladen
+
+Öffne den [Downloadbereich](/de/#download). Führe `uname -m` aus: Wähle `seine-linux-x86_64.tar.gz` für `x86_64` oder `seine-linux-aarch64.tar.gz` für `aarch64`. Die Linux-Versionen benötigen glibc 2.31 oder neuer. Die x86_64-Version unterstützt CPU und NVIDIA, ARM64 unterstützt CPU-Mining.
+
+<img src="/assets/blog/setup-download.webp" alt="Offizielle Downloadtabelle mit Archiven für Linux und Linux ARM64" loading="lazy" />
+
+## Schritt 2: entpacken und starten
+
+Öffne Terminal. Diese Befehle setzen voraus, dass das Archiv im Ordner Downloads liegt; passe den Pfad bei Bedarf an. Ersetze auf ARM64 `seine-linux-x86_64.tar.gz` durch `seine-linux-aarch64.tar.gz`. Sie entpacken seine in deinen Benutzerordner und starten es:
+
+```sh
+mkdir -p "$HOME/seine"
+tar -xzf "$HOME/Downloads/seine-linux-x86_64.tar.gz" -C "$HOME/seine"
+cd "$HOME/seine"
+./seine
+```
+
+## Schritt 3: deine Wallet-Adresse eingeben
+
+Füge deine öffentliche Blocknet-Empfangsadresse oder deinen registrierten `@name` ein und drücke Enter, um `stratum+tcp://bntpool.com:3333` zu übernehmen. Der [Wallet-Leitfaden](/de/blog/blocknet-wallet-for-mining/) zeigt, wo du die Adresse findest. Seine benötigt weder deine Wiederherstellungsphrase noch deine Ausgabeschlüssel. Der Pool-Worker erhält automatisch einen Namen.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="Adress- und Pool-Abfrage beim ersten Start. Ersetze das Beispiel durch deine Adresse oder deinen registrierten Namen." loading="lazy" />
+  </picture>
+  <figcaption>Adress- und Pool-Abfrage beim ersten Start. Ersetze das Beispiel durch deine Adresse oder deinen registrierten Namen.</figcaption>
+</figure>
+
+Seine wählt die Threads und optimiert automatisch. Starte es später aus demselben Ordner, um `seine-data/seine.config.json` wiederzuverwenden.
+
+## Schritt 4: akzeptierte Shares prüfen
+
+Achte im [Dashboard](/de/blog/seine-dashboard-explained/) auf eine Hashrate und einen steigenden **Accepted**-Zähler. Ein akzeptierter Share bestätigt, dass der Pool deine Arbeit erhalten hat; er bedeutet noch keine Auszahlung. Mit `q` oder `Ctrl+C` beendest du den Miner.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="Das echte Seine-Dashboard mit Beispieldaten. Achte auf Accepted; diese Zahlen sind kein Benchmark." loading="lazy" />
+  </picture>
+  <figcaption>Das echte Seine-Dashboard mit Beispieldaten. Achte auf Accepted; diese Zahlen sind kein Benchmark.</figcaption>
+</figure>
+
+Öffne [Meine Statistik](https://bntpool.com/stats?lang=de) und gib dieselbe Adresse oder denselben registrierten Namen ein, um deinen Worker, Shares und Kontostand zu sehen.
+
+## Was brauchst du für GPU-Mining unter Linux?
+
+NVIDIA-Karten brauchen nur den NVIDIA-Treiber. AMD-Karten brauchen den amdgpu-Treiber und die ROCm-HIP-Runtime, wie die [AMD-Anleitung](https://github.com/zpalmtree/seine/blob/master/docs/guides/amd.md) erklärt. Seine findet deine Karten selbst und mint mit ihnen zusammen mit der CPU im x86_64-Build. Die [NVIDIA-Anleitung](/de/blog/mine-blocknet-nvidia-gpu/) erklärt, wie du Karten wählst und GPU-Shares prüfst.
+
+<MinerSettings os="linux" />
+
+## Wie behebt man einen Linux-Startfehler?
+
+Wähle anhand der ersten Fehlermeldung die nächste Prüfung:
+
+| Meldung oder Symptom | Was prüfen? |
+|---|---|
+| `Exec format error` | Falsche Architektur: Vergleiche `uname -m` mit dem Archivnamen. |
+| `GLIBC_... not found` | Das Programm benötigt eine neuere glibc. Nutze ein kompatibles System oder baue aus dem Quellcode; lass die C-Systembibliothek weiterhin von deiner Distribution verwalten. |
+| `Permission denied` | Prüfe die Ausführungsrechte des Benutzers und verwende einen Ordner auf einem Dateisystem, das Ausführung erlaubt. |
+
+Sobald Shares akzeptiert werden, erklärt der [Huge-Pages-Leitfaden](/de/blog/huge-pages-blocknet-mining/) die optionale Einrichtung unter Linux. Der [Server-Leitfaden](/de/blog/mine-blocknet-on-servers/) behandelt Betrieb ohne grafische Oberfläche und NUMA-Platzierung. Beides ist für diesen ersten Start nicht erforderlich; führe Änderungen einzeln durch, damit du ihre Auswirkungen auf deinen Rechner erkennst.
+
+<CTA target="seine" title="seine für Linux herunterladen" text="Entpacke deinen Linux-Download, gib deine Adresse ein und starte mit automatischer CPU-Optimierung." />
+
+Öffne [Meine Statistik](https://bntpool.com/stats?lang=de) und gib dieselbe Adresse oder denselben registrierten Namen ein, um deinen Worker, Shares und Kontostand zu sehen.

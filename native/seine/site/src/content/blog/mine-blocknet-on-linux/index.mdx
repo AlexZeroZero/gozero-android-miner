@@ -1,0 +1,89 @@
+---
+title: 'How to mine Blocknet on Linux'
+description: "Mine Blocknet on Linux with seine. Download the x86_64 or ARM64 build, extract it, enter your wallet address, and find your accepted shares on bntpool.com."
+date: 2026-10-26
+updated: 2026-11-02
+tags: ['Mining guide', 'Linux', 'NVIDIA']
+faq:
+  - q: 'Which Linux archive should I download?'
+    a: "Open the download section. Run uname -m: choose seine-linux-x86_64.tar.gz for x86_64, or seine-linux-aarch64.tar.gz for aarch64. The Linux builds require glibc 2.31 or newer. The x86_64 build supports CPU and NVIDIA; ARM64 supports CPU mining."
+  - q: 'Do I need to run seine with sudo?'
+    a: 'Run the normal miner as your own user from a writable folder. Extract the archive, give the executable user execute permission if needed, and start it with ./seine. Preparing reserved huge pages is a separate administrative task; ordinary startup can use regular pages.'
+  - q: 'Do I need CUDA or NVRTC for NVIDIA mining on Linux?'
+    a: 'No. The NVIDIA driver is enough. Seine uses NVRTC when it is installed and otherwise loads the kernels built into seine, which cover GeForce GTX 10 series and newer cards. Install the driver, start seine, and check that your card appears in the Devices panel.'
+related: [how-to-mine-blocknet, mine-blocknet-nvidia-gpu, huge-pages-blocknet-mining, update-seine-miner]
+image: /assets/blog/setup-download.webp
+---
+
+## How do you start mining Blocknet on Linux?
+
+<Answer>
+Download seine, extract it, enter your Blocknet address, and confirm accepted shares on bntpool.com. Start with automatic settings; tuning advice comes after setup.
+</Answer>
+
+## Step 1: download the right build
+
+Open the [download section](/#download). Run `uname -m`: choose `seine-linux-x86_64.tar.gz` for `x86_64`, or `seine-linux-aarch64.tar.gz` for `aarch64`. The Linux builds require glibc 2.31 or newer. The x86_64 build supports CPU and NVIDIA; ARM64 supports CPU mining.
+
+<img src="/assets/blog/setup-download.webp" alt="The official download table with Linux and Linux ARM64 archives" loading="lazy" />
+
+## Step 2: extract and launch
+
+Open Terminal. These commands assume the archive is in your Downloads folder; use its actual location if different. On ARM64, replace `seine-linux-x86_64.tar.gz` with `seine-linux-aarch64.tar.gz`. They extract seine into your home folder and launch it:
+
+```sh
+mkdir -p "$HOME/seine"
+tar -xzf "$HOME/Downloads/seine-linux-x86_64.tar.gz" -C "$HOME/seine"
+cd "$HOME/seine"
+./seine
+```
+
+## Step 3: enter your wallet address
+
+Paste your public Blocknet receiving address or registered `@name`, then press Enter to accept `stratum+tcp://bntpool.com:3333`. The [wallet guide](/blog/blocknet-wallet-for-mining/) shows where to find your address. Seine does not need your recovery phrase or spending keys. It assigns a pool worker name automatically.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="First-run address and pool prompts. Replace the example with your own address or registered name." loading="lazy" />
+  </picture>
+  <figcaption>First-run address and pool prompts. Replace the example with your own address or registered name.</figcaption>
+</figure>
+
+Seine chooses threads and tunes automatically. On later starts, launch it from the same folder to reuse `seine-data/seine.config.json`.
+
+## Step 4: check accepted shares
+
+Look for a hashrate and an increasing **Accepted** counter in the [dashboard](/blog/seine-dashboard-explained/). An accepted share confirms the pool received your work; it does not mean a payout has happened. Press `q` or `Ctrl+C` to stop.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="Seine’s actual dashboard renderer with example data. Look for Accepted; these figures are not a benchmark." loading="lazy" />
+  </picture>
+  <figcaption>Seine’s actual dashboard renderer with example data. Look for Accepted; these figures are not a benchmark.</figcaption>
+</figure>
+
+Open [My Stats](https://bntpool.com/stats) and enter the same address or registered name to find your worker, shares, and balance.
+
+## What do you need for GPU mining on Linux?
+
+NVIDIA cards need only the NVIDIA driver. AMD cards need the amdgpu driver and the ROCm HIP runtime, as the [AMD guide](https://github.com/zpalmtree/seine/blob/master/docs/guides/amd.md) explains. Seine finds your cards by itself and mines on them alongside the CPU on the x86_64 build. The [NVIDIA guide](/blog/mine-blocknet-nvidia-gpu/) covers choosing cards and checking GPU shares.
+
+<MinerSettings os="linux" />
+
+## How do you resolve a Linux startup error?
+
+Use the first error message to choose the next check:
+
+| Message or symptom | What to check |
+|---|---|
+| `Exec format error` | Wrong architecture: compare `uname -m` with the archive filename. |
+| `GLIBC_... not found` | The binary requires a newer glibc. Use a compatible system or build from source; keep the system C library managed by your distribution. |
+| `Permission denied` | Check user execute permission and use a folder on a filesystem that permits execution. |
+
+Once shares are accepted, the [huge-pages guide](/blog/huge-pages-blocknet-mining/) covers optional Linux page setup. The [server guide](/blog/mine-blocknet-on-servers/) covers headless operation and NUMA placement. Neither preparation is required to follow this first-run walkthrough; keep each change separate so you can tell what changed on your machine.
+
+<CTA target="seine" title="Download seine for Linux" text="Extract your Linux download, enter your address, and start mining with automatic CPU tuning." />
+
+Open [My Stats](https://bntpool.com/stats) and enter the same address or registered name to find your worker, shares, and balance.

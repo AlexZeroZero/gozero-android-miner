@@ -1,0 +1,62 @@
+---
+title: 'Jak Blocknet zapewnia domyślną prywatność zwykłych płatności'
+description: 'Poznaj prywatność płatności Blocknet: podpisy pierścieniowe, klucze jednorazowe, ukryte kwoty i szyfrowane notatki oraz zmiany proponowane przez Faraday.'
+tags: ['Blocknet', 'Prywatność', 'Płatności']
+faq:
+  - q: 'Czy prywatność działa automatycznie przy płaceniu Blocknet?'
+    a: 'Tak. Wydany portfel tworzy zwykłe płatności z podpisami pierścieniowymi, jednorazowymi kluczami wyjść, ukrytymi kwotami i szyfrowanymi notatkami. Nie wybierasz osobnego trybu prywatnego. Publiczna struktura pozostaje, a nadawca i odbiorca znają własne szczegóły. Opis dotyczy normalnego wydawania; tworzenie nagród blokowych podlega osobnym zasadom.'
+  - q: 'Dlaczego wejście Blocknet ma 16 członków pierścienia?'
+    a: 'Normalne wejście używa jednego prawdziwego wyjścia i 15 przynęt z łańcucha. Podpis dowodzi uprawnienia bez wskazania prawdziwego członka. Konsensus ustala rozmiar 16, więc użytkownik nie wybiera innego rozmiaru dla każdej płatności. Przynęty nie dostarczają pieniędzy właścicieli, a obrazy kluczy pomagają wykrywać ponowne wydawanie.'
+  - q: 'Czy Faraday już zastępuje obecny system prywatności?'
+    a: 'Nie. Faraday pozostaje proponowaną aktualizacją. Oficjalny opis z 27 października przedstawia dowody wydania oparte na hashach dla zbioru monet Faraday i oddzielny mechanizm ML-KEM do odbioru płatności. Zbiór rósłby wraz z przechodzeniem monet do nowego formatu. Do aktywacji odpowiedniej aktualizacji punktem odniesienia pozostają obecne wydane reguły.'
+sourceHash: '64f1034d2ebb'
+translation: draft
+---
+
+Płacenie komuś nie powinno wymagać publikowania historii wydatków wszystkim czytelnikom blockchaina. Blocknet stosuje mechanizmy prywatności w zwykłych płatnościach portfela. Poradnik wyjaśnia automatyczną ochronę, kontrolę płatności przez sieć i rolę twoich własnych zapisów. Obecne zachowanie odnosi się do wydanego core v0.22.0; część o Faraday opisuje propozycję.
+
+## Co oznacza domyślna prywatność płatności Blocknet?
+
+<Answer>
+Zwykłe płatności Blocknet używają podpisów pierścieniowych dla wydawanych wejść, jednorazowych kluczy odbiorców i zobowiązań z dowodami zakresu dla kwot. Notatki są szyfrowane, a Dandelion++ ogranicza ujawnianie źródła sieciowego. Portfel stosuje te warstwy bez osobnego przełącznika, zachowując publiczną strukturę i własne zapisy uczestników.
+</Answer>
+
+## Jak domyślna ochrona obejmuje wydawane pieniądze?
+
+Po wpisaniu odbiorcy i kwoty portfel tworzy płatność w normalnym prywatnym formacie. Nie musisz wybierać transferu publicznego albo chronionego. Prywatność staje się częścią używania BNT jako waluty: płacenie osobie lub firmie korzysta z tych samych podstawowych zabezpieczeń co inna zwykła płatność. Decyzja o włączeniu prywatności nie staje się też wyborem wyróżniającym transakcję.
+
+Każde normalne wejście używa pierścienia CLSAG z 16 wyjść: twojego prawdziwego i 15 przynęt z łańcucha. [Wydane reguły walidacji](https://github.com/blocknetprivacy/core/blob/5a0a5b510c1dce46f4eeb12c33a291052e44e7b3/transaction.go#L1013) wymagają tego rozmiaru i członków będących rzeczywistymi wyjściami w łańcuchu. Podpis dowodzi uprawnienia bez wskazania członka dostarczającego środki. Przynęty zapewniają możliwe źródła dla dowodu, ale nie finansują płatności. Obraz klucza pozwala wykryć ponowne wydanie. Mechanizm opisuje [poradnik podpisów pierścieniowych](/pl/blog/ring-signatures-explained/).
+
+[![Trzy zabezpieczenia zwykłej płatności Blocknet: 1, pierścień 16 możliwych źródeł; 2, jednorazowy klucz wyjścia odbiorcy; 3, zobowiązanie ukrytej kwoty.](/assets/blog/blocknet-privacy-default.svg)](/assets/blog/blocknet-privacy-default.svg)
+
+Diagram grupuje trzy zabezpieczenia: **1** uprawnienie wśród członków pierścienia, **2** odbierane wyjście i **3** jego ukrytą kwotę. Żaden członek nie jest oznaczony jako prawdziwe źródło. To schemat pojęciowy, nie rzeczywista bieżąca transakcja.
+
+## Jak chronieni są odbiorca i notatka?
+
+Twój adres odbiorczy pozwala płacącemu utworzyć wyjście dla ciebie. Portfel wyprowadza jednorazowy klucz wyjścia zamiast umieszczać znajomy adres obok każdej płatności w łańcuchu. Rozpoznaje wpływające wyjścia przy użyciu prywatnych informacji podglądu. Możesz używać adresu wielokrotnie, a płatności otrzymują własne klucze wyjść. [Poradnik adresów stealth](/pl/blog/stealth-addresses-explained/) wyjaśnia tę relację.
+
+Publiczna [nazwa Blocknet ID](/pl/blog/blocknet-id-pay-by-name/) ułatwia znalezienie celu płatności. Ktoś może powiązać nazwę z tobą, ale zwykła płatność do tego celu nadal używa tej samej konstrukcji wyjścia. Publikacja nazwy odbiorczej nie publikuje prywatnych kluczy podglądu portfela.
+
+Możesz też dołączyć numer faktury lub krótką notatkę. Portfel szyfruje ją wspólnym sekretem dla danego wyjścia. Pole zajmuje 128 bajtów i mieści do 124 bajtów tekstu; krótsza lub pusta treść otrzymuje losowe dopełnienie przed szyfrowaniem. Stały rozmiar pola nie ujawnia więc długości notatki. Nadawca i odbiorca mogą ją znać, a świadomie udostępnione dane weryfikacji lub podglądu mogą ją ujawnić. [Poradnik notatek](/pl/blog/blocknet-encrypted-memos/) opisuje zapis i odczyt.
+
+## Jak sieć sprawdza ukryte kwoty?
+
+Zwykłe wyjścia zawierają zobowiązania Pedersena zamiast czytelnych opublikowanych kwot. Wraz z dowodami umożliwiają węzłom sprawdzenie bilansu transakcji, łącznie z publiczną opłatą. Dowody zakresu Bulletproofs potwierdzają dozwolony zakres kwot wyjściowych. Łącznie kontrole weryfikują przepływ pieniędzy bez umieszczania kwot płatności w zwykłym publicznym zapisie.
+
+Portfel nadal pokazuje otrzymaną kwotę. [Poradnik dowodów zakresu](/pl/blog/bulletproofs-explained/) wyjaśnia kryptografię, a [przebieg transakcji](/pl/blog/blocknet-transaction-explained/) śledzi wybrane wejścia, wyjścia odbiorcy i resztę. Reszta używa nowych wyjść portfela nadawcy; prywatność nie usuwa potrzeby rozliczenia wydatków i zwrotu.
+
+Publiczne zapisy zachowują hash, strukturę wejść i wyjść, opłatę oraz stan bloku po włączeniu. Prywatna płatność pozostaje więc weryfikowalną transakcją. Wyjaśnienie dotyczy zwykłych wydatków: specjalna transakcja coinbase tworząca nagrodę blokową nie ma wydawanych wejść i podlega osobnej walidacji. Rozdzielenie tych przypadków wiąże „domyślną prywatność” z opisywanym zachowaniem płatności.
+
+## Co dzieje się poza publiczną transakcją?
+
+[Dandelion++](/pl/blog/dandelion-plus-plus-explained/) dotyczy przekazywania w sieci. Nowa transakcja najpierw przechodzi ścieżką łodygi, a potem jest szeroko rozgłaszana, ograniczając bezpośrednie powiązanie źródła z węzłami ogłaszającymi ją szeroko. To dodatkowa warstwa obok kryptografii. Nie obiecuje ukrycia adresu IP w każdej sytuacji sieciowej.
+
+Uczestnicy również mają zapisy. Nadawca zna wpisany cel i kwotę, odbiorca rozpoznaje wpływ. Faktura, rozmowa lub udostępniony zrzut mogą łączyć te dane z osobą albo zamówieniem. To informacje zewnętrzne, oddzielne od publikowanych przez format. [Poradnik widoczności płatności](/pl/blog/blocknet-payment-visibility/) porównuje dostęp publiczny, nadawcy, odbiorcy i przyznanego podglądu, w tym świadome dowody płatności. W codziennym użyciu waluty zachowaj rozróżnienie: sieć weryfikuje transfer, a uczestnicy przechowują szczegóły potrzebne do własnego rozliczenia.
+
+## Co zmieniłaby proponowana aktualizacja Faraday?
+
+[Oficjalny opis z 27 października](https://blocknetcrypto.com/blog/2026-10-27-how-blocknet-privacy-survives-quantum-computers/) przedstawia Faraday jako projekt nadal budowany i testowany. Faraday zastąpiłby obecny dowód wydania dowodami opartymi na hashach obejmującymi cały zbiór monet Faraday. Zbiór rósłby wraz z monetami w nowym formacie; nie oznacza to, że każde historyczne wyjście już do niego należy. Propozycja Faraday używałaby ML-KEM do odbierania i wykrywania płatności, oddzielnie od dowodzenia wydania.
+
+[Poradnik prywatności Faraday](/pl/blog/blocknet-faraday-privacy/) wyjaśnia te plany. Projekt i terminy mogą się zmieniać; do aktualizacji aktualne zachowanie portfela wynika z wydanych reguł. Dzisiaj domyślna prywatność oznacza ochronę wrażliwych danych zwykłym formatem bez dodatkowego trybu. [Blocknet i zamienność](/pl/blog/blocknet-fungibility/) wyjaśnia związek z wymiennymi jednostkami; praktyczne kroki pozostają w [poradniku płatności](/pl/blog/send-receive-blocknet/).
+
+<CTA target="seine" title="Kop Blocknet z seine" text="Używaj seine z bntpool.com, aby kopać Blocknet i otrzymywać płatności do własnego portfela." />

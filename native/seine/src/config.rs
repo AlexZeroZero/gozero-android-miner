@@ -1,0 +1,6191 @@
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use blocknet_pow_spec::CPU_LANE_MEMORY_BYTES;
+use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, ValueEnum};
+use serde::{Deserialize, Serialize};
+
+use crate::shortname::validate_destination;
+use crate::user_config::{
+    read_user_config, write_user_config, UserConfig, USER_CONFIG_SCHEMA_VERSION,
+};
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, ValueEnum)]
+pub enum BackendKind {
+    Cpu,
+    Nvidia,
+    Metal,
+    /// AMD GPU backend (HIP/ROCm). Requires a build with `--features amd`;
+    /// discrete GPUs are auto-selected, integrated ones need `--backend amd`.
+    Amd,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum BenchKind {
+    Kernel,
+    KernelEffective,
+    Backend,
+    EndToEnd,
+}
+
+/// Proof of work a benchmark hashes.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum BenchPow {
+    #[default]
+    Argon2id,
+    /// Faraday BLAKE2b-512 on the 156-byte fork header; worker benchmarks only.
+    Blake2b,
+}
+
+impl BenchPow {
+    pub fn algorithm(self) -> crate::backend::PowAlgorithm {
+        match self {
+            Self::Argon2id => crate::backend::PowAlgorithm::Argon2id,
+            Self::Blake2b => crate::backend::PowAlgorithm::Blake2b512,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum BenchBaselinePolicy {
+    Strict,
+    IgnoreEnvironment,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum MiningMode {
+    Pool,
+    Daemon,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum CpuAffinityMode {
+    Off,
+    Auto,
+    /// Pin workers in OS CPU order without topology-based reordering.
+    Os,
+    PcoreOnly,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum CpuPageMode {
+    /// Prefer explicit large pages, then transparently fall back to ordinary mappings.
+    Auto,
+    /// Require ordinary pages and disable transparent huge pages where supported.
+    Regular,
+    /// Require explicit large pages and fail CPU backend startup when unavailable.
+    Large,
+    /// Require explicit 1 GiB HugeTLB pages (x86_64 Linux only) and fail CPU
+    /// backend startup when unavailable.
+    #[value(name = "large-1g")]
+    Large1G,
+}
+
+impl CpuPageMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Regular => "regular",
+            Self::Large => "large",
+            Self::Large1G => "large-1g",
+        }
+    }
+
+    /// Modes that require every worker arena to be explicitly large-page
+    /// backed and therefore fail closed instead of falling back.
+    pub const fn requires_explicit_large_pages(self) -> bool {
+        matches!(self, Self::Large | Self::Large1G)
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum CpuPerformanceProfile {
+    Balanced,
+    Throughput,
+    Efficiency,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum UiMode {
+    Auto,
+    Tui,
+    Plain,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum WorkAllocation {
+    Static,
+    Adaptive,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum NvidiaTemplateStopPolicy {
+    Auto,
+    On,
+    Off,
+}
+
+const DEFAULT_HASH_POLL_MS: u64 = 200;
+const DEFAULT_CPU_HASH_BATCH_SIZE: u64 = 64;
+const DEFAULT_CPU_CONTROL_CHECK_INTERVAL_HASHES: u64 = 1;
+const DEFAULT_CPU_HASH_FLUSH_MS: u64 = 50;
+const DEFAULT_CPU_EVENT_DISPATCH_CAPACITY: usize = 256;
+const DEFAULT_CPU_AUTOTUNE_SECS: u64 = 6;
+const DEFAULT_CPU_AUTOTUNE_CONFIG_FILE: &str = "seine.cpu-autotune.json";
+const DEFAULT_CONTROL_API_COOKIE_FILE: &str = "control-api.cookie";
+#[cfg(target_os = "macos")]
+const DEFAULT_CPU_AFFINITY: CpuAffinityMode = CpuAffinityMode::PcoreOnly;
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_CPU_AFFINITY: CpuAffinityMode = CpuAffinityMode::Auto;
+const DEFAULT_NVIDIA_AUTOTUNE_SECS: u64 = 5;
+const DEFAULT_NVIDIA_AUTOTUNE_SAMPLES: u32 = 2;
+const DEFAULT_NVIDIA_HASHES_PER_LAUNCH_PER_LANE: u32 = 2;
+const DEFAULT_NVIDIA_AUTOTUNE_CONFIG_FILE: &str = "seine.nvidia-autotune.json";
+const DEFAULT_METAL_HASHES_PER_LAUNCH_PER_LANE: u32 = 2;
+const LEGACY_DEFAULT_DAEMON_DIR_MAINNET: &str = "./blocknet-data-mainnet";
+const LEGACY_DEFAULT_DAEMON_DIR_TESTNET: &str = "./blocknet-data-testnet";
+const DEFAULT_API_URL: &str = "http://127.0.0.1:8332";
+const DEFAULT_POOL_URL: &str = "stratum+tcp://bntpool.com:3333";
+const DEFAULT_USER_CONFIG_FILE: &str = "seine.config.json";
+const DEFAULT_DEV_FEE_POOL_WORKER_PREFIX: &str = "seine-devfee";
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DaemonNetwork {
+    Mainnet,
+    Testnet,
+}
+
+impl DaemonNetwork {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Testnet => "testnet",
+        }
+    }
+
+    fn default_data_dir(self) -> PathBuf {
+        default_managed_data_dir(self).unwrap_or_else(|| legacy_default_data_dir(self))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DaemonContextSource {
+    WrapperConfig,
+    WrapperPidfile,
+    ProcessScan,
+}
+
+impl DaemonContextSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WrapperConfig => "wrapper-config",
+            Self::WrapperPidfile => "wrapper-pidfile",
+            Self::ProcessScan => "process-scan",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DaemonContext {
+    network: DaemonNetwork,
+    data_dir: PathBuf,
+    api_addr: Option<String>,
+    source: DaemonContextSource,
+    running: bool,
+    manager_config_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct BntConfigContext {
+    config_dir: PathBuf,
+    config_path: PathBuf,
+    config: BntConfigFile,
+}
+
+impl BntConfigContext {
+    fn data_dir_for(&self, network: DaemonNetwork) -> PathBuf {
+        self.config
+            .cores
+            .get(network.as_str())
+            .and_then(|core| {
+                let data_dir = core.data_dir.trim();
+                (!data_dir.is_empty()).then(|| PathBuf::from(data_dir))
+            })
+            .unwrap_or_else(|| self.config_dir.join("data").join(network.as_str()))
+    }
+
+    fn api_addr_for(&self, network: DaemonNetwork) -> Option<String> {
+        self.config.cores.get(network.as_str()).and_then(|core| {
+            let api_addr = core.api_addr.trim();
+            (!api_addr.is_empty()).then(|| api_addr.to_string())
+        })
+    }
+
+    fn enabled_networks(&self) -> Vec<DaemonNetwork> {
+        let mut out = Vec::new();
+        for network in [DaemonNetwork::Mainnet, DaemonNetwork::Testnet] {
+            if self
+                .config
+                .cores
+                .get(network.as_str())
+                .is_some_and(|core| core.enabled)
+            {
+                out.push(network);
+            }
+        }
+        if out.is_empty() {
+            out.push(DaemonNetwork::Mainnet);
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct BntConfigFile {
+    #[serde(default)]
+    cores: HashMap<String, BntCoreConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct BntCoreConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    data_dir: String,
+    #[serde(default)]
+    api_addr: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CpuProfileDefaults {
+    threads: usize,
+    hash_poll_ms: u64,
+    cpu_hash_batch_size: u64,
+    cpu_control_check_interval_hashes: u64,
+    cpu_hash_flush_ms: u64,
+    cpu_event_dispatch_capacity: usize,
+}
+
+fn cpu_profile_defaults(
+    profile: CpuPerformanceProfile,
+    auto_threads_cap: usize,
+) -> CpuProfileDefaults {
+    let auto_threads_cap = auto_threads_cap.max(1);
+    match profile {
+        CpuPerformanceProfile::Balanced => CpuProfileDefaults {
+            threads: auto_threads_cap,
+            hash_poll_ms: DEFAULT_HASH_POLL_MS,
+            cpu_hash_batch_size: DEFAULT_CPU_HASH_BATCH_SIZE,
+            cpu_control_check_interval_hashes: DEFAULT_CPU_CONTROL_CHECK_INTERVAL_HASHES,
+            cpu_hash_flush_ms: DEFAULT_CPU_HASH_FLUSH_MS,
+            cpu_event_dispatch_capacity: DEFAULT_CPU_EVENT_DISPATCH_CAPACITY,
+        },
+        CpuPerformanceProfile::Throughput => CpuProfileDefaults {
+            threads: auto_threads_cap,
+            hash_poll_ms: 100,
+            cpu_hash_batch_size: 256,
+            cpu_control_check_interval_hashes: 8,
+            cpu_hash_flush_ms: 200,
+            cpu_event_dispatch_capacity: 1024,
+        },
+        CpuPerformanceProfile::Efficiency => CpuProfileDefaults {
+            threads: (auto_threads_cap / 2).max(1),
+            hash_poll_ms: 400,
+            cpu_hash_batch_size: 32,
+            cpu_control_check_interval_hashes: 1,
+            cpu_hash_flush_ms: 25,
+            cpu_event_dispatch_capacity: 128,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct BackendSpec {
+    pub kind: BackendKind,
+    pub device_index: Option<u32>,
+    pub cpu_threads: Option<usize>,
+    pub cpu_affinity: Option<CpuAffinityMode>,
+    pub assign_timeout_override: Option<Duration>,
+    pub control_timeout_override: Option<Duration>,
+    pub assign_timeout_strikes_override: Option<u32>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum TelemetryChoice {
+    On,
+    Off,
+}
+
+const HELP_POOL: &str = "Pool and payout";
+const HELP_HARDWARE: &str = "Hardware";
+const HELP_CPU: &str = "CPU";
+const HELP_SOLO: &str = "Solo mining";
+const HELP_OUTPUT: &str = "Display and data";
+const HELP_MONITORING: &str = "Monitoring";
+const HELP_UPDATES: &str = "Updates and privacy";
+const HELP_BENCH: &str = "Benchmark";
+const HELP_INFO: &str = "Help";
+
+/// `--help` lists what most miners need. Other flags use `hide = true`, keep
+/// working, and are documented in docs/MINER_FLAGS.md.
+#[derive(Debug, Parser)]
+#[command(
+    name = "seine",
+    version = crate::version::RELEASE_VERSION,
+    about = "Seine net miner for Blocknet",
+    after_help = "Every flag: https://github.com/zpalmtree/seine/blob/master/docs/MINER_FLAGS.md"
+)]
+struct Cli {
+    /// Pool to mine on: host:port, or stratum+ssl://host:port for TLS. Repeat or separate
+    /// with commas to add backup pools.
+    #[arg(
+        long = "pool-url",
+        short = 'o',
+        visible_alias = "url",
+        value_delimiter = ',',
+        value_name = "URL",
+        help_heading = HELP_POOL,
+    )]
+    pool_url_args: Vec<String>,
+
+    /// Pool URL list joined from `pool_url_args`.
+    #[arg(skip)]
+    pool_url: Option<String>,
+
+    /// Where your rewards go: an address or Blocknet ID (@name or $name). ADDRESS.WORKER
+    /// also sets the worker name. Prefix solo: to mine solo on the pool.
+    #[arg(
+        long = "address",
+        short = 'u',
+        visible_alias = "user",
+        value_name = "ADDRESS",
+        help_heading = HELP_POOL,
+    )]
+    mining_address: Option<String>,
+
+    /// Worker name shown on the pool.
+    #[arg(
+        long = "pool-worker",
+        visible_alias = "worker",
+        alias = "rig-id",
+        value_name = "NAME",
+        help_heading = HELP_POOL,
+    )]
+    pool_worker: Option<String>,
+
+    /// Exact exchange deposit memo (pool mining only).
+    #[arg(long, value_name = "MEMO", help_heading = HELP_POOL)]
+    payout_memo: Option<String>,
+
+    /// Connect to pools through a SOCKS5 proxy: socks5://[user:pass@]host:port.
+    #[arg(
+        long = "pool-proxy",
+        visible_alias = "socks5",
+        value_name = "URL",
+        help_heading = HELP_POOL,
+    )]
+    pool_proxy: Option<String>,
+
+    /// Run as a farm proxy instead of mining: rigs connect to this address and share one
+    /// pool session.
+    #[arg(long = "proxy-listen", value_name = "HOST:PORT", help_heading = HELP_POOL)]
+    proxy_listen: Option<String>,
+
+    /// Hardware to mine on. Repeat or separate with commas. Detected automatically by default.
+    #[arg(
+        long = "backend",
+        value_enum,
+        value_delimiter = ',',
+        num_args = 1..,
+        value_name = "BACKEND",
+        help_heading = HELP_HARDWARE,
+    )]
+    backends: Vec<BackendKind>,
+
+    /// CPU threads to use, about 2 GB of RAM each. Sized and tuned automatically by default.
+    #[arg(long, alias = "cpu-threads", value_name = "N", help_heading = HELP_HARDWARE)]
+    threads: Option<usize>,
+
+    /// NVIDIA GPUs to use, for example 0,1,3. All by default.
+    #[arg(
+        long = "nvidia-devices",
+        value_delimiter = ',',
+        num_args = 1..,
+        value_name = "INDEX",
+        help_heading = HELP_HARDWARE,
+    )]
+    nvidia_devices: Vec<u32>,
+
+    /// AMD GPUs to use, for example 0,1,3. All by default.
+    #[arg(
+        long = "amd-devices",
+        value_delimiter = ',',
+        num_args = 1..,
+        value_name = "INDEX",
+        help_heading = HELP_HARDWARE,
+    )]
+    amd_devices: Vec<u32>,
+
+    /// Limit lanes on each NVIDIA GPU to use less VRAM (about 2 GB per lane).
+    #[arg(long, value_name = "N", help_heading = HELP_HARDWARE)]
+    nvidia_max_lanes: Option<usize>,
+
+    /// Limit lanes on each AMD GPU to use less VRAM (about 2 GB per lane).
+    #[arg(long, value_name = "N", help_heading = HELP_HARDWARE)]
+    amd_max_lanes: Option<usize>,
+
+    /// Limit Metal lanes to use less memory (about 2 GB per lane).
+    #[arg(long, value_name = "N", help_heading = HELP_HARDWARE)]
+    metal_max_lanes: Option<usize>,
+
+    /// Tuning goal: balanced and throughput aim for the highest hashrate; efficiency may
+    /// use fewer threads.
+    #[arg(
+        long = "cpu-profile",
+        value_enum,
+        default_value_t = CpuPerformanceProfile::Balanced,
+        value_name = "PROFILE",
+        help_heading = HELP_CPU,
+    )]
+    cpu_profile: CpuPerformanceProfile,
+
+    /// Most CPU threads automatic tuning may use, to leave room for other work.
+    #[arg(long, value_name = "N", help_heading = HELP_CPU)]
+    cpu_autotune_max_threads: Option<usize>,
+
+    /// Memory pages for CPU mining: auto uses large pages when it can, regular never does,
+    /// large and large-1g require them.
+    #[arg(
+        long = "cpu-page-mode",
+        value_enum,
+        default_value_t = CpuPageMode::Auto,
+        value_name = "MODE",
+        help_heading = HELP_CPU,
+    )]
+    cpu_page_mode: CpuPageMode,
+
+    /// How CPU threads are placed on cores.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = DEFAULT_CPU_AFFINITY,
+        value_name = "POLICY",
+        help_heading = HELP_CPU,
+    )]
+    cpu_affinity: CpuAffinityMode,
+
+    /// Mine on a pool, or use daemon to mine solo on your own node. Pool by default.
+    #[arg(long, value_enum, value_name = "MODE", help_heading = HELP_SOLO)]
+    mode: Option<MiningMode>,
+
+    /// Daemon API address. Detected automatically by default.
+    #[arg(long = "api-url", value_name = "URL", help_heading = HELP_SOLO)]
+    api_url: Option<String>,
+
+    /// Path to the daemon's api.cookie. Detected automatically by default.
+    #[arg(long, value_name = "PATH", help_heading = HELP_SOLO)]
+    cookie: Option<PathBuf>,
+
+    /// File with the wallet password, to load the wallet automatically.
+    #[arg(long, value_name = "PATH", help_heading = HELP_SOLO)]
+    wallet_password_file: Option<PathBuf>,
+
+    /// Display: auto, tui for the full-screen dashboard, or plain for log lines.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = UiMode::Auto,
+        value_name = "MODE",
+        help_heading = HELP_OUTPUT,
+    )]
+    ui: UiMode,
+
+    /// Show internal settings and routine activity on the dashboard and in logs.
+    #[arg(long, help_heading = HELP_OUTPUT)]
+    verbose: bool,
+
+    /// Seconds between stats lines in plain output.
+    #[arg(long, default_value_t = 10, value_name = "SECS", help_heading = HELP_OUTPUT)]
+    stats_secs: u64,
+
+    /// Where Seine keeps its settings and tuning results.
+    #[arg(long, default_value = "./seine-data", value_name = "DIR", help_heading = HELP_OUTPUT)]
+    data_dir: PathBuf,
+
+    /// Also run the local control API and Prometheus metrics.
+    #[arg(long, default_value_t = false, help_heading = HELP_MONITORING)]
+    api_server: bool,
+
+    /// Address for the control API.
+    #[arg(
+        long,
+        default_value = "127.0.0.1:9977",
+        value_name = "HOST:PORT",
+        help_heading = HELP_MONITORING,
+    )]
+    api_bind: String,
+
+    /// Install the newest release now, then exit.
+    #[arg(long, default_value_t = false, help_heading = HELP_UPDATES)]
+    self_update: bool,
+
+    /// Keep this version while mining; only log that a newer release exists.
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        conflicts_with = "auto_update",
+        help_heading = HELP_UPDATES,
+    )]
+    no_auto_update: bool,
+
+    /// Don't check GitHub for newer releases.
+    #[arg(long, action = ArgAction::SetTrue, help_heading = HELP_UPDATES)]
+    disable_update_check: bool,
+
+    /// Turn hardware and performance reports on or off (saved for later runs).
+    #[arg(long, value_enum, value_name = "STATE", help_heading = HELP_UPDATES)]
+    telemetry: Option<TelemetryChoice>,
+
+    /// Measure hashrate on this machine instead of mining.
+    #[arg(long, default_value_t = false, help_heading = HELP_BENCH)]
+    bench: bool,
+
+    // Everything below works but stays out of `--help`; docs/MINER_FLAGS.md lists it.
+    /// Hardware telemetry collector (HTTPS). An explicit opt-out is preserved across destinations.
+    #[arg(long, hide = true)]
+    telemetry_url: Option<String>,
+
+    /// Use Blocknet testnet defaults for daemon discovery in daemon mode.
+    #[arg(long, default_value_t = false, hide = true)]
+    testnet: bool,
+
+    /// Accepted for compatibility with other miners' launch templates.
+    /// Blocknet pools do not use passwords.
+    #[arg(long = "pass", short = 'p', alias = "password", hide = true)]
+    pool_password: Option<String>,
+
+    /// Bearer token for authenticated API access.
+    #[arg(long, hide = true)]
+    token: Option<String>,
+
+    /// Wallet password used for automatic wallet load when daemon starts without a wallet.
+    #[arg(long, hide = true)]
+    wallet_password: Option<String>,
+
+    /// Ignore the saved payout memo when switching to an ordinary wallet.
+    #[arg(long, conflicts_with = "payout_memo", hide = true)]
+    no_payout_memo: bool,
+
+    /// Select backends automatically, leaving out the CPU when a GPU is selected.
+    #[arg(long, conflicts_with = "backends", hide = true)]
+    gpu_only: bool,
+
+    /// Daemon data directory (used to locate api.cookie when --cookie is unset).
+    /// Defaults to the Blocknet wrapper-managed data dir under
+    /// ~/.config/bnt/data/{mainnet,testnet}.
+    #[arg(long, hide = true)]
+    daemon_dir: Option<PathBuf>,
+
+    /// Percentage of effective total RAM left unused by automatic CPU sizing/autotuning.
+    /// Default: 5%, at most 512 MiB on hosts with 16 GiB or more (else at most 1 GiB). Explicit
+    /// thread counts override this reserve.
+    /// Set 0 to disable headroom.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=99), hide = true)]
+    cpu_memory_reserve_percent: Option<u8>,
+
+    /// Optional per-CPU-instance thread counts (comma-separated).
+    /// Length must match the number of configured CPU backend instances.
+    #[arg(long = "cpu-threads-per-instance", value_delimiter = ',', num_args = 1.., hide = true)]
+    cpu_threads_per_instance: Vec<usize>,
+
+    /// Optional per-CPU-instance affinity policies (comma-separated).
+    /// Length must match the number of configured CPU backend instances.
+    #[arg(
+        long = "cpu-affinity-per-instance",
+        value_enum,
+        value_delimiter = ',',
+        num_args = 1..,
+        hide = true,
+    )]
+    cpu_affinity_per_instance: Vec<CpuAffinityMode>,
+
+    /// Allow starting when configured CPU lanes exceed detected system RAM.
+    #[arg(long, default_value_t = false, hide = true)]
+    allow_oversubscribe: bool,
+
+    /// Maximum time to work on one block template before refreshing (daemon mode).
+    #[arg(long, default_value_t = 20, hide = true)]
+    refresh_secs: u64,
+
+    /// Timeout for JSON API requests (blocktemplate/submitblock/wallet/load), in seconds.
+    #[arg(long, default_value_t = 10, hide = true)]
+    request_timeout_secs: u64,
+
+    /// Timeout for each SSE stream connection attempt, in seconds.
+    #[arg(long, default_value_t = 10, hide = true)]
+    events_stream_timeout_secs: u64,
+
+    /// Maximum lifetime for one SSE stream request before reconnecting, in seconds.
+    #[arg(long, default_value_t = 90, hide = true)]
+    events_idle_timeout_secs: u64,
+
+    /// Capacity of the bounded backend event queue.
+    #[arg(long, default_value_t = 1024, hide = true)]
+    backend_event_capacity: usize,
+
+    /// Backend hash polling interval in milliseconds.
+    #[arg(long, hide = true)]
+    hash_poll_ms: Option<u64>,
+
+    /// CPU worker hash flush batch size.
+    #[arg(long, hide = true)]
+    cpu_hash_batch_size: Option<u64>,
+
+    /// CPU worker control polling cadence in hashes (deadline checks are also time-bounded).
+    #[arg(long, hide = true)]
+    cpu_control_check_interval_hashes: Option<u64>,
+
+    /// CPU worker hash flush interval in milliseconds.
+    #[arg(long, hide = true)]
+    cpu_hash_flush_ms: Option<u64>,
+
+    /// CPU backend internal event dispatch queue capacity.
+    #[arg(long, hide = true)]
+    cpu_event_dispatch_capacity: Option<usize>,
+
+    /// Enable adaptive CPU tuning while mining (offline kernel search in benchmark mode).
+    #[arg(long, action = ArgAction::SetTrue, hide = true)]
+    cpu_autotune_threads: bool,
+
+    /// Disable adaptive CPU thread/kernel tuning; keep a fixed count and the default ISA.
+    #[arg(long, action = ArgAction::SetTrue, hide = true)]
+    disable_cpu_autotune_threads: bool,
+
+    /// Minimum per-instance CPU thread count considered by autotuner.
+    #[arg(long, default_value_t = 1, hide = true)]
+    cpu_autotune_min_threads: usize,
+
+    /// Base CPU autotune sample window; mining uses max(30, 5 * seconds).
+    /// Samples may run longer to collect a stable minimum hash count.
+    #[arg(long, default_value_t = DEFAULT_CPU_AUTOTUNE_SECS, hide = true)]
+    cpu_autotune_secs: u64,
+
+    /// Path for persisted CPU autotune result (default: <data-dir>/seine.cpu-autotune.json).
+    #[arg(long, hide = true)]
+    cpu_autotune_config: Option<PathBuf>,
+
+    /// Base benchmark window (seconds) per NVIDIA autotune sample.
+    #[arg(long, default_value_t = DEFAULT_NVIDIA_AUTOTUNE_SECS, hide = true)]
+    nvidia_autotune_secs: u64,
+
+    /// Number of benchmark samples per NVIDIA autotune candidate (median score wins).
+    #[arg(long, default_value_t = DEFAULT_NVIDIA_AUTOTUNE_SAMPLES, hide = true)]
+    nvidia_autotune_samples: u32,
+
+    /// Path for persisted NVIDIA autotune result (default: <data-dir>/seine.nvidia-autotune.json).
+    #[arg(long, hide = true)]
+    nvidia_autotune_config: Option<PathBuf>,
+
+    /// Force NVIDIA kernel register cap and skip autotune/cache lookup.
+    #[arg(long, hide = true)]
+    nvidia_max_rregcount: Option<u32>,
+
+    /// Override NVIDIA dispatch chunk hint (iterations per lane).
+    #[arg(long, hide = true)]
+    nvidia_dispatch_iters_per_lane: Option<u64>,
+
+    /// Override NVIDIA reservation/allocation hint (iterations per lane).
+    #[arg(long, hide = true)]
+    nvidia_allocation_iters_per_lane: Option<u64>,
+
+    /// Hashes each lane runs per CUDA launch; unset uses this GPU's default.
+    #[arg(long, default_value_t = DEFAULT_NVIDIA_HASHES_PER_LAUNCH_PER_LANE, hide = true)]
+    nvidia_hashes_per_launch_per_lane: u32,
+
+    /// Disable adaptive NVIDIA launch-depth pressure control and keep the configured launch depth.
+    #[arg(long, action = ArgAction::SetTrue, hide = true)]
+    nvidia_no_adaptive_launch_depth: bool,
+
+    /// Run the target check inside the fill kernel.
+    #[arg(long, action = ArgAction::SetTrue, hide = true)]
+    nvidia_fused_target_check: bool,
+
+    /// NVIDIA stop-at-template policy: `auto` follows round accounting mode, `on` always enforces,
+    /// `off` never enforces in the backend worker loop.
+    #[arg(long, value_enum, default_value_t = NvidiaTemplateStopPolicy::Auto, hide = true)]
+    nvidia_template_stop_policy: NvidiaTemplateStopPolicy,
+
+    /// Hashes each lane runs per Metal dispatch.
+    #[arg(long, default_value_t = DEFAULT_METAL_HASHES_PER_LAUNCH_PER_LANE, hide = true)]
+    metal_hashes_per_launch_per_lane: u32,
+
+    /// Maximum time to wait for one backend assignment dispatch call, in milliseconds.
+    #[arg(long, default_value_t = 1000, hide = true)]
+    backend_assign_timeout_ms: u64,
+
+    /// Optional per-backend-instance assignment dispatch timeouts in milliseconds.
+    /// Length must match total backend instances after expansion.
+    #[arg(
+        long = "backend-assign-timeout-ms-per-instance",
+        value_delimiter = ',',
+        num_args = 1..,
+        hide = true,
+    )]
+    backend_assign_timeout_ms_per_instance: Vec<u64>,
+
+    /// Consecutive assignment timeouts before backend quarantine.
+    #[arg(long, default_value_t = 3, hide = true)]
+    backend_assign_timeout_strikes: u32,
+
+    /// Optional per-backend-instance assignment-timeout strike thresholds.
+    /// Length must match total backend instances after expansion.
+    #[arg(
+        long = "backend-assign-timeout-strikes-per-instance",
+        value_delimiter = ',',
+        num_args = 1..,
+        hide = true,
+    )]
+    backend_assign_timeout_strikes_per_instance: Vec<u32>,
+
+    /// Maximum time to wait for backend cancel/fence control calls, in milliseconds.
+    #[arg(long, default_value_t = 60_000, hide = true)]
+    backend_control_timeout_ms: u64,
+
+    /// Optional per-backend-instance cancel/fence timeouts in milliseconds.
+    /// Length must match total backend instances after expansion.
+    #[arg(
+        long = "backend-control-timeout-ms-per-instance",
+        value_delimiter = ',',
+        num_args = 1..,
+        hide = true,
+    )]
+    backend_control_timeout_ms_per_instance: Vec<u64>,
+
+    /// Allow backends with best-effort deadline semantics.
+    #[arg(long, default_value_t = false, hide = true)]
+    allow_best_effort_deadlines: bool,
+
+    /// Maximum time to wait for a prefetched block template before falling back.
+    #[arg(long, default_value_t = 250, hide = true)]
+    prefetch_wait_ms: u64,
+
+    /// Maximum time to wait for tip-listener shutdown before detaching.
+    #[arg(long, default_value_t = 250, hide = true)]
+    tip_listener_join_wait_ms: u64,
+
+    /// Maximum time to wait for submit-worker shutdown before detaching.
+    #[arg(long, default_value_t = 2_000, hide = true)]
+    submit_join_wait_ms: u64,
+
+    /// Stop all backends at each round end for exact round accounting.
+    #[arg(long, action = ArgAction::SetTrue, hide = true)]
+    strict_round_accounting: bool,
+
+    /// Deprecated alias kept for compatibility; relaxed accounting is now the default.
+    #[arg(long, action = ArgAction::SetTrue, hide = true)]
+    relaxed_accounting: bool,
+
+    /// Optional nonce seed.
+    #[arg(long, hide = true)]
+    start_nonce: Option<u64>,
+
+    /// Maximum iterations each lane will scan before switching to next reservation.
+    #[arg(long, default_value_t = 1u64 << 36, hide = true)]
+    nonce_iters_per_lane: u64,
+
+    /// Nonce chunk allocation strategy across active backends.
+    #[arg(long, value_enum, default_value_t = WorkAllocation::Adaptive, hide = true)]
+    work_allocation: WorkAllocation,
+
+    /// Optional periodic in-round redistribution interval in milliseconds (0 disables).
+    #[arg(long, default_value_t = 0, hide = true)]
+    sub_round_rebalance_ms: u64,
+
+    /// Disable SSE tip notifications (/api/events) and rely only on refresh timer.
+    #[arg(long, action = ArgAction::SetTrue, hide = true)]
+    disable_sse: bool,
+
+    /// Refresh on same-height new_block hash changes.
+    #[arg(long, action = ArgAction::SetTrue, hide = true)]
+    refresh_on_same_height: bool,
+
+    /// API service mode: start local control API and wait for start commands.
+    #[arg(long, default_value_t = false, hide = true)]
+    service: bool,
+
+    /// Allow non-loopback API bind addresses.
+    #[arg(long, default_value_t = false, hide = true)]
+    api_allow_unsafe_bind: bool,
+
+    /// CORS allow-origin value for control API responses. Empty (default) sends no CORS
+    /// headers, so web pages on other origins cannot call the API from a browser.
+    #[arg(long, default_value = "", hide = true)]
+    api_cors: String,
+
+    /// Bearer token required by the control API. When omitted, Seine generates a random
+    /// token at startup and writes it to --api-cookie.
+    #[arg(long, hide = true)]
+    api_token: Option<String>,
+
+    /// File the generated control API token is written to (default: <data-dir>/control-api.cookie).
+    #[arg(long, hide = true)]
+    api_cookie: Option<PathBuf>,
+
+    /// Install new stable releases while mining (the default): download, verify
+    /// the release signature and checksum, swap the executable and restart with
+    /// the same arguments. Needs the update check.
+    #[arg(long, default_value_t = true, action = ArgAction::SetTrue, hide = true)]
+    auto_update: bool,
+
+    /// Experimental: side-buffer slots (1 KiB each) for the AVX-512 streaming
+    /// kernels; 0 disables, unset uses this CPU's default.
+    #[arg(long, hide = true)]
+    cpu_side_cache_blocks: Option<usize>,
+
+    /// Experimental: arena fraction (permille, 500-1000) from which odd blocks
+    /// are not stored (AVX2 and AVX-512 streaming kernels); 0 disables, unset uses this
+    /// CPU's default.
+    #[arg(long, hide = true)]
+    cpu_skip_store_permille: Option<u16>,
+
+    /// Benchmark mode.
+    /// `kernel-effective` measures kernel throughput with wall-time accounting and the backend's
+    /// target/eval path enabled so results are directly comparable to backend-mode overhead.
+    #[arg(long, value_enum, default_value_t = BenchKind::Backend, hide = true)]
+    bench_kind: BenchKind,
+
+    /// Proof of work to benchmark: argon2id (default) or blake2b (the Faraday fork
+    /// hash; `backend` and `end-to-end` kinds only).
+    #[arg(long, value_enum, default_value_t = BenchPow::Argon2id, hide = true)]
+    bench_pow: BenchPow,
+
+    /// Force a supported CPU kernel for offline benchmarks.
+    /// Requires --bench, CPU-only backends, fixed --threads, and no CPU autotuning.
+    #[arg(long, requires_all = ["bench", "threads"], hide = true)]
+    bench_cpu_kernel: Option<blocknet_pow_kernel::CpuKernel>,
+
+    /// Per-round benchmark duration in seconds.
+    #[arg(long, default_value_t = 20, hide = true)]
+    bench_secs: u64,
+
+    /// Number of benchmark rounds.
+    #[arg(long, default_value_t = 3, hide = true)]
+    bench_rounds: u32,
+
+    /// Number of warmup rounds run before measured benchmark rounds.
+    #[arg(long, default_value_t = 0, hide = true)]
+    bench_warmup_rounds: u32,
+
+    /// Write benchmark report JSON to this file.
+    #[arg(long, hide = true)]
+    bench_output: Option<PathBuf>,
+
+    /// Compare benchmark average H/s against a previous JSON report.
+    #[arg(long, hide = true)]
+    bench_baseline: Option<PathBuf>,
+
+    /// Fail benchmark run if average H/s regresses below baseline by more than this percent.
+    #[arg(long, hide = true)]
+    bench_fail_below_pct: Option<f64>,
+
+    /// Baseline compatibility mode: strict validates environment/build identity;
+    /// ignore-environment allows cross-build comparisons while keeping runtime/config/PoW checks.
+    #[arg(long, value_enum, default_value_t = BenchBaselinePolicy::Strict, hide = true)]
+    bench_baseline_policy: BenchBaselinePolicy,
+}
+
+/// The command line, with `--help` printing the same list as `-h`.
+fn cli_command() -> clap::Command {
+    Cli::command()
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .arg(
+            clap::Arg::new("help")
+                .short('h')
+                .long("help")
+                .action(ArgAction::HelpShort)
+                .help("Print help")
+                .help_heading(HELP_INFO),
+        )
+        .arg(
+            clap::Arg::new("version")
+                .short('V')
+                .long("version")
+                .action(ArgAction::Version)
+                .help("Print version")
+                .help_heading(HELP_INFO),
+        )
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub(crate) hardware_telemetry: Option<crate::hardware_telemetry::Options>,
+    pub mode: MiningMode,
+    pub pool_url: Option<String>,
+    pub pool_worker: Option<String>,
+    /// SOCKS5 proxy for pool connections.
+    pub pool_proxy: Option<crate::pool::SocksProxy>,
+    /// Run as a farm proxy listening for rigs on this address.
+    pub proxy_listen: Option<String>,
+    pub dev_fee_pool_worker: String,
+    pub api_url: String,
+    pub token: Option<String>,
+    pub token_cookie_path: Option<PathBuf>,
+    pub daemon_discovery_source: Option<String>,
+    pub daemon_manager_config_path: Option<PathBuf>,
+    pub daemon_resolved_data_dir: Option<PathBuf>,
+    pub daemon_expected_cookie_path: Option<PathBuf>,
+    pub wallet_password: Option<String>,
+    pub wallet_password_file: Option<PathBuf>,
+    pub mining_address: Option<String>,
+    pub payout_memo: Option<String>,
+    pub backend_specs: Vec<BackendSpec>,
+    pub threads: usize,
+    /// The explicit `--threads` value, reported in telemetry so fleet data can tell
+    /// operator choices from automatic sizing. `None` when sized automatically.
+    pub cpu_threads_explicit: Option<usize>,
+    pub cpu_auto_threads_cap: usize,
+    /// Recheck RAM after teardown for interactive/API thread overrides.
+    pub cpu_manual_memory_check: bool,
+    /// Frozen automatic worker slots for this run; distinct from the RAM-safe
+    /// manual/offline ceiling and the CPU-only cache/search maximum.
+    pub cpu_autotune_worker_slots: Option<usize>,
+    /// `None` reserves 5% of effective RAM, at most 512 MiB with 16 GiB or more (else 1 GiB).
+    pub cpu_memory_reserve_percent: Option<u8>,
+    pub cpu_affinity: CpuAffinityMode,
+    pub cpu_page_mode: CpuPageMode,
+    pub cpu_profile: CpuPerformanceProfile,
+    pub refresh_interval: Duration,
+    pub request_timeout: Duration,
+    pub events_stream_timeout: Duration,
+    pub events_idle_timeout: Duration,
+    pub stats_interval: Duration,
+    pub backend_event_capacity: usize,
+    pub hash_poll_interval: Duration,
+    pub cpu_hash_batch_size: u64,
+    pub cpu_control_check_interval_hashes: u64,
+    pub cpu_hash_flush_interval: Duration,
+    pub cpu_event_dispatch_capacity: usize,
+    pub cpu_autotune_threads: bool,
+    pub cpu_autotune_min_threads: usize,
+    pub cpu_autotune_max_threads: Option<usize>,
+    pub cpu_autotune_secs: u64,
+    pub cpu_autotune_config_path: PathBuf,
+    pub nvidia_autotune_secs: u64,
+    pub nvidia_autotune_samples: u32,
+    pub nvidia_autotune_config_path: PathBuf,
+    pub nvidia_max_rregcount: Option<u32>,
+    pub nvidia_max_lanes: Option<usize>,
+    pub nvidia_dispatch_iters_per_lane: Option<u64>,
+    pub nvidia_allocation_iters_per_lane: Option<u64>,
+    pub nvidia_hashes_per_launch_per_lane: u32,
+    pub nvidia_hashes_per_launch_per_lane_was_set: bool,
+    pub nvidia_fused_target_check: bool,
+    pub nvidia_adaptive_launch_depth: bool,
+    pub nvidia_enforce_template_stop: bool,
+    pub amd_devices: Vec<u32>,
+    pub amd_max_lanes: Option<usize>,
+    pub metal_max_lanes: Option<usize>,
+    pub metal_hashes_per_launch_per_lane: u32,
+    /// The Metal backend was added automatically and mines BLAKE2b only.
+    pub metal_blake2b_only: bool,
+    pub backend_assign_timeout: Duration,
+    pub backend_assign_timeout_strikes: u32,
+    pub backend_control_timeout: Duration,
+    pub allow_best_effort_deadlines: bool,
+    pub prefetch_wait: Duration,
+    pub tip_listener_join_wait: Duration,
+    pub submit_join_wait: Duration,
+    pub strict_round_accounting: bool,
+    pub start_nonce: u64,
+    pub nonce_iters_per_lane: u64,
+    pub work_allocation: WorkAllocation,
+    pub sub_round_rebalance_interval: Option<Duration>,
+    pub sse_enabled: bool,
+    pub update_check_enabled: bool,
+    /// Apply newer releases found by the update check (default; off with
+    /// `--no-auto-update` or `--disable-update-check`).
+    pub auto_update: bool,
+    /// Experimental side-cache slots for the AVX-512 streaming kernels (0 = off).
+    pub cpu_side_cache_blocks: usize,
+    /// Experimental skipped-store start for the AVX-512 streaming kernels (0 = off).
+    pub cpu_skip_store_permille: u16,
+    pub refresh_on_same_height: bool,
+    pub ui_mode: UiMode,
+    pub data_dir: PathBuf,
+    pub user_config_path: PathBuf,
+    pub user_config_created: bool,
+    pub api_server_enabled: bool,
+    pub service_mode: bool,
+    pub api_bind: String,
+    pub api_allow_unsafe_bind: bool,
+    pub api_cors: String,
+    pub api_token: Option<String>,
+    pub api_cookie_path: PathBuf,
+    pub allow_wallet_prompt: bool,
+    pub bench: bool,
+    pub bench_kind: BenchKind,
+    pub bench_pow: BenchPow,
+    pub bench_cpu_kernel: Option<blocknet_pow_kernel::CpuKernel>,
+    pub bench_secs: u64,
+    pub bench_rounds: u32,
+    pub bench_warmup_rounds: u32,
+    pub bench_output: Option<PathBuf>,
+    pub bench_baseline: Option<PathBuf>,
+    pub bench_fail_below_pct: Option<f64>,
+    pub bench_baseline_policy: BenchBaselinePolicy,
+    /// Informational hint about NVIDIA requirements when GPU was not auto-detected.
+    pub nvidia_hint: Option<&'static str>,
+    /// GPU detection/auto-expansion notices, logged once at miner startup.
+    pub startup_notices: Vec<String>,
+    /// Startup facts for plain logs; not worth a dashboard line.
+    pub startup_details: Vec<String>,
+}
+
+/// What `main` needs to know before the slower parts of configuration run.
+pub struct StartupUi {
+    pub verbose: bool,
+    pub opens_dashboard: bool,
+    pub mode_label: &'static str,
+    pub pool_url: Option<String>,
+    pub pool_worker: Option<String>,
+}
+
+impl Config {
+    /// `on_startup` runs once, after any prompts and before hardware detection.
+    pub fn parse(on_startup: impl FnOnce(StartupUi) -> Result<()>) -> Result<Self> {
+        let matches = match cli_command().try_get_matches() {
+            Ok(matches) => matches,
+            // Arguments the previous version took and this one refuses go
+            // back to that version (see `self_update::roll_back_failed_start`).
+            Err(err)
+                if crate::self_update::rollback_pending()
+                    && !matches!(
+                        err.kind(),
+                        clap::error::ErrorKind::DisplayHelp
+                            | clap::error::ErrorKind::DisplayVersion
+                    ) =>
+            {
+                return Err(err.into());
+            }
+            Err(err) => err.exit(),
+        };
+        let nvidia_hashes_per_launch_per_lane_was_set = matches!(
+            matches.value_source("nvidia_hashes_per_launch_per_lane"),
+            Some(clap::parser::ValueSource::CommandLine)
+        );
+        let mut cli =
+            Cli::from_arg_matches(&matches).expect("clap matches should deserialize into Cli");
+        cli.apply_miner_style_args();
+        if let Some(kernel) = cli.bench_cpu_kernel {
+            if !kernel.is_supported() {
+                bail!("CPU kernel {kernel} is not supported by this host/build");
+            }
+        }
+        let user_config_path = cli.data_dir.join(DEFAULT_USER_CONFIG_FILE);
+        let mut user_cfg = read_user_config(&user_config_path)?;
+        let user_config_exists = user_cfg.is_some();
+        let mut dev_fee_pool_worker = user_cfg
+            .as_ref()
+            .and_then(|cfg| cfg.dev_fee_pool_worker.as_ref())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        validate_saved_memo_override(&cli, user_cfg.as_ref())?;
+        apply_user_config_defaults(&mut cli, user_cfg.as_ref());
+        validate_payout_memo_config(&cli)?;
+        let mut user_config_created = false;
+        let should_prompt_for_pool_bootstrap = !cli.bench && !cli.service;
+        if !user_config_exists {
+            if should_prompt_for_pool_bootstrap {
+                resolve_first_run_pool_inputs(&mut cli, &user_config_path)?;
+            }
+            validate_cli_mining_address(&cli, "--address")?;
+            if dev_fee_pool_worker.is_none() {
+                dev_fee_pool_worker = Some(generate_default_dev_fee_pool_worker());
+            }
+            persist_bootstrap_user_config(
+                &cli,
+                &user_config_path,
+                dev_fee_pool_worker
+                    .as_deref()
+                    .expect("dev fee pool worker should be generated"),
+            )?;
+            user_config_created = true;
+        } else if should_validate_pool_mode_inputs(&cli) {
+            ensure_pool_mode_inputs_available(&cli, &user_config_path)?;
+            if cli
+                .pool_worker
+                .as_ref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                cli.pool_worker = Some(generate_default_pool_worker());
+            }
+        }
+        let memo_prompted = prompt_payout_memo_on_screen(&mut cli)?;
+        if resolve_required_payout_memo(
+            &mut cli,
+            io::stdin().is_terminal() && io::stderr().is_terminal(),
+            &mut io::stdin().lock(),
+            &mut io::stderr(),
+        )? || memo_prompted
+        {
+            persist_prompted_payout_memo(&cli, user_cfg.as_mut(), &user_config_path)?;
+        }
+        if dev_fee_pool_worker.is_none() {
+            let generated = generate_default_dev_fee_pool_worker();
+            persist_user_config_with_dev_fee_pool_worker(
+                user_cfg.as_ref(),
+                &cli,
+                &user_config_path,
+                &generated,
+            )?;
+            dev_fee_pool_worker = Some(generated);
+        }
+        let dev_fee_pool_worker = dev_fee_pool_worker
+            .expect("dev fee pool worker should always be resolved before config build");
+
+        if let Some(threads) = cli.threads {
+            if threads == 0 {
+                bail!("threads must be >= 1");
+            }
+        }
+        if let Some(mining_address) = cli.mining_address.as_ref() {
+            if mining_address.trim().is_empty() {
+                bail!("--address is empty");
+            }
+            validate_destination(mining_address)
+                .map_err(|err| anyhow::anyhow!("invalid --address: {err}"))?;
+        }
+        if let Some(pool_url) = cli.pool_url.as_ref() {
+            if let Err(err) = crate::pool::normalize_pool_urls(pool_url) {
+                bail!("invalid --pool-url: {err:#}");
+            }
+        }
+        if let Some(pool_worker) = cli.pool_worker.as_ref() {
+            if pool_worker.trim().is_empty() {
+                bail!("--pool-worker is empty");
+            }
+        }
+        if cli.proxy_listen.is_some() && cli.mode == Some(MiningMode::Daemon) {
+            bail!("--proxy-listen relays to a pool; it cannot be used with --mode daemon");
+        }
+        if cli.nonce_iters_per_lane == 0 {
+            bail!("nonce-iters-per-lane must be >= 1");
+        }
+        if cli.backend_event_capacity == 0 {
+            bail!("backend-event-capacity must be >= 1");
+        }
+        if let Some(value) = cli.hash_poll_ms {
+            if value == 0 {
+                bail!("hash-poll-ms must be >= 1");
+            }
+        }
+        if let Some(value) = cli.cpu_hash_batch_size {
+            if value == 0 {
+                bail!("cpu-hash-batch-size must be >= 1");
+            }
+        }
+        if let Some(value) = cli.cpu_control_check_interval_hashes {
+            if value == 0 {
+                bail!("cpu-control-check-interval-hashes must be >= 1");
+            }
+        }
+        if let Some(value) = cli.cpu_hash_flush_ms {
+            if value == 0 {
+                bail!("cpu-hash-flush-ms must be >= 1");
+            }
+        }
+        if let Some(value) = cli.cpu_event_dispatch_capacity {
+            if value == 0 {
+                bail!("cpu-event-dispatch-capacity must be >= 1");
+            }
+        }
+        if cli.cpu_autotune_threads && cli.disable_cpu_autotune_threads {
+            bail!("cannot use both --cpu-autotune-threads and --disable-cpu-autotune-threads");
+        }
+        if cli.cpu_autotune_min_threads == 0 {
+            bail!("cpu-autotune-min-threads must be >= 1");
+        }
+        if let Some(max_threads) = cli.cpu_autotune_max_threads {
+            if max_threads == 0 {
+                bail!("cpu-autotune-max-threads must be >= 1");
+            }
+            if max_threads < cli.cpu_autotune_min_threads {
+                bail!(
+                    "cpu-autotune-max-threads ({max_threads}) must be >= cpu-autotune-min-threads ({})",
+                    cli.cpu_autotune_min_threads
+                );
+            }
+        }
+        if cli.cpu_autotune_secs == 0 {
+            bail!("cpu-autotune-secs must be >= 1");
+        }
+        if cli.nvidia_autotune_secs == 0 {
+            bail!("nvidia-autotune-secs must be >= 1");
+        }
+        if cli.nvidia_autotune_samples == 0 {
+            bail!("nvidia-autotune-samples must be >= 1");
+        }
+        if matches!(cli.nvidia_max_rregcount, Some(0)) {
+            bail!("nvidia-max-rregcount must be >= 1");
+        }
+        if matches!(cli.nvidia_max_lanes, Some(0)) {
+            bail!("nvidia-max-lanes must be >= 1");
+        }
+        if matches!(cli.nvidia_dispatch_iters_per_lane, Some(0)) {
+            bail!("nvidia-dispatch-iters-per-lane must be >= 1");
+        }
+        if matches!(cli.nvidia_allocation_iters_per_lane, Some(0)) {
+            bail!("nvidia-allocation-iters-per-lane must be >= 1");
+        }
+        if cli.nvidia_hashes_per_launch_per_lane == 0 {
+            bail!("nvidia-hashes-per-launch-per-lane must be >= 1");
+        }
+        if matches!(cli.amd_max_lanes, Some(0)) {
+            bail!("amd-max-lanes must be >= 1");
+        }
+        if matches!(cli.metal_max_lanes, Some(0)) {
+            bail!("metal-max-lanes must be >= 1");
+        }
+        if cli.metal_hashes_per_launch_per_lane == 0 {
+            bail!("metal-hashes-per-launch-per-lane must be >= 1");
+        }
+        if cli.backend_assign_timeout_ms == 0 {
+            bail!("backend-assign-timeout-ms must be >= 1");
+        }
+        if cli.backend_assign_timeout_ms_per_instance.contains(&0) {
+            bail!("backend-assign-timeout-ms-per-instance values must be >= 1");
+        }
+        if cli.backend_assign_timeout_strikes == 0 {
+            bail!("backend-assign-timeout-strikes must be >= 1");
+        }
+        if cli.backend_assign_timeout_strikes_per_instance.contains(&0) {
+            bail!("backend-assign-timeout-strikes-per-instance values must be >= 1");
+        }
+        if cli.backend_control_timeout_ms == 0 {
+            bail!("backend-control-timeout-ms must be >= 1");
+        }
+        if cli.backend_control_timeout_ms_per_instance.contains(&0) {
+            bail!("backend-control-timeout-ms-per-instance values must be >= 1");
+        }
+        if cli.prefetch_wait_ms == 0 {
+            bail!("prefetch-wait-ms must be >= 1");
+        }
+        if cli.tip_listener_join_wait_ms == 0 {
+            bail!("tip-listener-join-wait-ms must be >= 1");
+        }
+        if cli.submit_join_wait_ms == 0 {
+            bail!("submit-join-wait-ms must be >= 1");
+        }
+        if cli.strict_round_accounting && cli.relaxed_accounting {
+            bail!("cannot use both --strict-round-accounting and --relaxed-accounting");
+        }
+        if cli.service && cli.bench {
+            bail!("--service cannot be combined with --bench");
+        }
+        if let Some(threshold) = cli.bench_fail_below_pct {
+            if !cli.bench {
+                bail!("--bench-fail-below-pct can only be used with --bench");
+            }
+            if !threshold.is_finite() || threshold < 0.0 {
+                bail!("--bench-fail-below-pct must be a finite number >= 0");
+            }
+            if cli.bench_baseline.is_none() {
+                bail!("--bench-fail-below-pct requires --bench-baseline");
+            }
+        }
+
+        on_startup(StartupUi {
+            verbose: cli.verbose,
+            opens_dashboard: !cli.bench
+                && !cli.service
+                && cli.proxy_listen.is_none()
+                && crate::miner::ui_mode_enables_tui(cli.ui),
+            mode_label: match cli.mode.unwrap_or(MiningMode::Pool) {
+                MiningMode::Pool => "pool",
+                MiningMode::Daemon => "daemon",
+            },
+            pool_url: cli.pool_url.clone(),
+            pool_worker: cli.pool_worker.clone(),
+        })?;
+
+        let nvidia_detection = detect_nvidia_devices();
+        let nvidia_available = nvidia_detection
+            .as_ref()
+            .map(|devices| !devices.is_empty())
+            .unwrap_or(false);
+        let mut startup_notices = Vec::new();
+        let mut startup_details = Vec::new();
+        // HIP is dlopen'd when AMD is requested without explicit devices, or
+        // when no backend is requested so discrete AMD GPUs can be enabled
+        // automatically; explicit --amd-devices keeps startup free of
+        // config-time ROCm probing.
+        let amd_requested = cli.backends.contains(&BackendKind::Amd);
+        if !cli.bench && cli.proxy_listen.is_none() {
+            init_amd_crash_guard(&cli.data_dir);
+        }
+        let amd_detection =
+            if (amd_requested || cli.backends.is_empty()) && cli.amd_devices.is_empty() {
+                Some(detect_amd_devices(
+                    &mut startup_notices,
+                    amd_requested,
+                    cli.proxy_listen.is_none(),
+                ))
+            } else {
+                None
+            };
+        let amd_available = amd_detection
+            .as_ref()
+            .and_then(|detection| detection.as_ref().ok())
+            .map(|devices| !devices.is_empty())
+            .unwrap_or(false);
+        let (mut backends, nvidia_hint) = resolve_backend_selection_in(
+            cli.mode.unwrap_or(MiningMode::Pool),
+            &cli.backends,
+            &cli.nvidia_devices,
+            nvidia_available,
+            &cli.amd_devices,
+            amd_available,
+        );
+        if cli.gpu_only {
+            drop_cpu_when_a_gpu_is_selected(&mut backends);
+        }
+        let auto_nvidia_devices: Vec<u32> =
+            if cli.nvidia_devices.is_empty() && backends.contains(&BackendKind::Nvidia) {
+                nvidia_detection
+                    .as_ref()
+                    .map(|devices| devices.iter().map(|device| device.index).collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+        let auto_amd_devices: Vec<u32> = amd_detection
+            .as_ref()
+            .and_then(|detection| detection.as_ref().ok())
+            .map(|devices| devices.iter().map(|device| device.index).collect())
+            .unwrap_or_default();
+        startup_notices.extend(build_gpu_detection_notices(
+            "NVIDIA",
+            "nvidia",
+            &nvidia_detection,
+            &cli.nvidia_devices,
+            backends.contains(&BackendKind::Nvidia),
+        ));
+        if let Some(detection) = &amd_detection {
+            startup_notices.extend(build_gpu_detection_notices(
+                "AMD",
+                "amd",
+                detection,
+                &cli.amd_devices,
+                backends.contains(&BackendKind::Amd),
+            ));
+        }
+        // The Metal backend Seine adds by itself mines BLAKE2b only and keeps
+        // no Argon2 lanes, so the CPU keeps its full memory budget.
+        let metal_blake2b_only = cli.backends.is_empty() && backends.contains(&BackendKind::Metal);
+        let gpu_memory_reservation =
+            if backends.contains(&BackendKind::Metal) && !metal_blake2b_only {
+                estimate_metal_memory_bytes(cli.metal_max_lanes)
+            } else {
+                0
+            };
+        let cpu_backend_instances = backends
+            .iter()
+            .filter(|kind| matches!(kind, BackendKind::Cpu))
+            .count();
+        if cfg!(target_os = "macos")
+            && cpu_backend_instances > 0
+            && cli.cpu_page_mode.requires_explicit_large_pages()
+        {
+            bail!(
+                "--cpu-page-mode {} is unsupported on macOS; use auto or regular",
+                cli.cpu_page_mode.as_str()
+            );
+        }
+        let auto_threads_cap = match cpu_backend_instances {
+            0 => 1,
+            instances => auto_cpu_threads(
+                instances,
+                gpu_memory_reservation,
+                cli.cpu_affinity,
+                cli.cpu_page_mode,
+                cli.cpu_memory_reserve_percent,
+            ),
+        };
+        let profile_defaults = cpu_profile_defaults(cli.cpu_profile, auto_threads_cap);
+        let resolved_threads = cli.threads.unwrap_or(profile_defaults.threads);
+        let cpu_autotune_threads = cpu_autotune_enabled(&cli, cpu_backend_instances);
+        // An explicit count on a host without a validated streaming default keeps
+        // its count but runs the kernel comparisons there, which is the only way
+        // such a host ever tries the streaming kernels.
+        let pinned_kernel_trials = pinned_kernel_trials_wanted(
+            cli.threads.is_some(),
+            cpu_backend_instances,
+            !cli.cpu_threads_per_instance.is_empty(),
+            cpu_autotune_threads,
+            cli.disable_cpu_autotune_threads,
+            cli.bench,
+        ) && crate::miner::fixed_count_trials_wanted(resolved_threads);
+        if pinned_kernel_trials {
+            startup_notices.push(format!(
+                "--threads {resolved_threads} is kept; the CPU kernel is still compared while mining on this CPU"
+            ));
+        }
+        let cpu_autotune_threads = cpu_autotune_threads || pinned_kernel_trials;
+        validate_benchmark_cpu_kernel(
+            cli.bench_cpu_kernel,
+            cli.bench,
+            &backends,
+            cli.threads,
+            cpu_autotune_threads,
+        )?;
+        if cpu_backend_instances > 0 && (cli.threads.is_none() || cpu_autotune_threads) {
+            startup_details.push(format!(
+                "CPU automatic sizing reserves {} of effective RAM; cap={} thread(s) per instance (--cpu-memory-reserve-percent 0 disables the reserve)",
+                cli.cpu_memory_reserve_percent
+                    .map_or("5% (at most 512 MiB with 16 GiB or more, else 1 GiB)".to_string(), |p| format!("{p}%")),
+                auto_threads_cap,
+            ));
+        }
+        startup_notices.extend(underused_threads_notice(
+            cli.threads,
+            cpu_backend_instances,
+            cpu_autotune_threads && !pinned_kernel_trials,
+            auto_threads_cap,
+        ));
+        startup_notices.extend(wsl_sizing_notice_for(
+            cpu_backend_instances,
+            gpu_memory_reservation,
+            cli.cpu_affinity,
+            cli.cpu_page_mode,
+            cli.cpu_memory_reserve_percent,
+        ));
+        if cpu_backend_instances > 0 && !cli.bench {
+            startup_notices.extend(crate::memory_modules::host_memory_setup_notices());
+        }
+        let cpu_autotune_config_path = cli
+            .cpu_autotune_config
+            .clone()
+            .unwrap_or_else(|| cli.data_dir.join(DEFAULT_CPU_AUTOTUNE_CONFIG_FILE));
+        let nvidia_autotune_config_path = cli
+            .nvidia_autotune_config
+            .clone()
+            .unwrap_or_else(|| cli.data_dir.join(DEFAULT_NVIDIA_AUTOTUNE_CONFIG_FILE));
+        let effective_hash_poll_ms = cli.hash_poll_ms.unwrap_or(profile_defaults.hash_poll_ms);
+        let effective_cpu_hash_batch_size = cli
+            .cpu_hash_batch_size
+            .unwrap_or(profile_defaults.cpu_hash_batch_size);
+        let effective_cpu_control_check_interval_hashes = cli
+            .cpu_control_check_interval_hashes
+            .unwrap_or(profile_defaults.cpu_control_check_interval_hashes);
+        let effective_cpu_hash_flush_ms = cli
+            .cpu_hash_flush_ms
+            .unwrap_or(profile_defaults.cpu_hash_flush_ms);
+        let effective_cpu_event_dispatch_capacity = cli
+            .cpu_event_dispatch_capacity
+            .unwrap_or(profile_defaults.cpu_event_dispatch_capacity);
+        let backend_specs = expand_backend_specs(
+            &backends,
+            &cli.nvidia_devices,
+            &cli.amd_devices,
+            &auto_nvidia_devices,
+            &auto_amd_devices,
+            BackendExpansionOptions {
+                default_cpu_threads: resolved_threads,
+                default_cpu_affinity: cli.cpu_affinity,
+                cpu_threads_per_instance: &cli.cpu_threads_per_instance,
+                cpu_affinity_per_instance: &cli.cpu_affinity_per_instance,
+                backend_assign_timeout_ms_per_instance: &cli.backend_assign_timeout_ms_per_instance,
+                backend_control_timeout_ms_per_instance: &cli
+                    .backend_control_timeout_ms_per_instance,
+                backend_assign_timeout_strikes_per_instance: &cli
+                    .backend_assign_timeout_strikes_per_instance,
+            },
+        )?;
+
+        // Automatic mining starts within a fresh budget and can wait for RAM.
+        // Explicit counts and offline benchmarks retain fail-fast validation.
+        if !cpu_autotune_threads || cli.bench {
+            validate_cpu_memory(
+                &backend_specs,
+                resolved_threads,
+                cli.allow_oversubscribe,
+                gpu_memory_reservation,
+                cli.cpu_page_mode,
+            )?;
+        }
+
+        let mode = cli.mode.unwrap_or(MiningMode::Pool);
+        let requested_network = cli_requested_daemon_network(&cli);
+        let daemon_context = if cli.bench {
+            None
+        } else {
+            detect_daemon_context(Some(requested_network))
+        };
+        let api_server_enabled = cli.api_server || cli.service;
+        if api_server_enabled && !cli.api_allow_unsafe_bind && !is_loopback_bind(&cli.api_bind) {
+            bail!(
+                "api-bind '{}' is not loopback; pass --api-allow-unsafe-bind to allow non-loopback binding",
+                cli.api_bind
+            );
+        }
+
+        let api_token = match cli.api_token.as_deref().map(str::trim) {
+            Some("") => bail!("--api-token is empty"),
+            Some(token) => Some(token.to_string()),
+            None => None,
+        };
+        let api_cookie_path = cli
+            .api_cookie
+            .clone()
+            .unwrap_or_else(|| cli.data_dir.join(DEFAULT_CONTROL_API_COOKIE_FILE));
+
+        let (token, token_cookie_path) = if cli.bench {
+            (None, None)
+        } else {
+            resolve_runtime_token_with_source(&cli, mode, daemon_context.as_ref())?
+        };
+        let api_url = resolve_api_url(cli.api_url.as_deref(), daemon_context.as_ref());
+        let daemon_resolved_data_dir = if cli.bench {
+            None
+        } else {
+            Some(resolve_effective_daemon_data_dir(
+                &cli,
+                daemon_context.as_ref(),
+            ))
+        };
+        let daemon_expected_cookie_path = daemon_resolved_data_dir
+            .as_ref()
+            .map(|data_dir| data_dir.join("api.cookie"));
+        let daemon_discovery_source = if cli.bench {
+            None
+        } else {
+            resolve_daemon_discovery_source(&cli, mode, daemon_context.as_ref())
+        };
+        let daemon_manager_config_path = daemon_context
+            .as_ref()
+            .and_then(|context| context.manager_config_path.clone());
+        let strict_round_accounting = cli.strict_round_accounting && !cli.relaxed_accounting;
+        let nvidia_enforce_template_stop = match cli.nvidia_template_stop_policy {
+            NvidiaTemplateStopPolicy::Auto => strict_round_accounting,
+            NvidiaTemplateStopPolicy::On => true,
+            NvidiaTemplateStopPolicy::Off => false,
+        };
+
+        let mut cfg = Self {
+            hardware_telemetry: None,
+            mode,
+            pool_url: cli.pool_url.as_deref().and_then(normalize_pool_url),
+            pool_worker: cli
+                .pool_worker
+                .as_ref()
+                .map(|value| value.trim().to_string()),
+            proxy_listen: cli.proxy_listen.clone(),
+            pool_proxy: cli
+                .pool_proxy
+                .as_deref()
+                .map(crate::pool::SocksProxy::parse)
+                .transpose()
+                .context("invalid --pool-proxy")?,
+            dev_fee_pool_worker,
+            api_url,
+            token,
+            token_cookie_path,
+            daemon_discovery_source,
+            daemon_manager_config_path,
+            daemon_resolved_data_dir,
+            daemon_expected_cookie_path,
+            wallet_password: cli.wallet_password,
+            wallet_password_file: cli.wallet_password_file,
+            payout_memo: cli.payout_memo.clone(),
+            mining_address: cli.mining_address.map(|address| address.trim().to_string()),
+            backend_specs,
+            threads: resolved_threads,
+            cpu_threads_explicit: cli.threads,
+            cpu_auto_threads_cap: auto_threads_cap,
+            cpu_manual_memory_check: false,
+            cpu_autotune_worker_slots: None,
+            cpu_memory_reserve_percent: cli.cpu_memory_reserve_percent,
+            cpu_affinity: cli.cpu_affinity,
+            cpu_page_mode: cli.cpu_page_mode,
+            cpu_profile: cli.cpu_profile,
+            refresh_interval: Duration::from_secs(cli.refresh_secs.max(1)),
+            request_timeout: Duration::from_secs(cli.request_timeout_secs.max(1)),
+            events_stream_timeout: Duration::from_secs(cli.events_stream_timeout_secs.max(1)),
+            events_idle_timeout: Duration::from_secs(cli.events_idle_timeout_secs.max(1)),
+            stats_interval: Duration::from_secs(cli.stats_secs.max(1)),
+            backend_event_capacity: cli.backend_event_capacity,
+            hash_poll_interval: Duration::from_millis(effective_hash_poll_ms),
+            cpu_hash_batch_size: effective_cpu_hash_batch_size,
+            cpu_control_check_interval_hashes: effective_cpu_control_check_interval_hashes,
+            cpu_hash_flush_interval: Duration::from_millis(effective_cpu_hash_flush_ms),
+            cpu_event_dispatch_capacity: effective_cpu_event_dispatch_capacity,
+            cpu_autotune_threads,
+            cpu_autotune_min_threads: if pinned_kernel_trials {
+                resolved_threads
+            } else {
+                cli.cpu_autotune_min_threads
+            },
+            cpu_autotune_max_threads: if pinned_kernel_trials {
+                Some(resolved_threads)
+            } else {
+                cli.cpu_autotune_max_threads
+            },
+            cpu_autotune_secs: cli.cpu_autotune_secs.max(1),
+            cpu_autotune_config_path,
+            nvidia_autotune_secs: cli.nvidia_autotune_secs.max(1),
+            nvidia_autotune_samples: cli.nvidia_autotune_samples.max(1),
+            nvidia_autotune_config_path,
+            nvidia_max_rregcount: cli.nvidia_max_rregcount.filter(|v| *v > 0),
+            nvidia_max_lanes: cli.nvidia_max_lanes.filter(|v| *v > 0),
+            nvidia_dispatch_iters_per_lane: cli.nvidia_dispatch_iters_per_lane.filter(|v| *v > 0),
+            nvidia_allocation_iters_per_lane: cli
+                .nvidia_allocation_iters_per_lane
+                .filter(|v| *v > 0),
+            nvidia_hashes_per_launch_per_lane: cli.nvidia_hashes_per_launch_per_lane.max(1),
+            nvidia_hashes_per_launch_per_lane_was_set,
+            nvidia_fused_target_check: cli.nvidia_fused_target_check,
+            nvidia_adaptive_launch_depth: !cli.nvidia_no_adaptive_launch_depth,
+            nvidia_enforce_template_stop,
+            amd_devices: cli.amd_devices.clone(),
+            amd_max_lanes: cli.amd_max_lanes.filter(|v| *v > 0),
+            metal_max_lanes: cli.metal_max_lanes.filter(|v| *v > 0),
+            metal_blake2b_only,
+            metal_hashes_per_launch_per_lane: cli.metal_hashes_per_launch_per_lane.max(1),
+            backend_assign_timeout: Duration::from_millis(cli.backend_assign_timeout_ms),
+            backend_assign_timeout_strikes: cli.backend_assign_timeout_strikes.max(1),
+            backend_control_timeout: Duration::from_millis(cli.backend_control_timeout_ms),
+            allow_best_effort_deadlines: cli.allow_best_effort_deadlines,
+            prefetch_wait: Duration::from_millis(cli.prefetch_wait_ms),
+            tip_listener_join_wait: Duration::from_millis(cli.tip_listener_join_wait_ms),
+            submit_join_wait: Duration::from_millis(cli.submit_join_wait_ms),
+            strict_round_accounting,
+            start_nonce: cli.start_nonce.unwrap_or_else(|| {
+                if cli.bench {
+                    0
+                } else {
+                    default_nonce_seed()
+                }
+            }),
+            nonce_iters_per_lane: cli.nonce_iters_per_lane,
+            work_allocation: cli.work_allocation,
+            sub_round_rebalance_interval: optional_duration_from_millis(cli.sub_round_rebalance_ms),
+            sse_enabled: !cli.disable_sse,
+            update_check_enabled: !cli.disable_update_check,
+            auto_update: cli.auto_update && !cli.no_auto_update && !cli.disable_update_check,
+            cpu_side_cache_blocks: cli.cpu_side_cache_blocks.unwrap_or_else(|| {
+                crate::miner::cohort_side_cache_blocks(
+                    cli.threads.unwrap_or(auto_threads_cap),
+                    sysinfo::System::new().physical_core_count(),
+                    cpu_parallelism_cap(cli.cpu_affinity),
+                )
+            }),
+            cpu_skip_store_permille: cli.cpu_skip_store_permille.unwrap_or_else(|| {
+                crate::miner::cohort_skip_store_permille(cli.threads.unwrap_or(auto_threads_cap))
+            }),
+            refresh_on_same_height: cli.refresh_on_same_height,
+            ui_mode: cli.ui,
+            data_dir: cli.data_dir,
+            user_config_path,
+            user_config_created,
+            api_server_enabled,
+            service_mode: cli.service,
+            api_bind: cli.api_bind,
+            api_allow_unsafe_bind: cli.api_allow_unsafe_bind,
+            api_cors: cli.api_cors,
+            api_token,
+            api_cookie_path,
+            allow_wallet_prompt: true,
+            bench: cli.bench,
+            bench_kind: cli.bench_kind,
+            bench_pow: cli.bench_pow,
+            bench_cpu_kernel: cli.bench_cpu_kernel,
+            bench_secs: cli.bench_secs.max(1),
+            bench_rounds: cli.bench_rounds.max(1),
+            bench_warmup_rounds: cli.bench_warmup_rounds,
+            bench_output: cli.bench_output,
+            bench_baseline: cli.bench_baseline,
+            bench_fail_below_pct: cli.bench_fail_below_pct,
+            bench_baseline_policy: cli.bench_baseline_policy,
+            nvidia_hint,
+            startup_notices,
+            startup_details,
+        };
+        if cfg.cpu_autotune_threads && !cfg.bench {
+            cfg.cpu_auto_threads_cap = cpu_autotune_capacity(&cfg, 0).0;
+        }
+        cfg.hardware_telemetry = match crate::hardware_telemetry::resolve(
+            &cfg.data_dir,
+            cli.telemetry.map(|v| v == TelemetryChoice::On),
+            cli.telemetry_url.as_deref(),
+        ) {
+            Ok(options) => options,
+            Err(err) if cli.telemetry.is_some() || cli.telemetry_url.is_some() => return Err(err),
+            Err(_) => None,
+        };
+        Ok(cfg)
+    }
+}
+
+impl Config {
+    pub fn daemon_connection_summary(&self) -> Option<String> {
+        if self.mode != MiningMode::Daemon
+            && self.token.is_none()
+            && self.token_cookie_path.is_none()
+        {
+            return None;
+        }
+        let data_dir = self.daemon_resolved_data_dir.as_ref()?;
+        let mut parts = Vec::new();
+        if let Some(source) = self.daemon_discovery_source.as_deref() {
+            parts.push(format!("source={source}"));
+        }
+        parts.push(format!("api={}", self.api_url));
+        parts.push(format!("data={}", data_dir.display()));
+        if let Some(cookie) = self.token_cookie_path.as_ref() {
+            parts.push(format!("cookie={}", cookie.display()));
+        } else if let Some(cookie) = self.daemon_expected_cookie_path.as_ref() {
+            parts.push(format!("cookie={}", cookie.display()));
+        }
+        if let Some(config_path) = self.daemon_manager_config_path.as_ref() {
+            parts.push(format!("config={}", config_path.display()));
+        }
+        Some(parts.join(" "))
+    }
+
+    pub fn daemon_auth_wait_message(&self, repeated: bool) -> String {
+        if let Some(cookie_path) = self.token_cookie_path.as_ref() {
+            let mismatch_hint = self.daemon_cookie_mismatch_hint();
+            if repeated {
+                if let Some(hint) = mismatch_hint {
+                    return format!(
+                        "daemon auth still failing; watching {}. {}",
+                        cookie_path.display(),
+                        hint
+                    );
+                }
+                return format!(
+                    "daemon auth still failing; watching {} for a new cookie token",
+                    cookie_path.display()
+                );
+            }
+            if let Some(hint) = mismatch_hint {
+                return format!(
+                    "daemon auth failed with cookie {}; {}",
+                    cookie_path.display(),
+                    hint
+                );
+            }
+            return format!(
+                "daemon auth failed; watching {} for a new cookie token",
+                cookie_path.display()
+            );
+        }
+
+        "auth failed; static --token cannot auto-refresh".to_string()
+    }
+
+    pub fn daemon_cookie_refresh_failure_message(&self, reason: &str) -> String {
+        if let Some(cookie_path) = self.token_cookie_path.as_ref() {
+            let mismatch_hint = self.daemon_cookie_mismatch_hint();
+            if let Some(hint) = mismatch_hint {
+                return format!(
+                    "{reason}; watched cookie {}. {}",
+                    cookie_path.display(),
+                    hint
+                );
+            }
+            return format!("{reason}; watched cookie {}", cookie_path.display());
+        }
+        reason.to_string()
+    }
+
+    fn daemon_cookie_mismatch_hint(&self) -> Option<String> {
+        let watched = self.token_cookie_path.as_ref()?;
+        let expected = self.daemon_expected_cookie_path.as_ref()?;
+        if watched == expected {
+            return None;
+        }
+
+        let mut hint = format!(
+            "provided cookie path looks stale; expected managed cookie at {}",
+            expected.display()
+        );
+        if let Some(config_path) = self.daemon_manager_config_path.as_ref() {
+            hint.push_str(&format!(" (from {})", config_path.display()));
+        }
+        Some(hint)
+    }
+}
+
+fn resolve_backend_selection_in(
+    mode: MiningMode,
+    requested_backends: &[BackendKind],
+    nvidia_devices: &[u32],
+    nvidia_available: bool,
+    amd_devices: &[u32],
+    amd_available: bool,
+) -> (Vec<BackendKind>, Option<&'static str>) {
+    if !requested_backends.is_empty() {
+        return (requested_backends.to_vec(), None);
+    }
+
+    // Integrated AMD GPUs are not auto-enabled; users can opt in via
+    // --backend cpu,amd. On Apple Silicon builds that mine BLAKE2b, Metal is
+    // added for BLAKE2b work only; --backend cpu,metal also mines Argon2 on it.
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    let _ = mode;
+    let mut selected = vec![BackendKind::Cpu];
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    if crate::miner::mines_blake2b_in(mode) {
+        selected.push(BackendKind::Metal);
+    }
+    if nvidia_available || !nvidia_devices.is_empty() {
+        selected.push(BackendKind::Nvidia);
+    }
+    if amd_available || !amd_devices.is_empty() {
+        selected.push(BackendKind::Amd);
+    }
+
+    #[cfg(all(feature = "nvidia", not(target_os = "macos")))]
+    let hint = if !selected.contains(&BackendKind::Nvidia) && !selected.contains(&BackendKind::Amd)
+    {
+        Some(
+            "this build supports NVIDIA GPU mining but no GPU was detected; \
+             install the NVIDIA driver to enable it: https://www.nvidia.com/drivers",
+        )
+    } else {
+        None
+    };
+    #[cfg(any(not(feature = "nvidia"), target_os = "macos"))]
+    let hint = None;
+
+    (selected, hint)
+}
+
+/// `--gpu-only`: a rig with no usable GPU still mines on the CPU.
+fn drop_cpu_when_a_gpu_is_selected(backends: &mut Vec<BackendKind>) {
+    if backends
+        .iter()
+        .any(|kind| matches!(kind, BackendKind::Nvidia | BackendKind::Amd))
+    {
+        backends.retain(|kind| *kind != BackendKind::Cpu);
+    }
+}
+
+/// A GPU reported by config-time device enumeration, used to fan out one
+/// backend instance per device before any backend is constructed.
+#[derive(Debug, Clone)]
+pub(crate) struct DetectedGpu {
+    pub index: u32,
+    pub name: String,
+    pub memory_total_mib: u64,
+}
+
+#[cfg(feature = "nvidia")]
+pub(crate) fn detect_nvidia_devices() -> Result<Vec<DetectedGpu>> {
+    let devices = crate::backend::nvidia::query_nvidia_devices()?;
+    Ok(devices
+        .into_iter()
+        .map(|device| DetectedGpu {
+            index: device.index,
+            name: device.name,
+            memory_total_mib: device.memory_total_mib,
+        })
+        .collect())
+}
+
+#[cfg(not(feature = "nvidia"))]
+pub(crate) fn detect_nvidia_devices() -> Result<Vec<DetectedGpu>> {
+    bail!("NVIDIA support is not compiled into this build")
+}
+
+/// Enumerates HIP devices, keeping only wave32 GPUs the AMD backend can run on.
+/// Skipped devices are reported through `notices` instead of spawning instances
+/// that are guaranteed to fail wavefront validation at start.
+/// Integrated GPUs are kept only when `include_integrated` is set.
+/// `raise_perf_level` is false when nothing will mine (farm proxy).
+#[cfg(all(feature = "amd", any(target_os = "linux", windows)))]
+pub(crate) fn detect_amd_devices(
+    notices: &mut Vec<String>,
+    include_integrated: bool,
+    raise_perf_level: bool,
+) -> Result<Vec<DetectedGpu>> {
+    use crate::backend::amd::{crash_guard, hip_runtime_present, query_amd_devices};
+
+    // Startup detection (not device listing) feeds telemetry.
+    let record = raise_perf_level;
+    // `include_integrated` means the user listed `amd`, which always tries.
+    if !include_integrated && crash_guard::skips_automatic_start() {
+        notices.push(
+            "AMD GPUs skipped: the AMD GPU runtime ended the last Seine starts while using them. \
+             Seine tries them again after its next update; add amd to --backend to try now."
+                .to_string(),
+        );
+        if record {
+            crate::diagnostics::set_amd_detection(seine_telemetry::AmdDetection {
+                hip_unavailable: false,
+                pci_devices: amd_pci_display_devices(),
+                ..Default::default()
+            });
+        }
+        return Ok(Vec::new());
+    }
+    let queried = {
+        let _native_call = hip_runtime_present().then(crash_guard::enter_native_call);
+        query_amd_devices()
+    };
+    let mut devices = match queried {
+        Ok(devices) => devices,
+        Err(err) => {
+            if record {
+                crate::diagnostics::set_amd_detection(seine_telemetry::AmdDetection {
+                    hip_unavailable: true,
+                    pci_devices: amd_pci_display_devices(),
+                    ..Default::default()
+                });
+            }
+            return Err(err);
+        }
+    };
+    let found = devices.len() as u32;
+    devices.retain(|device| include_integrated || !device.integrated);
+    let integrated_skipped = found - devices.len() as u32;
+    for device in &devices {
+        if !raise_perf_level || !crate::backend::amd::supports_wavefront_size(device.wavefront_size)
+        {
+            continue;
+        }
+        let outcome = crate::backend::amd::dpm::raise_performance_level(
+            &device.pci_address,
+            &device.gcn_arch_name,
+        );
+        notices.extend(crate::backend::amd::dpm::startup_notice(
+            device.index,
+            &device.name,
+            &device.pci_address,
+            &outcome,
+        ));
+    }
+    let considered = devices.len() as u32;
+    let (usable, skipped) = partition_supported_amd_devices(devices);
+    notices.extend(skipped);
+    if record {
+        crate::diagnostics::set_amd_detection(seine_telemetry::AmdDetection {
+            hip_unavailable: false,
+            found: found.min(64),
+            selected: (usable.len() as u32).min(64),
+            integrated_skipped,
+            unsupported_skipped: considered - usable.len() as u32,
+            pci_devices: amd_pci_display_devices(),
+        });
+    }
+    Ok(usable)
+}
+
+#[cfg(all(feature = "amd", any(target_os = "linux", windows)))]
+fn init_amd_crash_guard(data_dir: &Path) {
+    crate::backend::amd::crash_guard::init(data_dir);
+}
+
+#[cfg(not(all(feature = "amd", any(target_os = "linux", windows))))]
+fn init_amd_crash_guard(_data_dir: &Path) {}
+
+/// Discrete AMD display devices (vendor 0x1002, PCI class 0x03) as the OS lists
+/// them, whether or not HIP can use them. Linux only.
+#[cfg(all(feature = "amd", any(target_os = "linux", windows)))]
+fn amd_pci_display_devices() -> Option<u32> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let entries = std::fs::read_dir("/sys/bus/pci/devices").ok()?;
+    let read = |path: std::path::PathBuf| {
+        std::fs::read_to_string(path)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default()
+    };
+    let count = entries
+        .flatten()
+        .filter(|entry| {
+            read(entry.path().join("vendor")) == "0x1002"
+                && read(entry.path().join("class")).starts_with("0x03")
+                && !u16::from_str_radix(
+                    read(entry.path().join("device")).trim_start_matches("0x"),
+                    16,
+                )
+                .is_ok_and(amd_integrated_gpu_device)
+        })
+        .count();
+    Some(count.min(64) as u32)
+}
+
+/// AMD display devices built into a CPU (APU or Ryzen desktop graphics),
+/// which Seine never mines on.
+#[cfg(all(feature = "amd", any(target_os = "linux", windows)))]
+fn amd_integrated_gpu_device(device: u16) -> bool {
+    matches!(
+        device,
+        0x1304..=0x131d // Kaveri
+            | 0x9830..=0x983f // Kabini
+            | 0x9850..=0x985f // Mullins
+            | 0x9870..=0x9877 // Carrizo
+            | 0x98e4 // Stoney
+            | 0x15d8 | 0x15dd // Picasso, Raven
+            | 0x15e7 | 0x1636 | 0x1638 | 0x164c // Barcelo, Renoir, Cezanne, Lucienne
+            | 0x163f // Van Gogh
+            | 0x13fe | 0x143f // Cyan Skillfish
+            | 0x164d | 0x1681 // Rembrandt
+            | 0x164e | 0x13c0 // Raphael, Granite Ridge
+            | 0x1506 // Mendocino
+            | 0x15bf | 0x15c8 | 0x1900 | 0x1901 // Phoenix, Hawk Point
+            | 0x150e | 0x1114 | 0x1586 // Strix Point, Krackan Point, Strix Halo
+    )
+}
+
+#[cfg(not(all(feature = "amd", any(target_os = "linux", windows))))]
+pub(crate) fn detect_amd_devices(
+    _notices: &mut Vec<String>,
+    _include_integrated: bool,
+    _raise_perf_level: bool,
+) -> Result<Vec<DetectedGpu>> {
+    bail!("AMD support is not compiled into this build")
+}
+
+#[cfg(all(feature = "amd", any(target_os = "linux", windows)))]
+fn partition_supported_amd_devices(
+    devices: Vec<crate::backend::amd::AmdDeviceInfo>,
+) -> (Vec<DetectedGpu>, Vec<String>) {
+    let mut usable = Vec::new();
+    let mut skipped = Vec::new();
+    for device in devices {
+        if crate::backend::amd::supports_wavefront_size(device.wavefront_size) {
+            usable.push(DetectedGpu {
+                index: device.index,
+                name: device.name,
+                memory_total_mib: device.memory_total_mib,
+            });
+        } else {
+            skipped.push(format!(
+                "skipping AMD device {} ({}, {}): wavefront size {} is unsupported (wave32 or wave64 required)",
+                device.index, device.name, device.gcn_arch_name, device.wavefront_size
+            ));
+        }
+    }
+    (usable, skipped)
+}
+
+/// Builds user-facing startup notices for one GPU backend kind: what was
+/// detected and auto-enabled, why a forced kind fell back to a single default
+/// instance, or explicit device indices that enumeration does not report.
+fn build_gpu_detection_notices(
+    vendor: &str,
+    backend_flag: &str,
+    detection: &Result<Vec<DetectedGpu>>,
+    explicit_devices: &[u32],
+    kind_selected: bool,
+) -> Vec<String> {
+    if !kind_selected {
+        return Vec::new();
+    }
+    let mut notices = Vec::new();
+    match detection {
+        Ok(detected) if !explicit_devices.is_empty() => {
+            if !detected.is_empty() {
+                let available: Vec<u32> = detected.iter().map(|device| device.index).collect();
+                for index in dedupe_device_indexes(explicit_devices) {
+                    if !available.contains(&index) {
+                        notices.push(format!(
+                            "requested {vendor} device index {index} is not reported by device \
+                             enumeration; available: {available:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(detected) if detected.is_empty() => {
+            notices.push(format!(
+                "--backend {backend_flag} selected but no usable {vendor} devices were detected; \
+                 starting a single instance on the default device"
+            ));
+        }
+        Ok(detected) => {
+            let device_list = detected
+                .iter()
+                .map(|device| device.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            notices.push(format!(
+                "detected {} {vendor} GPU(s): {device_list}",
+                detected.len()
+            ));
+        }
+        Err(err) if explicit_devices.is_empty() => {
+            notices.push(format!(
+                "--backend {backend_flag} selected but {vendor} device enumeration failed \
+                 ({err:#}); starting a single instance on the default device"
+            ));
+        }
+        Err(_) => {}
+    }
+    notices
+}
+
+/// Estimate the memory Metal will consume so CPU auto-sizing can deduct it.
+/// Mirrors the lane-estimation logic in `MetalArgon2Engine::new()`.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn estimate_metal_memory_bytes(metal_max_lanes: Option<usize>) -> u64 {
+    const MEMORY_RESERVE_RATIO: f64 = 0.10;
+    const MAX_LANES_HARD_LIMIT: usize = 64;
+
+    let lanes = match metal_max_lanes {
+        Some(forced) => forced.min(MAX_LANES_HARD_LIMIT).max(1),
+        None => {
+            let Some(device) = metal::Device::system_default() else {
+                return 0;
+            };
+            let max_working_set = device.recommended_max_working_set_size();
+            let usable = ((max_working_set as f64) * (1.0 - MEMORY_RESERVE_RATIO)) as u64;
+            let estimated = (usable / CPU_LANE_MEMORY_BYTES) as usize;
+            estimated.min(MAX_LANES_HARD_LIMIT).max(1)
+        }
+    };
+    lanes as u64 * CPU_LANE_MEMORY_BYTES
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn estimate_metal_memory_bytes(_metal_max_lanes: Option<usize>) -> u64 {
+    0
+}
+
+fn resolve_token_with_source(
+    cli: &Cli,
+    daemon_context: Option<&DaemonContext>,
+) -> Result<(String, Option<PathBuf>)> {
+    if let Some(token) = &cli.token {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            bail!("--token is empty");
+        }
+        return Ok((trimmed.to_string(), None));
+    }
+
+    if let Some(cookie) = &cli.cookie {
+        let token = read_token_from_cookie_file(cookie)?;
+        return Ok((token, Some(cookie.clone())));
+    }
+
+    let candidates = cookie_candidates(cli, daemon_context);
+
+    for path in &candidates {
+        if let Ok(token) = read_token_from_cookie_file(path) {
+            return Ok((token, Some(path.clone())));
+        }
+    }
+
+    let searched = format_cookie_search_list(&candidates);
+    if let Some(context) = daemon_context {
+        let expected_cookie = context.data_dir.join("api.cookie");
+        let detected_api = resolve_api_url(cli.api_url.as_deref(), Some(context));
+        let config_hint = context
+            .manager_config_path
+            .as_ref()
+            .map(|path| format!("Managed config: {}\n", path.display()))
+            .unwrap_or_default();
+        if context.running {
+            bail!(
+                "detected a Blocknet daemon, but Seine could not read a usable API cookie\n\n\
+                 Source: {}\n\
+                 API: {}\n\
+                 Data dir: {}\n\
+                 Expected cookie: {}\n\
+                 {config_hint}Searched:\n{searched}\n\n\
+                 If you started Blocknet with the wrapper, use:\n  \
+                 blocknet install latest\n  \
+                 blocknet start {}\n\n\
+                 For custom layouts, override manually with:\n  \
+                 seine --mode daemon --cookie /path/to/api.cookie",
+                context.source.as_str(),
+                detected_api,
+                context.data_dir.display(),
+                expected_cookie.display(),
+                context.network.as_str(),
+            );
+        }
+
+        bail!(
+            "managed Blocknet config was detected, but the daemon cookie is not available yet\n\n\
+             Source: {}\n\
+             API: {}\n\
+             Data dir: {}\n\
+             Expected cookie: {}\n\
+             {config_hint}Searched:\n{searched}\n\n\
+             Start the daemon with:\n  \
+             blocknet install latest\n  \
+             blocknet start {}",
+            context.source.as_str(),
+            detected_api,
+            context.data_dir.display(),
+            expected_cookie.display(),
+            context.network.as_str(),
+        );
+    }
+
+    bail!(
+        "no running Blocknet daemon was detected and Seine could not find a usable API cookie\n\n\
+         Start the daemon with the wrapper-managed flow:\n  \
+         blocknet install latest\n  \
+         blocknet start {}\n\n\
+         Searched:\n{searched}\n\n\
+         For custom layouts, override manually with:\n  \
+         seine --mode daemon --cookie /path/to/api.cookie",
+        cli_requested_daemon_network(cli).as_str(),
+    );
+}
+
+fn resolve_service_token_with_source(
+    cli: &Cli,
+    daemon_context: Option<&DaemonContext>,
+) -> Result<(Option<String>, Option<PathBuf>)> {
+    if let Some(token) = &cli.token {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            bail!("--token is empty");
+        }
+        return Ok((Some(trimmed.to_string()), None));
+    }
+
+    if let Some(cookie) = &cli.cookie {
+        let token = read_token_from_cookie_file(cookie)?;
+        return Ok((Some(token), Some(cookie.clone())));
+    }
+
+    let candidates = cookie_candidates(cli, daemon_context);
+
+    for path in &candidates {
+        if let Ok(token) = read_token_from_cookie_file(path) {
+            return Ok((Some(token), Some(path.clone())));
+        }
+    }
+
+    Ok((None, None))
+}
+
+fn resolve_runtime_token_with_source(
+    cli: &Cli,
+    mode: MiningMode,
+    daemon_context: Option<&DaemonContext>,
+) -> Result<(Option<String>, Option<PathBuf>)> {
+    if mode == MiningMode::Daemon && !cli.service {
+        let (token, cookie_path) = resolve_token_with_source(cli, daemon_context)?;
+        Ok((Some(token), cookie_path))
+    } else {
+        resolve_service_token_with_source(cli, daemon_context)
+    }
+}
+
+fn resolved_cli_daemon_dir(cli: &Cli) -> PathBuf {
+    cli.daemon_dir
+        .clone()
+        .unwrap_or_else(|| cli_requested_daemon_network(cli).default_data_dir())
+}
+
+fn cli_requested_daemon_network(cli: &Cli) -> DaemonNetwork {
+    if cli.testnet {
+        DaemonNetwork::Testnet
+    } else {
+        DaemonNetwork::Mainnet
+    }
+}
+
+fn detect_daemon_context(preferred_network: Option<DaemonNetwork>) -> Option<DaemonContext> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let preferred_network = preferred_network.unwrap_or(DaemonNetwork::Mainnet);
+    let managed_config = load_bnt_config_context();
+    let managed_dir = managed_config
+        .as_ref()
+        .map(|config| config.config_dir.as_path());
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        ProcessRefreshKind::new()
+            .with_cmd(UpdateKind::Always)
+            .with_cwd(UpdateKind::Always),
+    );
+
+    for process in sys.processes().values() {
+        let name = process.name().to_str();
+        let cmd: Vec<String> = process
+            .cmd()
+            .iter()
+            .filter_map(|s| s.to_str().map(String::from))
+            .collect();
+        if !looks_like_blocknet_daemon_process(name, &cmd) {
+            continue;
+        }
+
+        let pid = process.pid().as_u32();
+        if let Some((network, _pidfile_path)) =
+            managed_dir.and_then(|config_dir| daemon_pidfile_match(config_dir, pid))
+        {
+            let data_dir = daemon_data_dir_from_cmdline(&cmd)
+                .or_else(|| {
+                    managed_config
+                        .as_ref()
+                        .map(|config| config.data_dir_for(network))
+                })
+                .unwrap_or_else(|| network.default_data_dir());
+            let data_dir = resolve_relative_daemon_path(process.cwd(), &data_dir);
+            return Some(DaemonContext {
+                network,
+                data_dir,
+                api_addr: daemon_api_addr_from_cmdline(&cmd).or_else(|| {
+                    managed_config
+                        .as_ref()
+                        .and_then(|config| config.api_addr_for(network))
+                }),
+                source: DaemonContextSource::WrapperPidfile,
+                running: true,
+                manager_config_path: managed_config
+                    .as_ref()
+                    .map(|config| config.config_path.clone()),
+            });
+        }
+
+        let network = daemon_network_from_cmdline(&cmd).unwrap_or(preferred_network);
+        if network != preferred_network {
+            continue;
+        }
+
+        return Some(DaemonContext {
+            network,
+            data_dir: resolve_relative_daemon_path(
+                process.cwd(),
+                &daemon_data_dir_from_cmdline(&cmd)
+                    .or_else(|| {
+                        managed_config
+                            .as_ref()
+                            .map(|config| config.data_dir_for(network))
+                    })
+                    .unwrap_or_else(|| network.default_data_dir()),
+            ),
+            api_addr: daemon_api_addr_from_cmdline(&cmd).or_else(|| {
+                managed_config
+                    .as_ref()
+                    .and_then(|config| config.api_addr_for(network))
+            }),
+            source: DaemonContextSource::ProcessScan,
+            running: true,
+            manager_config_path: managed_config
+                .as_ref()
+                .map(|config| config.config_path.clone()),
+        });
+    }
+
+    managed_config.as_ref().map(|config| {
+        let network = if config.enabled_networks().contains(&preferred_network) {
+            preferred_network
+        } else {
+            config.enabled_networks()[0]
+        };
+        DaemonContext {
+            network,
+            data_dir: config.data_dir_for(network),
+            api_addr: config.api_addr_for(network),
+            source: DaemonContextSource::WrapperConfig,
+            running: false,
+            manager_config_path: Some(config.config_path.clone()),
+        }
+    })
+}
+
+fn cookie_candidates(cli: &Cli, daemon_context: Option<&DaemonContext>) -> Vec<PathBuf> {
+    let requested_network = cli_requested_daemon_network(cli);
+    let managed_config = load_bnt_config_context();
+    let mut candidates = Vec::<PathBuf>::new();
+
+    if let Some(daemon_dir) = &cli.daemon_dir {
+        push_cookie_candidate(&mut candidates, daemon_dir.join("api.cookie"));
+    }
+
+    if let Some(context) = daemon_context {
+        push_cookie_candidate(&mut candidates, context.data_dir.join("api.cookie"));
+    }
+
+    if let Some(config) = managed_config.as_ref() {
+        for network in ordered_networks(requested_network) {
+            let pidfile = managed_pidfile_path(&config.config_dir, network);
+            if pidfile.exists() {
+                push_cookie_candidate(
+                    &mut candidates,
+                    config.data_dir_for(network).join("api.cookie"),
+                );
+            }
+        }
+        for network in ordered_networks(requested_network) {
+            push_cookie_candidate(
+                &mut candidates,
+                config.data_dir_for(network).join("api.cookie"),
+            );
+        }
+    } else if let Some(config_dir) = default_managed_config_dir() {
+        for network in ordered_networks(requested_network) {
+            push_cookie_candidate(
+                &mut candidates,
+                config_dir
+                    .join("data")
+                    .join(network.as_str())
+                    .join("api.cookie"),
+            );
+        }
+    }
+
+    push_cookie_candidate(
+        &mut candidates,
+        legacy_default_data_dir(requested_network).join("api.cookie"),
+    );
+    candidates
+}
+
+fn ordered_networks(requested: DaemonNetwork) -> [DaemonNetwork; 2] {
+    match requested {
+        DaemonNetwork::Mainnet => [DaemonNetwork::Mainnet, DaemonNetwork::Testnet],
+        DaemonNetwork::Testnet => [DaemonNetwork::Testnet, DaemonNetwork::Mainnet],
+    }
+}
+
+fn push_cookie_candidate(out: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !out.contains(&candidate) {
+        out.push(candidate);
+    }
+}
+
+fn format_cookie_search_list(candidates: &[PathBuf]) -> String {
+    candidates
+        .iter()
+        .map(|path| format!("  - {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn resolve_effective_daemon_data_dir(cli: &Cli, daemon_context: Option<&DaemonContext>) -> PathBuf {
+    cli.daemon_dir
+        .clone()
+        .or_else(|| daemon_context.map(|context| context.data_dir.clone()))
+        .unwrap_or_else(|| resolved_cli_daemon_dir(cli))
+}
+
+fn resolve_daemon_discovery_source(
+    cli: &Cli,
+    mode: MiningMode,
+    daemon_context: Option<&DaemonContext>,
+) -> Option<String> {
+    if cli.token.is_some() {
+        return Some("explicit-token".to_string());
+    }
+    if cli.cookie.is_some() {
+        return Some("explicit-cookie".to_string());
+    }
+    if cli.daemon_dir.is_some() {
+        return Some("explicit-daemon-dir".to_string());
+    }
+    if let Some(context) = daemon_context {
+        return Some(context.source.as_str().to_string());
+    }
+    if mode == MiningMode::Daemon || cli.service {
+        return Some(if default_managed_config_dir().is_some() {
+            "managed-default".to_string()
+        } else {
+            "legacy-default".to_string()
+        });
+    }
+    None
+}
+
+fn default_managed_config_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("BNT_CONFIG_DIR").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".config").join("bnt"))
+}
+
+fn default_managed_data_dir(network: DaemonNetwork) -> Option<PathBuf> {
+    default_managed_config_dir().map(|config_dir| config_dir.join("data").join(network.as_str()))
+}
+
+fn legacy_default_data_dir(network: DaemonNetwork) -> PathBuf {
+    match network {
+        DaemonNetwork::Mainnet => PathBuf::from(LEGACY_DEFAULT_DAEMON_DIR_MAINNET),
+        DaemonNetwork::Testnet => PathBuf::from(LEGACY_DEFAULT_DAEMON_DIR_TESTNET),
+    }
+}
+
+fn load_bnt_config_context() -> Option<BntConfigContext> {
+    let config_dir = default_managed_config_dir()?;
+    let config_path = config_dir.join("config.json");
+    let data = fs::read(&config_path).ok()?;
+    let stripped = strip_json_comments(&data);
+    let config = serde_json::from_slice::<BntConfigFile>(&stripped).ok()?;
+    Some(BntConfigContext {
+        config_dir,
+        config_path,
+        config,
+    })
+}
+
+fn strip_json_comments(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len());
+    let mut idx = 0;
+    while idx < src.len() {
+        let ch = src[idx];
+        if ch == b'"' {
+            out.push(ch);
+            idx += 1;
+            while idx < src.len() {
+                let next = src[idx];
+                out.push(next);
+                idx += 1;
+                if next == b'\\' && idx < src.len() {
+                    out.push(src[idx]);
+                    idx += 1;
+                } else if next == b'"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == b'/' && idx + 1 < src.len() && src[idx + 1] == b'/' {
+            while idx < src.len() && src[idx] != b'\n' {
+                idx += 1;
+            }
+            continue;
+        }
+        if ch == b'#' {
+            while idx < src.len() && src[idx] != b'\n' {
+                idx += 1;
+            }
+            continue;
+        }
+        out.push(ch);
+        idx += 1;
+    }
+    out
+}
+
+fn resolve_relative_daemon_path(cwd: Option<&Path>, data_dir: &Path) -> PathBuf {
+    if data_dir.is_relative() {
+        cwd.map(|dir| dir.join(data_dir))
+            .unwrap_or_else(|| data_dir.to_path_buf())
+    } else {
+        data_dir.to_path_buf()
+    }
+}
+
+fn daemon_network_from_cmdline(cmd: &[String]) -> Option<DaemonNetwork> {
+    cmd_bool_flag_is_truthy(cmd, &["--testnet", "-testnet"]).then_some(DaemonNetwork::Testnet)
+}
+
+fn daemon_pidfile_match(config_dir: &Path, pid: u32) -> Option<(DaemonNetwork, PathBuf)> {
+    for network in [DaemonNetwork::Mainnet, DaemonNetwork::Testnet] {
+        let pidfile = managed_pidfile_path(config_dir, network);
+        let Ok(raw) = fs::read_to_string(&pidfile) else {
+            continue;
+        };
+        let Ok(found_pid) = raw.trim().parse::<u32>() else {
+            continue;
+        };
+        if found_pid == pid {
+            return Some((network, pidfile));
+        }
+    }
+    None
+}
+
+fn managed_pidfile_path(config_dir: &Path, network: DaemonNetwork) -> PathBuf {
+    config_dir.join(format!("core.{}.pid", network.as_str()))
+}
+
+fn looks_like_blocknet_daemon_process(name: Option<&str>, cmd: &[String]) -> bool {
+    name.is_some_and(binary_name_matches_blocknet)
+        || cmd
+            .first()
+            .and_then(|arg0| Path::new(arg0).file_name())
+            .and_then(|basename| basename.to_str())
+            .is_some_and(binary_name_matches_blocknet)
+}
+
+fn binary_name_matches_blocknet(name: &str) -> bool {
+    name == "blocknet" || name.starts_with("blocknet-core-")
+}
+
+fn daemon_data_dir_from_cmdline(cmd: &[String]) -> Option<PathBuf> {
+    cmd_arg_value(cmd, &["--data", "--data-dir", "-datadir"]).map(PathBuf::from)
+}
+
+fn daemon_api_addr_from_cmdline(cmd: &[String]) -> Option<String> {
+    cmd_arg_value(cmd, &["--api", "-api"])
+}
+
+fn cmd_arg_value(cmd: &[String], flags: &[&str]) -> Option<String> {
+    for (idx, arg) in cmd.iter().enumerate() {
+        for flag in flags {
+            if arg == flag {
+                if let Some(value) = cmd.get(idx + 1) {
+                    if !value.trim().is_empty() && !value.starts_with('-') {
+                        return Some(value.clone());
+                    }
+                }
+            }
+            if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
+                if !value.trim().is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn cmd_bool_flag_is_truthy(cmd: &[String], flags: &[&str]) -> bool {
+    for arg in cmd {
+        for flag in flags {
+            if arg == flag {
+                return true;
+            }
+
+            if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
+                let normalized = value.trim().to_ascii_lowercase();
+                if matches!(normalized.as_str(), "1" | "true" | "t" | "yes" | "y" | "on") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+pub fn read_token_from_cookie_file(cookie_path: &Path) -> Result<String> {
+    let token = fs::read_to_string(cookie_path)
+        .with_context(|| format!("failed to read cookie file at {}", cookie_path.display()))?;
+
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        bail!("cookie file is empty: {}", cookie_path.display());
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn optional_duration_from_millis(value: u64) -> Option<Duration> {
+    if value == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(value))
+    }
+}
+
+fn resolve_api_url(cli_api_url: Option<&str>, daemon_context: Option<&DaemonContext>) -> String {
+    if let Some(input) = cli_api_url {
+        return normalize_api_url(input);
+    }
+    if let Some(context) = daemon_context {
+        if let Some(api_addr) = context.api_addr.as_deref() {
+            if let Some(url) = api_url_from_daemon_api_addr(api_addr) {
+                return url;
+            }
+        }
+    }
+    DEFAULT_API_URL.to_string()
+}
+
+fn api_url_from_daemon_api_addr(input: &str) -> Option<String> {
+    let authority = input.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    if authority.starts_with("http://") || authority.starts_with("https://") {
+        return Some(normalize_api_url(authority));
+    }
+
+    let authority = authority
+        .trim_start_matches("tcp://")
+        .split('/')
+        .next()
+        .unwrap_or(authority)
+        .trim();
+    if authority.is_empty() {
+        return None;
+    }
+
+    let (host, port) = parse_host_port(authority)?;
+    let host = match host.as_str() {
+        "" | "0.0.0.0" | "::" | "*" => "127.0.0.1".to_string(),
+        _ => host,
+    };
+    let host_for_url = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Some(format!("http://{host_for_url}:{port}"))
+}
+
+fn parse_host_port(authority: &str) -> Option<(String, u16)> {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    if authority.chars().all(|c| c.is_ascii_digit()) {
+        let port = authority.parse::<u16>().ok()?;
+        return Some(("127.0.0.1".to_string(), port));
+    }
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let closing = rest.find(']')?;
+        let host = rest[..closing].to_string();
+        let port_part = rest.get(closing + 1..)?.strip_prefix(':')?;
+        let port = port_part.parse::<u16>().ok()?;
+        return Some((host, port));
+    }
+
+    if authority.matches(':').count() == 1 {
+        let (host, port) = authority.split_once(':')?;
+        let port = port.parse::<u16>().ok()?;
+        return Some((host.to_string(), port));
+    }
+
+    // IPv6 addresses without brackets (for example ::1:8332)
+    let (host, port) = authority.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    Some((host.to_string(), port))
+}
+
+fn is_loopback_bind(bind: &str) -> bool {
+    let trimmed = bind.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if let Ok(socket_addr) = trimmed.parse::<std::net::SocketAddr>() {
+        return socket_addr.ip().is_loopback();
+    }
+
+    let Some((host, _)) = parse_host_port(trimmed) else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']).trim().to_ascii_lowercase();
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1")
+}
+
+fn normalize_api_url(input: &str) -> String {
+    let trimmed = input.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return trimmed.to_string();
+    }
+    format!("http://{trimmed}")
+}
+
+fn normalize_pool_url(input: &str) -> Option<String> {
+    crate::pool::normalize_pool_urls(input).ok()
+}
+
+impl Cli {
+    /// Folds the launch-template conventions shared with other miners into
+    /// seine's own options: repeated or comma-separated `-o` pool URLs and a
+    /// `-u ADDRESS.WORKER` login. An explicit `--pool-worker` wins.
+    fn apply_miner_style_args(&mut self) {
+        let urls = self
+            .pool_url_args
+            .iter()
+            .map(|url| url.trim())
+            .filter(|url| !url.is_empty())
+            .collect::<Vec<_>>();
+        if !urls.is_empty() {
+            self.pool_url = Some(urls.join(","));
+        }
+        if let Some((address, worker)) = self
+            .mining_address
+            .as_deref()
+            .and_then(split_address_worker)
+        {
+            if self.pool_worker.is_none() {
+                self.pool_worker = Some(worker.to_string());
+            }
+            self.mining_address = Some(address.to_string());
+        }
+    }
+}
+
+/// Splits `ADDRESS.WORKER`. Shortnames may contain dots, so only plain
+/// addresses are split.
+fn split_address_worker(value: &str) -> Option<(&str, &str)> {
+    let value = value.trim();
+    if crate::shortname::split_solo(value)
+        .1
+        .starts_with(['@', '$'])
+    {
+        return None;
+    }
+    let (address, worker) = value.split_once('.')?;
+    let worker = worker.trim();
+    (!address.is_empty() && !worker.is_empty()).then_some((address.trim(), worker))
+}
+
+fn validate_saved_memo_override(cli: &Cli, saved: Option<&UserConfig>) -> Result<()> {
+    if let Some(saved) = saved {
+        if saved.payout_memo.is_some()
+            && cli.payout_memo.is_none()
+            && !cli.no_payout_memo
+            && cli.mining_address.as_deref().is_some_and(|address| {
+                Some(address.trim()) != saved.address.as_deref().map(str::trim)
+            })
+        {
+            bail!(
+                "changing an address with a saved memo requires --payout-memo or --no-payout-memo"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_payout_memo_config(cli: &Cli) -> Result<()> {
+    if let Some(memo) = &cli.payout_memo {
+        crate::payout_destination::validate_memo(memo)?;
+        if cli.mode == Some(MiningMode::Daemon) || cli.proxy_listen.is_some() {
+            bail!("payout memos require a direct pool connection; solo mode and farm proxy hosting are not supported");
+        }
+        if let Some(address) = &cli.mining_address {
+            crate::address::validate_mining_address(crate::shortname::split_solo(address).1)
+                .map_err(anyhow::Error::msg)
+                .context("use the full exchange deposit address with --payout-memo")?;
+        }
+    }
+    Ok(())
+}
+
+fn apply_user_config_defaults(cli: &mut Cli, user_cfg: Option<&UserConfig>) {
+    if let Some(user_cfg) = user_cfg {
+        if cli.payout_memo.is_none() && !cli.no_payout_memo {
+            cli.payout_memo = user_cfg.payout_memo.clone();
+        }
+        if cli.mode.is_none() {
+            cli.mode = user_cfg.mode;
+        }
+        if cli.mining_address.is_none() {
+            cli.mining_address = user_cfg.address.clone();
+        }
+        if cli.pool_url.is_none() {
+            cli.pool_url = user_cfg.pool_url.clone();
+        }
+        if cli.pool_worker.is_none() {
+            cli.pool_worker = user_cfg.pool_worker.clone();
+        }
+    }
+
+    if cli.mode.is_none() {
+        cli.mode = Some(MiningMode::Pool);
+    }
+}
+
+fn should_validate_pool_mode_inputs(cli: &Cli) -> bool {
+    !cli.bench && cli.mode.unwrap_or(MiningMode::Pool) == MiningMode::Pool
+}
+
+fn resolve_required_payout_memo(
+    cli: &mut Cli,
+    interactive: bool,
+    input: &mut impl io::BufRead,
+    output: &mut impl Write,
+) -> Result<bool> {
+    if cli.bench || cli.payout_memo.is_some() {
+        return Ok(false);
+    }
+    let Some(exchange) = cli
+        .mining_address
+        .as_deref()
+        .and_then(crate::payout_destination::known_exchange)
+    else {
+        return Ok(false);
+    };
+    if cli.mode.unwrap_or(MiningMode::Pool) != MiningMode::Pool || cli.proxy_listen.is_some() {
+        bail!(
+            "this shared exchange address requires memo payouts through a direct pool connection"
+        );
+    }
+    if !interactive || cli.service || cli.no_payout_memo {
+        bail!("this shared exchange address requires a memo; use --payout-memo with the memo from your deposit page");
+    }
+    writeln!(output, "{exchange} requires a deposit memo.")?;
+    loop {
+        write!(output, "Enter your deposit memo: ")?;
+        output.flush()?;
+        let mut memo = String::new();
+        if input.read_line(&mut memo)? == 0 {
+            bail!("a deposit memo is required");
+        }
+        let memo = memo.trim_end_matches(['\r', '\n']).to_string();
+        match crate::payout_destination::validate_memo(&memo) {
+            Ok(()) => {
+                cli.payout_memo = Some(memo);
+                validate_payout_memo_config(cli)?;
+                return Ok(true);
+            }
+            Err(error) => writeln!(output, "{error}")?,
+        }
+    }
+}
+
+/// The full-screen form when one can be shown; otherwise the line prompt in
+/// `resolve_required_payout_memo` handles it. Returns true once a memo is entered.
+fn prompt_payout_memo_on_screen(cli: &mut Cli) -> Result<bool> {
+    if !screen_prompts_available(cli)
+        || cli.bench
+        || cli.service
+        || cli.no_payout_memo
+        || cli.payout_memo.is_some()
+        || cli.proxy_listen.is_some()
+        || cli.mode.unwrap_or(MiningMode::Pool) != MiningMode::Pool
+    {
+        return Ok(false);
+    }
+    let Some(exchange) = cli
+        .mining_address
+        .as_deref()
+        .and_then(crate::payout_destination::known_exchange)
+    else {
+        return Ok(false);
+    };
+    let help = format!("{exchange} requires the deposit memo shown on your deposit page.");
+    let memo = crate::miner::prompt_screen(crate::miner::PromptSpec {
+        help: &help,
+        label: "Deposit memo",
+        initial: "",
+        validate: &|value| {
+            crate::payout_destination::validate_memo(value).map_err(|err| err.to_string())
+        },
+    })?;
+    cli.payout_memo = Some(memo);
+    validate_payout_memo_config(cli)?;
+    Ok(true)
+}
+
+fn screen_prompts_available(cli: &Cli) -> bool {
+    io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && crate::miner::ui_mode_enables_tui(cli.ui)
+}
+
+fn persist_prompted_payout_memo(
+    cli: &Cli,
+    saved: Option<&mut UserConfig>,
+    path: &Path,
+) -> Result<()> {
+    // A command-line destination override must not change the saved destination.
+    if let Some(saved) = saved {
+        if saved.address.as_deref().map(str::trim) == cli.mining_address.as_deref().map(str::trim) {
+            saved.payout_memo = cli.payout_memo.clone();
+            write_user_config(path, saved)?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_first_run_pool_inputs(cli: &mut Cli, user_config_path: &Path) -> Result<()> {
+    let mode = cli.mode.unwrap_or(MiningMode::Pool);
+    cli.mode = Some(mode);
+    if mode != MiningMode::Pool {
+        return Ok(());
+    }
+
+    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+
+    if cli
+        .mining_address
+        .as_ref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        if !interactive {
+            bail!(
+                "pool mode first startup requires an address in non-interactive mode.\n\
+                 Provide --address and --pool-url, or create {} manually.",
+                user_config_path.display()
+            );
+        }
+        let address = if screen_prompts_available(cli) {
+            crate::miner::prompt_screen(crate::miner::PromptSpec {
+                help: "Welcome to seine. Mining rewards are paid to your Blocknet wallet.",
+                label: "Your address or shortname (@name / $name)",
+                initial: "",
+                validate: &|value| {
+                    validate_destination(value).map_err(|_| {
+                        "That is not a Blocknet address. Paste the whole address, or use @name."
+                            .to_string()
+                    })
+                },
+            })?
+        } else {
+            prompt_required_value(
+                "Enter your Blocknet address or shortname (@name / $name): ",
+                None,
+            )?
+        };
+        cli.mining_address = Some(address);
+    }
+
+    if !prompt_payout_memo_on_screen(cli)? {
+        resolve_required_payout_memo(cli, interactive, &mut io::stdin().lock(), &mut io::stderr())?;
+    }
+    if cli
+        .pool_url
+        .as_ref()
+        .and_then(|value| normalize_pool_url(value))
+        .is_none()
+    {
+        if !interactive {
+            bail!(
+                "pool mode first startup requires --pool-url in non-interactive mode.\n\
+                 Provide --address and --pool-url, or create {} manually.",
+                user_config_path.display()
+            );
+        }
+        let pool_url = if screen_prompts_available(cli) {
+            crate::miner::prompt_screen(crate::miner::PromptSpec {
+                help: "Press Enter to mine on the default pool, or type another.",
+                label: "Pool",
+                initial: DEFAULT_POOL_URL,
+                validate: &|value| {
+                    normalize_pool_url(value).map(|_| ()).ok_or_else(|| {
+                        "Enter a pool as host:port or stratum+tcp://host:port".to_string()
+                    })
+                },
+            })?
+        } else {
+            prompt_required_value(
+                "Enter pool URL [default: stratum+tcp://bntpool.com:3333]: ",
+                Some(DEFAULT_POOL_URL),
+            )?
+        };
+        cli.pool_url = Some(pool_url);
+    }
+
+    if cli
+        .pool_worker
+        .as_ref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        cli.pool_worker = Some(generate_default_pool_worker());
+    }
+
+    Ok(())
+}
+
+fn ensure_pool_mode_inputs_available(cli: &Cli, user_config_path: &Path) -> Result<()> {
+    let mode = cli.mode.unwrap_or(MiningMode::Pool);
+    if mode != MiningMode::Pool {
+        return Ok(());
+    }
+    if cli
+        .mining_address
+        .as_ref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        bail!(
+            "pool mode requires a mining address.\n\
+             Pass --address or edit {}.",
+            user_config_path.display()
+        );
+    }
+    if cli
+        .pool_url
+        .as_ref()
+        .and_then(|value| normalize_pool_url(value))
+        .is_none()
+    {
+        bail!(
+            "pool mode requires a valid pool URL.\n\
+             Pass --pool-url (host:port, stratum+tcp://host:port or stratum+ssl://host:port) or edit {}.",
+            user_config_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_cli_mining_address(cli: &Cli, label: &str) -> Result<()> {
+    if let Some(address) = cli.mining_address.as_ref() {
+        if address.trim().is_empty() {
+            bail!("{label} is empty");
+        }
+        validate_destination(address).map_err(|err| anyhow::anyhow!("invalid {label}: {err}"))?;
+    }
+    Ok(())
+}
+
+fn persist_bootstrap_user_config(
+    cli: &Cli,
+    user_config_path: &Path,
+    dev_fee_pool_worker: &str,
+) -> Result<()> {
+    validate_payout_memo_config(cli)?;
+    let mode = cli.mode.unwrap_or(MiningMode::Pool);
+    let cfg = UserConfig {
+        schema_version: USER_CONFIG_SCHEMA_VERSION,
+        mode: Some(mode),
+        payout_memo: cli.payout_memo.clone(),
+        address: cli
+            .mining_address
+            .as_ref()
+            .map(|value| value.trim().to_string()),
+        pool_url: cli.pool_url.as_deref().and_then(normalize_pool_url),
+        pool_worker: cli
+            .pool_worker
+            .as_ref()
+            .map(|value| value.trim().to_string()),
+        dev_fee_pool_worker: Some(dev_fee_pool_worker.to_string()),
+    };
+    write_user_config(user_config_path, &cfg)
+}
+
+fn persist_user_config_with_dev_fee_pool_worker(
+    existing: Option<&UserConfig>,
+    cli: &Cli,
+    user_config_path: &Path,
+    dev_fee_pool_worker: &str,
+) -> Result<()> {
+    if let Some(existing) = existing {
+        let mut cfg = existing.clone();
+        if cfg.schema_version == 0 {
+            cfg.schema_version = USER_CONFIG_SCHEMA_VERSION;
+        }
+        cfg.dev_fee_pool_worker = Some(dev_fee_pool_worker.to_string());
+        return write_user_config(user_config_path, &cfg);
+    }
+    persist_bootstrap_user_config(cli, user_config_path, dev_fee_pool_worker)
+}
+
+fn prompt_required_value(prompt: &str, default: Option<&str>) -> Result<String> {
+    loop {
+        write!(io::stderr(), "{prompt}")?;
+        io::stderr().flush()?;
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .context("failed reading user input")?;
+        let value = line.trim();
+        if value.is_empty() {
+            if let Some(default) = default {
+                return Ok(default.to_string());
+            }
+            continue;
+        }
+        return Ok(value.to_string());
+    }
+}
+
+fn generate_default_pool_worker() -> String {
+    let mut buf = [0u8; 2];
+    if getrandom::getrandom(&mut buf).is_ok() {
+        let value = u16::from_le_bytes(buf) % 10_000;
+        return format!("seine-{value:04}");
+    }
+    format!("seine-{:04}", default_nonce_seed() as u16 % 10_000)
+}
+
+fn generate_default_dev_fee_pool_worker() -> String {
+    let mut buf = [0u8; 4];
+    if getrandom::getrandom(&mut buf).is_ok() {
+        let value = u32::from_le_bytes(buf);
+        return format!("{DEFAULT_DEV_FEE_POOL_WORKER_PREFIX}-{value:08x}");
+    }
+    format!(
+        "{DEFAULT_DEV_FEE_POOL_WORKER_PREFIX}-{:08x}",
+        default_nonce_seed() as u32
+    )
+}
+
+fn default_nonce_seed() -> u64 {
+    let mut buf = [0u8; 8];
+    getrandom::getrandom(&mut buf).expect("OS randomness should be available");
+    u64::from_le_bytes(buf)
+}
+
+fn dedupe_device_indexes(device_indexes: &[u32]) -> Vec<u32> {
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::with_capacity(device_indexes.len());
+    for device_index in device_indexes {
+        if seen.insert(*device_index) {
+            ordered.push(*device_index);
+        }
+    }
+    ordered
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackendExpansionOptions<'a> {
+    default_cpu_threads: usize,
+    default_cpu_affinity: CpuAffinityMode,
+    cpu_threads_per_instance: &'a [usize],
+    cpu_affinity_per_instance: &'a [CpuAffinityMode],
+    backend_assign_timeout_ms_per_instance: &'a [u64],
+    backend_control_timeout_ms_per_instance: &'a [u64],
+    backend_assign_timeout_strikes_per_instance: &'a [u32],
+}
+
+/// Suffix for per-instance flag length-mismatch errors: auto-expansion changes
+/// the instance count versus older single-instance defaults, so scripts with
+/// hardcoded per-instance lists need to know where the extra instances came from.
+fn auto_expansion_hint(nvidia_auto_instances: usize, amd_auto_instances: usize) -> String {
+    let mut parts = Vec::new();
+    if nvidia_auto_instances > 0 {
+        parts.push(format!(
+            "{nvidia_auto_instances} nvidia instance(s) were auto-expanded from detected GPUs; \
+             pass --nvidia-devices to pin the instance count"
+        ));
+    }
+    if amd_auto_instances > 0 {
+        parts.push(format!(
+            "{amd_auto_instances} amd instance(s) were auto-expanded from detected GPUs; \
+             pass --amd-devices to pin the instance count"
+        ));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" (note: {})", parts.join("; "))
+    }
+}
+
+fn bare_backend_spec(kind: BackendKind, device_index: Option<u32>) -> BackendSpec {
+    BackendSpec {
+        kind,
+        device_index,
+        cpu_threads: None,
+        cpu_affinity: None,
+        assign_timeout_override: None,
+        control_timeout_override: None,
+        assign_timeout_strikes_override: None,
+    }
+}
+
+/// Pushes one spec per device for a GPU backend kind. An explicit device list
+/// always wins over the auto-detected list; with neither, a single unpinned
+/// spec is pushed and the backend binds its default device at start. Returns
+/// how many instances came from auto-detection.
+fn push_gpu_backend_specs(
+    specs: &mut Vec<BackendSpec>,
+    kind: BackendKind,
+    explicit_devices: &[u32],
+    auto_devices: &[u32],
+) -> usize {
+    let (devices, auto) = if explicit_devices.is_empty() {
+        (auto_devices, true)
+    } else {
+        (explicit_devices, false)
+    };
+    if devices.is_empty() {
+        specs.push(bare_backend_spec(kind, None));
+        return 0;
+    }
+    for device_index in devices {
+        specs.push(bare_backend_spec(kind, Some(*device_index)));
+    }
+    if auto {
+        devices.len()
+    } else {
+        0
+    }
+}
+
+fn expand_backend_specs(
+    backends: &[BackendKind],
+    nvidia_devices: &[u32],
+    amd_devices: &[u32],
+    auto_nvidia_devices: &[u32],
+    auto_amd_devices: &[u32],
+    options: BackendExpansionOptions<'_>,
+) -> Result<Vec<BackendSpec>> {
+    if !nvidia_devices.is_empty() && !backends.contains(&BackendKind::Nvidia) {
+        bail!("--nvidia-devices requires selecting nvidia in --backend");
+    }
+    if !amd_devices.is_empty() && !backends.contains(&BackendKind::Amd) {
+        bail!("--amd-devices requires selecting amd in --backend");
+    }
+
+    let nvidia_devices = dedupe_device_indexes(nvidia_devices);
+    let amd_devices = dedupe_device_indexes(amd_devices);
+    let auto_nvidia_devices = dedupe_device_indexes(auto_nvidia_devices);
+    let auto_amd_devices = dedupe_device_indexes(auto_amd_devices);
+    let mut nvidia_auto_instances = 0usize;
+    let mut amd_auto_instances = 0usize;
+    let mut specs = Vec::new();
+    for backend in backends {
+        match backend {
+            BackendKind::Cpu => specs.push(bare_backend_spec(BackendKind::Cpu, None)),
+            BackendKind::Nvidia => {
+                nvidia_auto_instances += push_gpu_backend_specs(
+                    &mut specs,
+                    BackendKind::Nvidia,
+                    &nvidia_devices,
+                    &auto_nvidia_devices,
+                );
+            }
+            BackendKind::Amd => {
+                amd_auto_instances += push_gpu_backend_specs(
+                    &mut specs,
+                    BackendKind::Amd,
+                    &amd_devices,
+                    &auto_amd_devices,
+                );
+            }
+            BackendKind::Metal => specs.push(bare_backend_spec(BackendKind::Metal, None)),
+        }
+    }
+
+    if specs.is_empty() {
+        bail!("at least one backend is required");
+    }
+
+    let cpu_instance_indexes = specs
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, spec)| (spec.kind == BackendKind::Cpu).then_some(idx))
+        .collect::<Vec<_>>();
+
+    if !options.cpu_threads_per_instance.is_empty()
+        && options.cpu_threads_per_instance.len() != cpu_instance_indexes.len()
+    {
+        bail!(
+            "--cpu-threads-per-instance length ({}) must match CPU backend instances ({})",
+            options.cpu_threads_per_instance.len(),
+            cpu_instance_indexes.len()
+        );
+    }
+    if !options.cpu_affinity_per_instance.is_empty()
+        && options.cpu_affinity_per_instance.len() != cpu_instance_indexes.len()
+    {
+        bail!(
+            "--cpu-affinity-per-instance length ({}) must match CPU backend instances ({})",
+            options.cpu_affinity_per_instance.len(),
+            cpu_instance_indexes.len()
+        );
+    }
+
+    for (cpu_idx, spec_idx) in cpu_instance_indexes.iter().copied().enumerate() {
+        let threads = options
+            .cpu_threads_per_instance
+            .get(cpu_idx)
+            .copied()
+            .unwrap_or(options.default_cpu_threads)
+            .max(1);
+        let affinity = options
+            .cpu_affinity_per_instance
+            .get(cpu_idx)
+            .copied()
+            .unwrap_or(options.default_cpu_affinity);
+        specs[spec_idx].cpu_threads = Some(threads);
+        specs[spec_idx].cpu_affinity = Some(affinity);
+    }
+
+    let instance_count = specs.len();
+    let auto_expansion_hint = auto_expansion_hint(nvidia_auto_instances, amd_auto_instances);
+    if !options.backend_assign_timeout_ms_per_instance.is_empty()
+        && options.backend_assign_timeout_ms_per_instance.len() != instance_count
+    {
+        bail!(
+            "--backend-assign-timeout-ms-per-instance length ({}) must match backend instances ({}){}",
+            options.backend_assign_timeout_ms_per_instance.len(),
+            instance_count,
+            auto_expansion_hint
+        );
+    }
+    if !options.backend_control_timeout_ms_per_instance.is_empty()
+        && options.backend_control_timeout_ms_per_instance.len() != instance_count
+    {
+        bail!(
+            "--backend-control-timeout-ms-per-instance length ({}) must match backend instances ({}){}",
+            options.backend_control_timeout_ms_per_instance.len(),
+            instance_count,
+            auto_expansion_hint
+        );
+    }
+    if !options
+        .backend_assign_timeout_strikes_per_instance
+        .is_empty()
+        && options.backend_assign_timeout_strikes_per_instance.len() != instance_count
+    {
+        bail!(
+            "--backend-assign-timeout-strikes-per-instance length ({}) must match backend instances ({}){}",
+            options.backend_assign_timeout_strikes_per_instance.len(),
+            instance_count,
+            auto_expansion_hint
+        );
+    }
+
+    for (idx, spec) in specs.iter_mut().enumerate() {
+        spec.assign_timeout_override = options
+            .backend_assign_timeout_ms_per_instance
+            .get(idx)
+            .map(|value| Duration::from_millis(*value));
+        spec.control_timeout_override = options
+            .backend_control_timeout_ms_per_instance
+            .get(idx)
+            .map(|value| Duration::from_millis(*value));
+        spec.assign_timeout_strikes_override = options
+            .backend_assign_timeout_strikes_per_instance
+            .get(idx)
+            .copied();
+    }
+
+    Ok(specs)
+}
+
+/// Returns the number of performance (P) cores on macOS Apple Silicon.
+/// Uses `sysctlbyname("hw.perflevel0.logicalcpu")` which returns the P-core
+/// count on heterogeneous (big.LITTLE) Apple Silicon SoCs.  Falls back to
+/// `None` on non-macOS, Intel Macs (no perflevels), or if the query fails.
+#[allow(dead_code)]
+fn pcore_count() -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn sysctlbyname(
+                name: *const u8,
+                oldp: *mut std::ffi::c_void,
+                oldlenp: *mut usize,
+                newp: *const std::ffi::c_void,
+                newlen: usize,
+            ) -> i32;
+        }
+        let mut val: u32 = 0;
+        let mut len = std::mem::size_of::<u32>();
+        let name = b"hw.perflevel0.logicalcpu\0";
+        let ret = unsafe {
+            sysctlbyname(
+                name.as_ptr(),
+                &mut val as *mut u32 as *mut std::ffi::c_void,
+                &mut len,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if ret == 0 && val > 0 {
+            Some(val as usize)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+fn logical_cpu_parallelism() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .max(1);
+    #[cfg(target_os = "linux")]
+    {
+        with_fractional_quota(available, linux_cgroup_cpu_quota(), linux_affinity_count())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        available
+    }
+}
+
+/// `available_parallelism` rounds a fractional CPU quota down, which leaves part of the
+/// quota unused. Count the partial CPU as a worker slot, within the CPUs this process
+/// may run on. Automatic tuning still decides whether that worker is worth running.
+#[cfg(any(target_os = "linux", test))]
+fn with_fractional_quota(available: usize, quota: Option<f64>, affinity: Option<usize>) -> usize {
+    let rounded_up = match quota {
+        Some(cpus) if cpus.fract() > 0.0 && cpus.floor() as usize == available => available + 1,
+        _ => return available,
+    };
+    affinity.map_or(available, |allowed| rounded_up.min(allowed).max(available))
+}
+
+/// CPUs allowed by `cpu.max` or `cpu.cfs_quota_us`, the tightest along the hierarchy.
+#[cfg(target_os = "linux")]
+fn linux_cgroup_cpu_quota() -> Option<f64> {
+    let mut tightest: Option<f64> = None;
+    if let Some(mut dir) = linux_cgroup_v2_path() {
+        loop {
+            if let Some(cpus) = fs::read_to_string(dir.join("cpu.max"))
+                .ok()
+                .and_then(|raw| parse_cgroup_v2_cpu_max(&raw))
+            {
+                tightest = Some(tightest.map_or(cpus, |t: f64| t.min(cpus)));
+            }
+            if dir == std::path::Path::new("/sys/fs/cgroup") || !dir.pop() {
+                break;
+            }
+        }
+    }
+    if tightest.is_some() {
+        return tightest;
+    }
+    ["/sys/fs/cgroup/cpu", "/sys/fs/cgroup/cpu,cpuacct"]
+        .iter()
+        .find_map(|root| {
+            let read = |name: &str| fs::read_to_string(format!("{root}/{name}")).ok();
+            parse_cgroup_v1_cpu_quota(&read("cpu.cfs_quota_us")?, &read("cpu.cfs_period_us")?)
+        })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_v2_cpu_max(raw: &str) -> Option<f64> {
+    let mut parts = raw.split_whitespace();
+    let quota: f64 = parts.next()?.parse().ok()?;
+    let period: f64 = parts.next().unwrap_or("100000").parse().ok()?;
+    (quota > 0.0 && period > 0.0).then_some(quota / period)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_v1_cpu_quota(quota: &str, period: &str) -> Option<f64> {
+    let quota: f64 = quota.trim().parse().ok()?;
+    let period: f64 = period.trim().parse().ok()?;
+    (quota > 0.0 && period > 0.0).then_some(quota / period)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_affinity_count() -> Option<usize> {
+    // SAFETY: the set is zero-initialized and sized for this call.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        (libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0)
+            .then(|| libc::CPU_COUNT(&set) as usize)
+    }
+}
+
+#[allow(dead_code)]
+fn macos_hybrid_pcore_parallelism_cap(pcore_count: usize, logical_parallelism: usize) -> usize {
+    let logical_parallelism = logical_parallelism.max(1);
+    let pcore_count = pcore_count.max(1).min(logical_parallelism);
+    let non_pcore_count = logical_parallelism.saturating_sub(pcore_count);
+    // Keep a balanced hybrid-core ceiling without stepping all the way into full logical-core
+    // usage, which has shown memory pressure and unstable behavior on some Macs.
+    pcore_count.saturating_add(non_pcore_count / 2).max(1)
+}
+
+fn cpu_parallelism_cap(affinity: CpuAffinityMode) -> usize {
+    let logical_parallelism = logical_cpu_parallelism();
+    #[cfg(target_os = "macos")]
+    {
+        if affinity == CpuAffinityMode::PcoreOnly {
+            if let Some(pcore_count) = pcore_count() {
+                return macos_hybrid_pcore_parallelism_cap(pcore_count, logical_parallelism);
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = affinity;
+    }
+    logical_parallelism
+}
+
+/// Explicit `--threads` without any tuning flag, on a host whose cohort has no
+/// validated kernel default, runs kernel comparisons at the fixed count.
+fn pinned_kernel_trials_wanted(
+    explicit_threads: bool,
+    instances: usize,
+    per_instance_overrides: bool,
+    autotune_threads: bool,
+    disable_autotune: bool,
+    bench: bool,
+) -> bool {
+    explicit_threads
+        && instances > 0
+        && !per_instance_overrides
+        && !autotune_threads
+        && !disable_autotune
+        && !bench
+}
+
+fn cpu_autotune_enabled(cli: &Cli, instances: usize) -> bool {
+    !cli.disable_cpu_autotune_threads
+        && (cli.cpu_autotune_threads
+            || (instances > 0 && cli.threads.is_none() && cli.cpu_threads_per_instance.is_empty()))
+}
+
+fn auto_cpu_threads(
+    cpu_backend_instances: usize,
+    gpu_memory_reservation: u64,
+    affinity: CpuAffinityMode,
+    page_mode: CpuPageMode,
+    reserve_percent: Option<u8>,
+) -> usize {
+    let cpu_parallelism = cpu_parallelism_cap(affinity);
+    let memory_cap_total = detect_memory_budget_bytes(page_mode)
+        .map(|budget| {
+            let available = auto_cpu_memory_bytes(budget, gpu_memory_reservation, reserve_percent);
+            (available / CPU_LANE_MEMORY_BYTES) as usize
+        })
+        .unwrap_or(cpu_parallelism)
+        .max(1);
+    let total_lanes_cap = cpu_parallelism.min(memory_cap_total).max(1);
+    distribute_auto_cpu_threads(total_lanes_cap, cpu_backend_instances)
+}
+
+// RAM kept free by automatic sizing, as a share of the effective (cgroup-aware)
+// total; free memory already excludes what the OS uses. The default is 5%, at most
+// 1 GiB, and at most 512 MiB on hosts with 16 GiB or more.
+fn memory_reserve_bytes(effective_total: u64, reserve_percent: Option<u8>) -> u64 {
+    match reserve_percent {
+        Some(percent) => effective_total / 100 * u64::from(percent),
+        None => (effective_total / 100 * 5).min(default_reserve_cap(effective_total)),
+    }
+}
+
+fn default_reserve_cap(effective_total: u64) -> u64 {
+    if effective_total >= 16 * 1024 * 1024 * 1024 {
+        512 * 1024 * 1024
+    } else {
+        1024 * 1024 * 1024
+    }
+}
+
+fn auto_cpu_memory_bytes(
+    budget: MemoryBudgetBytes,
+    gpu_memory_reservation: u64,
+    reserve_percent: Option<u8>,
+) -> u64 {
+    let reserve = memory_reserve_bytes(budget.effective_total, reserve_percent);
+    budget
+        .effective_available
+        .saturating_sub(gpu_memory_reservation)
+        .saturating_sub(reserve)
+}
+
+// Telemetry shows large fleets pinned far below capacity (for example
+// --threads 3 on 16-core hosts with free RAM for 11 workers).
+fn underused_threads_notice(
+    threads: Option<usize>,
+    cpu_backend_instances: usize,
+    cpu_autotune_threads: bool,
+    auto_threads_cap: usize,
+) -> Option<String> {
+    let threads = threads?;
+    (cpu_backend_instances > 0 && !cpu_autotune_threads && threads.saturating_mul(2) <= auto_threads_cap)
+        .then(|| {
+            format!(
+                "--threads {threads} is under half of the {auto_threads_cap} this machine can run; omit --threads for more hashrate"
+            )
+        })
+}
+
+/// WSL2 gives its Linux VM half of the PC's RAM by default, so desktops with the
+/// cores for a dozen workers often fit three. Name the two fixes once at startup.
+fn wsl_sizing_notice_for(
+    cpu_backend_instances: usize,
+    gpu_memory_reservation: u64,
+    affinity: CpuAffinityMode,
+    page_mode: CpuPageMode,
+    reserve_percent: Option<u8>,
+) -> Option<String> {
+    if cpu_backend_instances == 0 {
+        return None;
+    }
+    let runtime_environment = crate::runtime_identity::runtime_environment();
+    if runtime_environment != "wsl2" {
+        return None;
+    }
+    let budget = detect_memory_budget_bytes(page_mode)?;
+    let memory_lanes = (auto_cpu_memory_bytes(budget, gpu_memory_reservation, reserve_percent)
+        / CPU_LANE_MEMORY_BYTES) as usize;
+    wsl_sizing_notice(
+        &runtime_environment,
+        cpu_backend_instances,
+        memory_lanes,
+        cpu_parallelism_cap(affinity),
+        budget.effective_total,
+    )
+}
+
+fn wsl_sizing_notice(
+    runtime_environment: &str,
+    cpu_backend_instances: usize,
+    memory_lanes: usize,
+    cpu_lanes: usize,
+    effective_total_bytes: u64,
+) -> Option<String> {
+    if runtime_environment != "wsl2" || cpu_backend_instances == 0 || memory_lanes >= cpu_lanes {
+        return None;
+    }
+    let gib = |bytes: u64| bytes.div_ceil(1024 * 1024 * 1024);
+    let needed_gib = gib(CPU_LANE_MEMORY_BYTES.saturating_mul(cpu_lanes as u64)) + 2;
+    Some(format!(
+        "WSL2 gives this VM {} GiB of RAM, enough for {memory_lanes} of {cpu_lanes} CPU threads. For more, set memory={needed_gib}GB under [wsl2] in %UserProfile%\\.wslconfig and run `wsl --shutdown`, or use the Windows build.",
+        gib(effective_total_bytes)
+    ))
+}
+
+fn distribute_auto_cpu_threads(total_lanes_cap: usize, cpu_backend_instances: usize) -> usize {
+    let lanes = total_lanes_cap.max(1);
+    let instances = cpu_backend_instances.max(1);
+    (lanes / instances).max(1)
+}
+
+fn validate_cpu_memory(
+    backend_specs: &[BackendSpec],
+    threads: usize,
+    allow_oversubscribe: bool,
+    gpu_memory_reservation: u64,
+    page_mode: CpuPageMode,
+) -> Result<()> {
+    let cpu_lane_configs = backend_specs
+        .iter()
+        .filter(|spec| spec.kind == BackendKind::Cpu)
+        .map(|spec| spec.cpu_threads.unwrap_or(threads).max(1) as u64)
+        .collect::<Vec<_>>();
+    if cpu_lane_configs.is_empty() {
+        return Ok(());
+    }
+
+    let total_cpu_lanes = cpu_lane_configs
+        .iter()
+        .fold(0u64, |acc, lanes| acc.saturating_add(*lanes));
+    let cpu_required = CPU_LANE_MEMORY_BYTES.saturating_mul(total_cpu_lanes);
+    let required = cpu_required.saturating_add(gpu_memory_reservation);
+    let Some(budget) = detect_memory_budget_bytes(page_mode) else {
+        return Ok(());
+    };
+
+    let gpu_note = if gpu_memory_reservation > 0 {
+        format!(
+            " + ~{} GPU/Metal reservation",
+            human_bytes(gpu_memory_reservation)
+        )
+    } else {
+        String::new()
+    };
+
+    if required > budget.effective_total && !allow_oversubscribe {
+        bail!(
+            "configured CPU lanes need ~{} RAM ({} CPU lane(s) * 2GB){}, but effective memory limit is ~{}. Use fewer CPU lanes or pass --allow-oversubscribe to bypass this safety check.",
+            human_bytes(cpu_required),
+            total_cpu_lanes,
+            gpu_note,
+            human_bytes(budget.effective_total),
+        );
+    }
+
+    if required > budget.effective_available && !allow_oversubscribe {
+        bail!(
+            "configured CPU lanes need ~{} RAM ({} CPU lane(s) * 2GB){}, but currently available memory is ~{} (effective limit ~{}). Reduce CPU lanes or pass --allow-oversubscribe if you accept potential swap/OOM risk.",
+            human_bytes(cpu_required),
+            total_cpu_lanes,
+            gpu_note,
+            human_bytes(budget.effective_available),
+            human_bytes(budget.effective_total),
+        );
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MemoryBudgetBytes {
+    effective_total: u64,
+    effective_available: u64,
+}
+
+/// Search/cache maximum from CPU availability and instance count only.
+/// Dynamic RAM limits govern active arenas, never the fixed nonce-lane stride.
+pub(crate) fn cpu_autotune_worker_ceiling(cfg: &Config) -> usize {
+    let instances = cfg
+        .backend_specs
+        .iter()
+        .filter(|s| s.kind == BackendKind::Cpu)
+        .count()
+        .max(1);
+    (cpu_parallelism_cap(cfg.cpu_affinity) / instances).max(1)
+}
+
+/// Total capacity is stable across temporary RAM use; available capacity includes
+/// only arenas this miner already owns, so they are not subtracted twice.
+pub(crate) fn cpu_autotune_capacity(cfg: &Config, owned_bytes: u64) -> (usize, usize) {
+    cpu_autotune_capacity_snapshot(cfg, owned_bytes).0
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CpuAutotuneResources {
+    pub parallelism: usize,
+    pub total_bytes: Option<u64>,
+    pub available_bytes: Option<u64>,
+}
+
+/// Reuse the sizing observation for telemetry; do not add another resource poll.
+pub(crate) fn cpu_autotune_capacity_snapshot(
+    cfg: &Config,
+    owned_bytes: u64,
+) -> ((usize, usize), CpuAutotuneResources) {
+    let instances = cfg
+        .backend_specs
+        .iter()
+        .filter(|s| s.kind == BackendKind::Cpu)
+        .count()
+        .max(1);
+    let parallelism = cpu_parallelism_cap(cfg.cpu_affinity);
+    let cpu_cap = parallelism / instances;
+    let gpu_reserve = if !cfg.metal_blake2b_only
+        && cfg
+            .backend_specs
+            .iter()
+            .any(|s| s.kind == BackendKind::Metal)
+    {
+        estimate_metal_memory_bytes(cfg.metal_max_lanes)
+    } else {
+        0
+    };
+    let budget = detect_memory_budget_bytes(cfg.cpu_page_mode);
+    let resources = CpuAutotuneResources {
+        parallelism,
+        total_bytes: budget.map(|b| b.effective_total),
+        available_bytes: budget.map(|b| b.effective_available),
+    };
+    let capacity = match budget {
+        Some(budget) => cpu_capacity_from_budget(
+            budget,
+            owned_bytes,
+            gpu_reserve,
+            cfg.cpu_memory_reserve_percent,
+            instances,
+            cpu_cap,
+        ),
+        // Unknown headroom must not authorize additional 2 GiB allocations.
+        None => (
+            cpu_cap.max(1),
+            (owned_bytes / CPU_LANE_MEMORY_BYTES) as usize / instances,
+        ),
+    };
+    (capacity, resources)
+}
+
+fn cpu_capacity_from_budget(
+    budget: MemoryBudgetBytes,
+    owned_bytes: u64,
+    gpu_reserve: u64,
+    reserve_percent: Option<u8>,
+    instances: usize,
+    cpu_cap: usize,
+) -> (usize, usize) {
+    let reserve = memory_reserve_bytes(budget.effective_total, reserve_percent);
+    let per_count = CPU_LANE_MEMORY_BYTES.saturating_mul(instances.max(1) as u64);
+    let usable = |bytes: u64| bytes.saturating_sub(reserve).saturating_sub(gpu_reserve) / per_count;
+    let capacity = (usable(budget.effective_total) as usize).min(cpu_cap);
+    let available = budget
+        .effective_available
+        .saturating_add(owned_bytes)
+        .min(budget.effective_total);
+    // Keep RAM headroom separate from CPU/user ceilings. Pressure handling must
+    // not mistake a two-core machine for a machine with room for only two arenas.
+    (capacity.max(1), usable(available) as usize)
+}
+
+/// Report-time headroom using the same cgroup-aware budget as CPU sizing.
+/// Regular mode deliberately excludes reserved HugeTLB pools from free memory.
+pub(crate) fn telemetry_memory_budget_gib() -> (Option<u32>, Option<u32>) {
+    detect_memory_budget_bytes(CpuPageMode::Regular).map_or((None, None), |budget| {
+        let gib = 1024 * 1024 * 1024;
+        (
+            Some(budget.effective_total.div_ceil(gib) as u32),
+            Some((budget.effective_available / gib) as u32),
+        )
+    })
+}
+
+fn detect_memory_budget_bytes(page_mode: CpuPageMode) -> Option<MemoryBudgetBytes> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+
+    let total = sys.total_memory();
+    if total == 0 {
+        None
+    } else {
+        let mut effective_total = total;
+        let mut effective_available = sys.available_memory();
+        if page_mode != CpuPageMode::Regular {
+            if let Some(hugetlb_unreserved_bytes) = linux_hugetlb_unreserved_bytes() {
+                // HugeTLB pools are typically excluded from MemAvailable even though CPU workers
+                // can map them via MAP_HUGETLB. Add unreserved HugeTLB bytes back to avoid
+                // under-capping CPU autotune when users pre-reserve hugepages.
+                effective_available = effective_available.saturating_add(hugetlb_unreserved_bytes);
+            }
+            if page_mode == CpuPageMode::Large1G {
+                if let Some(hugetlb_1g_unreserved_bytes) = linux_hugetlb_1g_unreserved_bytes() {
+                    // 1 GiB pools are usually a non-default hugepage size, so the
+                    // /proc/meminfo credit above (default size only) misses them.
+                    effective_available =
+                        effective_available.saturating_add(hugetlb_1g_unreserved_bytes);
+                }
+            }
+        }
+
+        if let Some(budget) = linux_cgroup_v2_memory_budget(MemoryBudgetBytes {
+            effective_total,
+            effective_available,
+        }) {
+            effective_total = budget.effective_total;
+            effective_available = budget.effective_available;
+        } else if let Some(cgroup) = sys.cgroup_limits() {
+            if cgroup.total_memory > 0 {
+                effective_total = effective_total.min(cgroup.total_memory);
+            }
+            effective_available = effective_available.min(cgroup.free_memory);
+        }
+
+        effective_available = effective_available.min(effective_total);
+        Some(MemoryBudgetBytes {
+            effective_total,
+            effective_available,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cgroup_v2_memory_budget(budget: MemoryBudgetBytes) -> Option<MemoryBudgetBytes> {
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    let current = linux_cgroup_v2_path()?;
+    cgroup_v2_budget_at(budget, root, current.strip_prefix(root).ok()?.to_str()?)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_cgroup_v2_path() -> Option<PathBuf> {
+    let membership = fs::read_to_string("/proc/self/cgroup").ok()?;
+    let relative = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::/"))?;
+    if std::path::Path::new(relative).components().any(|part| {
+        !matches!(
+            part,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return None;
+    }
+    let dir = std::path::Path::new("/sys/fs/cgroup").join(relative);
+    dir.is_dir().then_some(dir)
+}
+
+/// Remaining tasks in the tightest ancestor, including sibling/descendant use.
+/// This is a startup hint, not a reservation: clone() can still fail afterward.
+pub(crate) fn cpu_task_headroom() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        cgroup_v2_pid_headroom_at(Path::new("/sys/fs/cgroup"), &linux_cgroup_v2_path()?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_v2_pid_headroom_at(root: &Path, current: &Path) -> Option<usize> {
+    let relative = current.strip_prefix(root).ok()?;
+    if relative.components().any(|part| {
+        !matches!(
+            part,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return None;
+    }
+    let mut headroom = None;
+    for dir in current.ancestors().take_while(|dir| dir.starts_with(root)) {
+        let raw = match fs::read_to_string(dir.join("pids.max")) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Some(0),
+        };
+        if raw.trim() == "max" {
+            continue;
+        }
+        // A present but unreadable/malformed finite budget cannot authorize
+        // more threads. Missing controller files mean this level has no limit.
+        let limit = raw.trim().parse::<u64>().unwrap_or(0);
+        let used = fs::read_to_string(dir.join("pids.current"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(limit);
+        let remaining = usize::try_from(limit.saturating_sub(used)).unwrap_or(usize::MAX);
+        headroom = Some(headroom.map_or(remaining, |old: usize| old.min(remaining)));
+    }
+    headroom
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v2_budget_at(
+    mut budget: MemoryBudgetBytes,
+    root: &std::path::Path,
+    relative: &str,
+) -> Option<MemoryBudgetBytes> {
+    if std::path::Path::new(relative).components().any(|part| {
+        !matches!(
+            part,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return None;
+    }
+    let current = root.join(relative);
+    if !current.is_dir() {
+        return None;
+    }
+    let number = |path| fs::read_to_string(path).ok()?.trim().parse::<u64>().ok();
+    // sysinfo 0.31 reads only the mount root. Systemd services and other nested
+    // groups also inherit limits from every ancestor of their actual membership.
+    for dir in current.ancestors().take_while(|dir| dir.starts_with(root)) {
+        let limit = [
+            number(dir.join("memory.max")),
+            number(dir.join("memory.high")),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        if let Some(limit) = limit {
+            let usage = number(dir.join("memory.current")).unwrap_or(limit);
+            let stats = fs::read_to_string(dir.join("memory.stat")).unwrap_or_default();
+            let stat = |key| {
+                stats
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(' ')?;
+                        (name == key)
+                            .then(|| value.trim().parse::<u64>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0)
+            };
+            // Clean inactive file cache can be reclaimed. Dirty/writeback pages
+            // are conservatively excluded from the credit.
+            let reclaimable = stat("inactive_file")
+                .saturating_sub(stat("file_dirty").saturating_add(stat("file_writeback")));
+            budget = constrain_cgroup_budget(budget, limit, usage, reclaimable);
+        }
+    }
+    Some(budget)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_cgroup_v2_memory_budget(_budget: MemoryBudgetBytes) -> Option<MemoryBudgetBytes> {
+    None
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn constrain_cgroup_budget(
+    budget: MemoryBudgetBytes,
+    limit: u64,
+    usage: u64,
+    reclaimable: u64,
+) -> MemoryBudgetBytes {
+    let total = budget.effective_total.min(limit);
+    let available = limit.saturating_sub(usage.saturating_sub(reclaimable));
+    MemoryBudgetBytes {
+        effective_total: total,
+        effective_available: budget.effective_available.min(available).min(total),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_hugetlb_unreserved_bytes() -> Option<u64> {
+    let content = fs::read_to_string("/proc/meminfo").ok()?;
+    parse_linux_hugetlb_unreserved_bytes(&content)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_hugetlb_unreserved_bytes() -> Option<u64> {
+    None
+}
+
+/// Unreserved bytes in the explicit 1 GiB HugeTLB pool. `/proc/meminfo` only
+/// reports the default hugepage size, so when the default is not 1 GiB the
+/// pool is read from sysfs; when it is 1 GiB, `linux_hugetlb_unreserved_bytes`
+/// already accounts for it and this returns `None` to avoid double counting.
+#[cfg(target_os = "linux")]
+fn linux_hugetlb_1g_unreserved_bytes() -> Option<u64> {
+    const HUGE_1G_KIB: u64 = 1024 * 1024;
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    let default_page_size_kib = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("Hugepagesize:"))
+        .and_then(parse_meminfo_u64_field)?;
+    if default_page_size_kib == HUGE_1G_KIB {
+        return None;
+    }
+
+    let pool = "/sys/kernel/mm/hugepages/hugepages-1048576kB";
+    let read_pages = |name: &str| -> Option<u64> {
+        fs::read_to_string(format!("{pool}/{name}"))
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    };
+    let free_pages = read_pages("free_hugepages")?;
+    let reserved_pages = read_pages("resv_hugepages").unwrap_or(0);
+    Some(
+        free_pages
+            .saturating_sub(reserved_pages)
+            .saturating_mul(HUGE_1G_KIB)
+            .saturating_mul(1024),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_hugetlb_1g_unreserved_bytes() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_hugetlb_unreserved_bytes(meminfo: &str) -> Option<u64> {
+    let mut free_pages = 0u64;
+    let mut reserved_pages = 0u64;
+    let mut page_size_kib = 0u64;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("HugePages_Free:") {
+            free_pages = parse_meminfo_u64_field(rest).unwrap_or(free_pages);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("HugePages_Rsvd:") {
+            reserved_pages = parse_meminfo_u64_field(rest).unwrap_or(reserved_pages);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Hugepagesize:") {
+            page_size_kib = parse_meminfo_u64_field(rest).unwrap_or(page_size_kib);
+        }
+    }
+
+    if page_size_kib == 0 {
+        return None;
+    }
+    let unreserved_pages = free_pages.saturating_sub(reserved_pages);
+    Some(
+        unreserved_pages
+            .saturating_mul(page_size_kib)
+            .saturating_mul(1024),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn parse_meminfo_u64_field(value: &str) -> Option<u64> {
+    value.split_whitespace().next()?.parse::<u64>().ok()
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+
+    if bytes >= 1024 * 1024 * 1024 {
+        return format!("{:.2} GiB", (bytes as f64) / GIB);
+    }
+    format!("{:.2} MiB", (bytes as f64) / MIB)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn solo_logins_split_workers_only_from_addresses() {
+        assert_eq!(
+            split_address_worker("solo:ADDR.rig"),
+            Some(("solo:ADDR", "rig"))
+        );
+        assert_eq!(split_address_worker("solo:@a.b"), None);
+        assert_eq!(split_address_worker("SOLO:$a.b"), None);
+        assert_eq!(split_address_worker("@a.b"), None);
+    }
+
+    #[test]
+    fn pid_headroom_uses_tightest_ancestor_and_fails_closed_on_bad_usage() {
+        let root = unique_temp_dir();
+        let group = root.join("service/worker");
+        fs::create_dir_all(&group).unwrap();
+        fs::write(root.join("pids.max"), "max\n").unwrap();
+        fs::write(root.join("service/pids.max"), "64\n").unwrap();
+        fs::write(root.join("service/pids.current"), "60\n").unwrap();
+        fs::write(group.join("pids.max"), "32\n").unwrap();
+        fs::write(group.join("pids.current"), "10\n").unwrap();
+        assert_eq!(cgroup_v2_pid_headroom_at(&root, &group), Some(4));
+        fs::write(group.join("pids.current"), "34\n").unwrap();
+        assert_eq!(cgroup_v2_pid_headroom_at(&root, &group), Some(0));
+        fs::write(group.join("pids.current"), "bad\n").unwrap();
+        assert_eq!(cgroup_v2_pid_headroom_at(&root, &group), Some(0));
+        fs::remove_file(group.join("pids.current")).unwrap();
+        assert_eq!(cgroup_v2_pid_headroom_at(&root, &group), Some(0));
+        fs::write(group.join("pids.max"), "max\n").unwrap();
+        assert_eq!(cgroup_v2_pid_headroom_at(&root, &group), Some(4));
+        fs::write(root.join("service/pids.max"), "max\n").unwrap();
+        assert_eq!(cgroup_v2_pid_headroom_at(&root, &group), None);
+        assert_eq!(
+            cgroup_v2_pid_headroom_at(&root, &root.join("../outside")),
+            None
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn unique_temp_dir() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be >= unix epoch")
+            .as_nanos();
+        dir.push(format!("seine-test-{}-{}", std::process::id(), now));
+        dir
+    }
+
+    #[test]
+    fn shortnames_are_accepted_and_preserved_in_bootstrap_config() {
+        for destination in ["@Alice", "$alice"] {
+            let mut cli = sample_cli();
+            cli.mode = Some(MiningMode::Pool);
+            cli.mining_address = Some(destination.into());
+            validate_cli_mining_address(&cli, "--address").unwrap();
+            let dir = unique_temp_dir();
+            let path = dir.join("config.json");
+            persist_bootstrap_user_config(&cli, &path, "dev-worker").unwrap();
+            assert_eq!(
+                read_user_config(&path).unwrap().unwrap().address.as_deref(),
+                Some(destination)
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+        let mut cli = sample_cli();
+        cli.mining_address = Some("@invalid/name".into());
+        assert!(validate_cli_mining_address(&cli, "--address").is_err());
+    }
+
+    #[test]
+    fn payout_memo_config_preserves_exact_bytes_and_requires_explicit_address_override() {
+        let mut cli = sample_cli();
+        cli.mode = Some(MiningMode::Pool);
+        cli.mining_address = Some(crate::dev_fee::DEV_ADDRESS.into());
+        cli.payout_memo = Some("ID000123".into());
+        let dir = unique_temp_dir();
+        let path = dir.join("config.json");
+        persist_bootstrap_user_config(&cli, &path, "dev").unwrap();
+        let saved = read_user_config(&path).unwrap().unwrap();
+        assert_eq!(saved.payout_memo.as_deref(), Some("ID000123"));
+        cli.payout_memo = None;
+        cli.mining_address = Some("another-address".into());
+        assert!(validate_saved_memo_override(&cli, Some(&saved)).is_err());
+        cli.no_payout_memo = true;
+        assert!(validate_saved_memo_override(&cli, Some(&saved)).is_ok());
+        apply_user_config_defaults(&mut cli, Some(&saved));
+        assert!(cli.payout_memo.is_none());
+        cli.payout_memo = Some("001".into());
+        cli.mode = Some(MiningMode::Daemon);
+        assert!(validate_payout_memo_config(&cli).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    const TEST_EXCHANGE_ADDRESS: &str = "ZJZqGfDPCVg78CRH5Z33CtHafg911Dp5Bauf1Dnxg5jgXx7Whqsvqka96FCV8W6QZXNDKzJefkFU6bwDEGBewqPrTWjij";
+
+    #[test]
+    fn existing_exchange_prompt_preserves_memo_and_saved_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut saved = UserConfig {
+            address: Some(TEST_EXCHANGE_ADDRESS.into()),
+            pool_worker: Some("keep-worker".into()),
+            dev_fee_pool_worker: Some("keep-dev-worker".into()),
+            ..Default::default()
+        };
+        let mut cli = sample_cli();
+        cli.mode = Some(MiningMode::Pool);
+        apply_user_config_defaults(&mut cli, Some(&saved));
+        let mut output = Vec::new();
+        assert!(resolve_required_payout_memo(
+            &mut cli,
+            true,
+            &mut &b"\n ID0001 \r\n"[..],
+            &mut output
+        )
+        .unwrap());
+        assert_eq!(cli.payout_memo.as_deref(), Some(" ID0001 "));
+        persist_prompted_payout_memo(&cli, Some(&mut saved), &path).unwrap();
+        let persisted = read_user_config(&path).unwrap().unwrap();
+        assert_eq!(persisted.payout_memo, cli.payout_memo);
+        assert_eq!(persisted.pool_worker.as_deref(), Some("keep-worker"));
+        assert_eq!(
+            persisted.dev_fee_pool_worker.as_deref(),
+            Some("keep-dev-worker")
+        );
+        assert!(
+            !resolve_required_payout_memo(&mut cli, true, &mut &b""[..], &mut Vec::new()).unwrap()
+        );
+        // An override cannot pair the new memo with the old saved address.
+        saved.address = Some(crate::dev_fee::DEV_ADDRESS.into());
+        saved.payout_memo = None;
+        persist_prompted_payout_memo(&cli, Some(&mut saved), &path).unwrap();
+        assert_eq!(saved.payout_memo, None);
+    }
+
+    #[test]
+    fn missing_memo_never_prompts_services_or_ordinary_wallets() {
+        for (interactive, service, no_memo, mode, should_error) in [
+            (false, false, false, MiningMode::Pool, true),
+            (true, true, false, MiningMode::Pool, true),
+            (true, false, true, MiningMode::Pool, true),
+            (true, false, false, MiningMode::Daemon, true),
+        ] {
+            let mut cli = sample_cli();
+            cli.mode = Some(mode);
+            cli.service = service;
+            cli.no_payout_memo = no_memo;
+            cli.mining_address = Some(TEST_EXCHANGE_ADDRESS.into());
+            let mut output = Vec::new();
+            assert_eq!(
+                resolve_required_payout_memo(
+                    &mut cli,
+                    interactive,
+                    &mut &b"DEMO001\n"[..],
+                    &mut output
+                )
+                .is_err(),
+                should_error
+            );
+            assert!(output.is_empty());
+        }
+        let mut cli = sample_cli();
+        cli.mode = Some(MiningMode::Pool);
+        cli.mining_address = Some(crate::dev_fee::DEV_ADDRESS.into());
+        let mut output = Vec::new();
+        assert!(!resolve_required_payout_memo(&mut cli, true, &mut &b""[..], &mut output).unwrap());
+        assert!(output.is_empty());
+        cli.mining_address = Some(TEST_EXCHANGE_ADDRESS.into());
+        assert!(resolve_required_payout_memo(&mut cli, true, &mut &b""[..], &mut output).is_err());
+        assert!(cli.payout_memo.is_none());
+    }
+
+    #[test]
+    #[ignore = "exports the actual missing-memo prompt with synthetic input"]
+    fn export_memo_prompt_showcase() {
+        let mut captures = Vec::new();
+        for (title, input, interactive) in [
+            ("Saved exchange address / missing memo", "", true),
+            ("Invalid memo / try again", "\n", true),
+            ("Unattended / memo required", "", false),
+        ] {
+            let mut cli = sample_cli();
+            cli.mode = Some(MiningMode::Pool);
+            cli.mining_address = Some(TEST_EXCHANGE_ADDRESS.into());
+            let mut output = Vec::new();
+            let result = resolve_required_payout_memo(
+                &mut cli,
+                interactive,
+                &mut input.as_bytes(),
+                &mut output,
+            );
+            if !interactive {
+                write!(&mut output, "{}", result.unwrap_err()).unwrap();
+            }
+            captures.push((title, String::from_utf8(output).unwrap()));
+        }
+        let path = Path::new("docs/showcases/exchange-payouts");
+        fs::create_dir_all(path).unwrap();
+        fs::write(
+            path.join("prompts.json"),
+            serde_json::to_string(&captures).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn sample_cli() -> Cli {
+        Cli {
+            telemetry: None,
+            telemetry_url: None,
+            mode: Some(MiningMode::Daemon),
+            testnet: false,
+            pool_url_args: Vec::new(),
+            pool_url: None,
+            pool_worker: None,
+            pool_proxy: None,
+            pool_password: None,
+            proxy_listen: None,
+            api_url: None,
+            token: None,
+            wallet_password: None,
+            wallet_password_file: None,
+            mining_address: None,
+            payout_memo: None,
+            no_payout_memo: false,
+            gpu_only: false,
+            cookie: None,
+            daemon_dir: None,
+            data_dir: PathBuf::from("./seine-data"),
+            backends: vec![BackendKind::Cpu],
+            nvidia_devices: Vec::new(),
+            amd_devices: Vec::new(),
+            threads: Some(1),
+            cpu_affinity: CpuAffinityMode::Auto,
+            cpu_page_mode: CpuPageMode::Auto,
+            cpu_profile: CpuPerformanceProfile::Balanced,
+            cpu_threads_per_instance: Vec::new(),
+            cpu_affinity_per_instance: Vec::new(),
+            cpu_memory_reserve_percent: None,
+            allow_oversubscribe: false,
+            refresh_secs: 20,
+            request_timeout_secs: 10,
+            events_stream_timeout_secs: 10,
+            events_idle_timeout_secs: 90,
+            stats_secs: 10,
+            backend_event_capacity: 1024,
+            hash_poll_ms: Some(DEFAULT_HASH_POLL_MS),
+            cpu_hash_batch_size: Some(DEFAULT_CPU_HASH_BATCH_SIZE),
+            cpu_control_check_interval_hashes: Some(DEFAULT_CPU_CONTROL_CHECK_INTERVAL_HASHES),
+            cpu_hash_flush_ms: Some(DEFAULT_CPU_HASH_FLUSH_MS),
+            cpu_event_dispatch_capacity: Some(DEFAULT_CPU_EVENT_DISPATCH_CAPACITY),
+            cpu_autotune_threads: false,
+            disable_cpu_autotune_threads: false,
+            cpu_autotune_min_threads: 1,
+            cpu_autotune_max_threads: None,
+            cpu_autotune_secs: DEFAULT_CPU_AUTOTUNE_SECS,
+            cpu_autotune_config: None,
+            nvidia_autotune_secs: DEFAULT_NVIDIA_AUTOTUNE_SECS,
+            nvidia_autotune_samples: DEFAULT_NVIDIA_AUTOTUNE_SAMPLES,
+            nvidia_autotune_config: None,
+            nvidia_max_rregcount: None,
+            nvidia_max_lanes: None,
+            nvidia_dispatch_iters_per_lane: None,
+            nvidia_allocation_iters_per_lane: None,
+            nvidia_hashes_per_launch_per_lane: DEFAULT_NVIDIA_HASHES_PER_LAUNCH_PER_LANE,
+            nvidia_fused_target_check: false,
+            nvidia_no_adaptive_launch_depth: false,
+            nvidia_template_stop_policy: NvidiaTemplateStopPolicy::Auto,
+            amd_max_lanes: None,
+            metal_max_lanes: None,
+            metal_hashes_per_launch_per_lane: DEFAULT_METAL_HASHES_PER_LAUNCH_PER_LANE,
+            backend_assign_timeout_ms: 1000,
+            backend_assign_timeout_ms_per_instance: Vec::new(),
+            backend_assign_timeout_strikes: 3,
+            backend_assign_timeout_strikes_per_instance: Vec::new(),
+            backend_control_timeout_ms: 60_000,
+            backend_control_timeout_ms_per_instance: Vec::new(),
+            allow_best_effort_deadlines: false,
+            prefetch_wait_ms: 250,
+            tip_listener_join_wait_ms: 250,
+            submit_join_wait_ms: 2_000,
+            strict_round_accounting: false,
+            relaxed_accounting: false,
+            start_nonce: None,
+            nonce_iters_per_lane: 1u64 << 36,
+            work_allocation: WorkAllocation::Adaptive,
+            sub_round_rebalance_ms: 0,
+            disable_sse: false,
+            disable_update_check: false,
+            refresh_on_same_height: false,
+            verbose: false,
+            ui: UiMode::Auto,
+            api_server: false,
+            service: false,
+            api_bind: "127.0.0.1:9977".to_string(),
+            api_allow_unsafe_bind: false,
+            api_cors: String::new(),
+            api_token: None,
+            api_cookie: None,
+            bench: false,
+            self_update: false,
+            auto_update: false,
+            no_auto_update: false,
+            cpu_side_cache_blocks: None,
+            cpu_skip_store_permille: None,
+            bench_kind: BenchKind::Backend,
+            bench_pow: BenchPow::Argon2id,
+            bench_cpu_kernel: None,
+            bench_secs: 20,
+            bench_rounds: 3,
+            bench_warmup_rounds: 0,
+            bench_output: None,
+            bench_baseline: None,
+            bench_fail_below_pct: None,
+            bench_baseline_policy: BenchBaselinePolicy::Strict,
+        }
+    }
+
+    #[test]
+    fn normalize_pool_url_rejects_websocket_schemes() {
+        assert_eq!(
+            normalize_pool_url("stratum+ws://pool.example.com:3334"),
+            None
+        );
+        assert_eq!(
+            normalize_pool_url("stratum+wss://pool.example.com:443"),
+            None
+        );
+    }
+
+    #[test]
+    fn normalize_pool_url_rejects_paths() {
+        assert_eq!(
+            normalize_pool_url("stratum+tcp://pool.example.com:3334/miner"),
+            None
+        );
+        assert_eq!(normalize_pool_url("pool.example.com:3334/miner"), None);
+    }
+
+    #[test]
+    fn miner_style_flags_set_pool_list_address_and_worker() {
+        let address = "8yAUM9aprE1ffiEm5KugyGH1TUqXQTuF9j5Mt2ZabBJmM9HAb5bfPkpa5JjgGQHU8bAmsuuJrcJVSXNWt5KLVn7Tv1bVm";
+        let mut cli = Cli::try_parse_from([
+            "seine",
+            "-o",
+            "stratum+ssl://1.2.3.4:3443",
+            "-o",
+            "bntpool.com:3333,backup.example.com:3333",
+            "-u",
+            &format!("{address}.rig7"),
+            "-p",
+            "x",
+        ])
+        .expect("miner-style flags should parse");
+        cli.apply_miner_style_args();
+        assert_eq!(
+            cli.pool_url.as_deref().and_then(normalize_pool_url).as_deref(),
+            Some("stratum+ssl://1.2.3.4:3443,stratum+tcp://bntpool.com:3333,stratum+tcp://backup.example.com:3333")
+        );
+        assert_eq!(cli.mining_address.as_deref(), Some(address));
+        assert_eq!(cli.pool_worker.as_deref(), Some("rig7"));
+
+        let mut cli = Cli::try_parse_from([
+            "seine",
+            "--url",
+            "bntpool.com:3333",
+            "--user",
+            &format!("{address}.rig7"),
+            "--worker",
+            "explicit",
+        ])
+        .unwrap();
+        cli.apply_miner_style_args();
+        assert_eq!(cli.pool_worker.as_deref(), Some("explicit"));
+        assert_eq!(cli.mining_address.as_deref(), Some(address));
+    }
+
+    /// The HiveOS package (packaging/hiveos) writes these argument lists; its
+    /// shell tests check h-config.sh still produces them.
+    #[test]
+    fn hiveos_package_arguments_parse() {
+        let parse = |fixture: &str| {
+            let args = std::iter::once("seine").chain(fixture.lines());
+            let mut cli = Cli::try_parse_from(args).expect("HiveOS arguments should parse");
+            cli.apply_miner_style_args();
+            cli
+        };
+
+        let cli = parse(include_str!("../packaging/hiveos/testdata/nvidia-rig.args"));
+        assert_eq!(cli.pool_worker.as_deref(), Some("rig01"));
+        assert_eq!(
+            cli.pool_url
+                .as_deref()
+                .and_then(normalize_pool_url)
+                .as_deref(),
+            Some("stratum+tcp://bntpool.com:3333,stratum+ssl://backup.example.com:3443")
+        );
+        assert_eq!(cli.backends, vec![BackendKind::Nvidia]);
+        assert_eq!(cli.ui, UiMode::Plain);
+        assert!(cli.api_server && cli.no_auto_update);
+        assert_eq!(cli.api_bind, "127.0.0.1:9977");
+        assert_eq!(cli.data_dir, PathBuf::from("/var/lib/seine"));
+
+        let cli = parse(include_str!(
+            "../packaging/hiveos/testdata/extra-config.args"
+        ));
+        assert_eq!(cli.pool_worker.as_deref(), Some("rig02"));
+        assert_eq!(cli.backends, vec![BackendKind::Nvidia, BackendKind::Cpu]);
+        assert_eq!(cli.threads, Some(2));
+    }
+
+    /// The mmpOS package (packaging/mmpos) writes these argument lists; its
+    /// shell tests check mmp-launch.sh still produces them.
+    #[test]
+    fn mmpos_package_arguments_parse() {
+        let parse = |fixture: &str| {
+            let args = std::iter::once("seine").chain(fixture.lines());
+            let mut cli = Cli::try_parse_from(args).expect("mmpOS arguments should parse");
+            cli.apply_miner_style_args();
+            cli
+        };
+
+        let cli = parse(include_str!("../packaging/mmpos/testdata/gpu-rig.args"));
+        assert_eq!(cli.pool_worker.as_deref(), Some("rig01"));
+        assert_eq!(
+            cli.pool_url
+                .as_deref()
+                .and_then(normalize_pool_url)
+                .as_deref(),
+            Some("stratum+ssl://pool.example.com:3443")
+        );
+        assert!(cli.backends.is_empty() && cli.gpu_only);
+        assert_eq!(cli.ui, UiMode::Plain);
+        assert!(cli.api_server && cli.no_auto_update);
+        assert_eq!(cli.api_bind, "127.0.0.1:4044");
+        assert_eq!(cli.data_dir, PathBuf::from("/opt/mmp/miners/seine-data"));
+
+        let cli = parse(include_str!("../packaging/mmpos/testdata/extra-args.args"));
+        assert_eq!(cli.mining_address.as_deref(), Some("@miner.one"));
+        assert_eq!(cli.pool_worker.as_deref(), Some("rig02"));
+        assert_eq!(cli.backends, vec![BackendKind::Nvidia, BackendKind::Cpu]);
+        assert_eq!(cli.threads, Some(2));
+    }
+
+    #[test]
+    fn shortname_logins_are_not_split_on_dots() {
+        let mut cli = Cli::try_parse_from(["seine", "-u", "@miner.one"]).unwrap();
+        cli.apply_miner_style_args();
+        assert_eq!(cli.mining_address.as_deref(), Some("@miner.one"));
+        assert_eq!(cli.pool_worker, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_linux_hugetlb_unreserved_bytes_uses_free_minus_reserved_pages() {
+        let meminfo = "\
+HugePages_Free:      10240
+HugePages_Rsvd:        512
+Hugepagesize:         2048 kB
+";
+        let expected = 9728u64 * 2048 * 1024;
+        assert_eq!(
+            parse_linux_hugetlb_unreserved_bytes(meminfo),
+            Some(expected)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_linux_hugetlb_unreserved_bytes_requires_page_size() {
+        let meminfo = "\
+HugePages_Free:      10240
+HugePages_Rsvd:          0
+";
+        assert_eq!(parse_linux_hugetlb_unreserved_bytes(meminfo), None);
+    }
+
+    #[test]
+    fn normalize_api_url_adds_scheme() {
+        assert_eq!(
+            normalize_api_url("127.0.0.1:8332/"),
+            "http://127.0.0.1:8332"
+        );
+        assert_eq!(
+            normalize_api_url("https://node.example.com/"),
+            "https://node.example.com"
+        );
+    }
+
+    #[test]
+    fn resolved_cli_daemon_dir_defaults_to_mainnet() {
+        let cli = sample_cli();
+        assert_eq!(
+            resolved_cli_daemon_dir(&cli),
+            default_managed_data_dir(DaemonNetwork::Mainnet)
+                .unwrap_or_else(|| legacy_default_data_dir(DaemonNetwork::Mainnet))
+        );
+    }
+
+    #[test]
+    fn resolved_cli_daemon_dir_uses_testnet_default_when_requested() {
+        let mut cli = sample_cli();
+        cli.testnet = true;
+        assert_eq!(
+            resolved_cli_daemon_dir(&cli),
+            default_managed_data_dir(DaemonNetwork::Testnet)
+                .unwrap_or_else(|| legacy_default_data_dir(DaemonNetwork::Testnet))
+        );
+    }
+
+    #[test]
+    fn legacy_default_data_dir_uses_testnet_path() {
+        assert_eq!(
+            legacy_default_data_dir(DaemonNetwork::Testnet),
+            PathBuf::from(LEGACY_DEFAULT_DAEMON_DIR_TESTNET)
+        );
+    }
+
+    #[test]
+    fn daemon_network_from_cmdline_ignores_false_testnet_value() {
+        let cmd = vec!["blocknet".to_string(), "--testnet=false".to_string()];
+        assert_eq!(daemon_network_from_cmdline(&cmd), None);
+    }
+
+    #[test]
+    fn resolve_api_url_prefers_explicit_cli_value() {
+        let daemon = DaemonContext {
+            network: DaemonNetwork::Mainnet,
+            data_dir: PathBuf::from("/tmp/blocknet"),
+            api_addr: Some("127.0.0.1:9000".to_string()),
+            source: DaemonContextSource::ProcessScan,
+            running: true,
+            manager_config_path: None,
+        };
+        assert_eq!(
+            resolve_api_url(Some("http://10.0.0.2:8332"), Some(&daemon)),
+            "http://10.0.0.2:8332"
+        );
+    }
+
+    #[test]
+    fn resolve_api_url_uses_daemon_api_when_cli_omitted() {
+        let daemon = DaemonContext {
+            network: DaemonNetwork::Mainnet,
+            data_dir: PathBuf::from("/tmp/blocknet"),
+            api_addr: Some("192.168.1.5:9100".to_string()),
+            source: DaemonContextSource::ProcessScan,
+            running: true,
+            manager_config_path: None,
+        };
+        assert_eq!(
+            resolve_api_url(None, Some(&daemon)),
+            "http://192.168.1.5:9100"
+        );
+    }
+
+    #[test]
+    fn resolve_api_url_falls_back_when_daemon_api_is_unparseable() {
+        let daemon = DaemonContext {
+            network: DaemonNetwork::Mainnet,
+            data_dir: PathBuf::from("/tmp/blocknet"),
+            api_addr: Some("not-an-endpoint".to_string()),
+            source: DaemonContextSource::ProcessScan,
+            running: true,
+            manager_config_path: None,
+        };
+        assert_eq!(resolve_api_url(None, Some(&daemon)), DEFAULT_API_URL);
+    }
+
+    #[test]
+    fn api_url_from_daemon_api_addr_maps_wildcards_to_loopback() {
+        assert_eq!(
+            api_url_from_daemon_api_addr("0.0.0.0:8332"),
+            Some("http://127.0.0.1:8332".to_string())
+        );
+        assert_eq!(
+            api_url_from_daemon_api_addr("[::]:8332"),
+            Some("http://127.0.0.1:8332".to_string())
+        );
+    }
+
+    #[test]
+    fn api_url_from_daemon_api_addr_supports_port_only_and_equals_form() {
+        assert_eq!(
+            api_url_from_daemon_api_addr("8332"),
+            Some("http://127.0.0.1:8332".to_string())
+        );
+        let cmd = vec![
+            "blocknet".to_string(),
+            "--api=127.0.0.1:7777".to_string(),
+            "--data=./node-data".to_string(),
+        ];
+        assert_eq!(
+            daemon_api_addr_from_cmdline(&cmd),
+            Some("127.0.0.1:7777".to_string())
+        );
+        assert_eq!(
+            daemon_data_dir_from_cmdline(&cmd),
+            Some(PathBuf::from("./node-data"))
+        );
+    }
+
+    #[test]
+    fn resolve_token_prefers_explicit_token() {
+        let mut cli = sample_cli();
+        cli.token = Some("  abc123  ".to_string());
+
+        let (token, source) = resolve_token_with_source(&cli, None).expect("token should parse");
+        assert_eq!(token, "abc123");
+        assert!(source.is_none());
+    }
+
+    #[test]
+    fn resolve_token_reads_cookie() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let cookie = dir.join("api.cookie");
+        fs::write(&cookie, "deadbeef\n").expect("cookie should be written");
+
+        let mut cli = sample_cli();
+        cli.cookie = Some(cookie.clone());
+        cli.daemon_dir = Some(dir.clone());
+
+        let (token, source) = resolve_token_with_source(&cli, None).expect("cookie should be read");
+        assert_eq!(token, "deadbeef");
+        assert_eq!(source.as_deref(), Some(cookie.as_path()));
+        let _ = fs::remove_file(cookie);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_token_reads_detected_testnet_cookie_without_flag() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let cookie = dir.join("api.cookie");
+        fs::write(&cookie, "deadbeef\n").expect("cookie should be written");
+
+        let cli = sample_cli();
+        let daemon = DaemonContext {
+            network: DaemonNetwork::Mainnet,
+            data_dir: dir.clone(),
+            api_addr: Some("127.0.0.1:8332".to_string()),
+            source: DaemonContextSource::ProcessScan,
+            running: true,
+            manager_config_path: None,
+        };
+
+        let (token, source) =
+            resolve_token_with_source(&cli, Some(&daemon)).expect("cookie should be read");
+        assert_eq!(token, "deadbeef");
+        assert_eq!(source.as_deref(), Some(cookie.as_path()));
+        let _ = fs::remove_file(cookie);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_service_token_prefers_explicit_token() {
+        let mut cli = sample_cli();
+        cli.service = true;
+        cli.token = Some("  abc123  ".to_string());
+
+        let (token, source) =
+            resolve_service_token_with_source(&cli, None).expect("token should parse");
+        assert_eq!(token.as_deref(), Some("abc123"));
+        assert!(source.is_none());
+    }
+
+    #[test]
+    fn resolve_service_token_reads_cookie_when_present() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let cookie = dir.join("api.cookie");
+        fs::write(&cookie, "deadbeef\n").expect("cookie should be written");
+
+        let mut cli = sample_cli();
+        cli.service = true;
+        cli.daemon_dir = Some(dir.clone());
+
+        let (token, source) =
+            resolve_service_token_with_source(&cli, None).expect("cookie should be read");
+        assert_eq!(token.as_deref(), Some("deadbeef"));
+        assert_eq!(source.as_deref(), Some(cookie.as_path()));
+        let _ = fs::remove_file(cookie);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_service_token_returns_none_when_not_available() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let mut cli = sample_cli();
+        cli.service = true;
+        cli.daemon_dir = Some(dir.clone());
+
+        let (token, source) =
+            resolve_service_token_with_source(&cli, None).expect("missing token is allowed");
+        assert!(token.is_none());
+        assert!(source.is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_runtime_token_reads_cookie_in_pool_mode_when_present() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let cookie = dir.join("api.cookie");
+        fs::write(&cookie, "deadbeef\n").expect("cookie should be written");
+
+        let mut cli = sample_cli();
+        cli.mode = Some(MiningMode::Pool);
+        cli.daemon_dir = Some(dir.clone());
+
+        let (token, source) = resolve_runtime_token_with_source(&cli, MiningMode::Pool, None)
+            .expect("pool mode should read optional cookie");
+        assert_eq!(token.as_deref(), Some("deadbeef"));
+        assert_eq!(source.as_deref(), Some(cookie.as_path()));
+        let _ = fs::remove_file(cookie);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_runtime_token_allows_missing_cookie_in_pool_mode() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+
+        let mut cli = sample_cli();
+        cli.mode = Some(MiningMode::Pool);
+        cli.daemon_dir = Some(dir.clone());
+
+        let (token, source) = resolve_runtime_token_with_source(&cli, MiningMode::Pool, None)
+            .expect("pool mode should allow missing daemon auth");
+        assert!(token.is_none());
+        assert!(source.is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn duplicate_backends_are_preserved_for_instance_shaping() {
+        let out = expand_backend_specs(
+            &[BackendKind::Cpu, BackendKind::Cpu],
+            &[],
+            &[],
+            &[],
+            &[],
+            BackendExpansionOptions {
+                default_cpu_threads: 1,
+                default_cpu_affinity: CpuAffinityMode::Auto,
+                cpu_threads_per_instance: &[],
+                cpu_affinity_per_instance: &[],
+                backend_assign_timeout_ms_per_instance: &[],
+                backend_control_timeout_ms_per_instance: &[],
+                backend_assign_timeout_strikes_per_instance: &[],
+            },
+        )
+        .expect("duplicate CPU backends should be preserved");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].kind, BackendKind::Cpu);
+        assert_eq!(out[1].kind, BackendKind::Cpu);
+    }
+
+    #[test]
+    fn expand_backend_specs_expands_nvidia_devices() {
+        let out = expand_backend_specs(
+            &[BackendKind::Cpu, BackendKind::Nvidia],
+            &[2, 0, 2],
+            &[],
+            &[],
+            &[],
+            BackendExpansionOptions {
+                default_cpu_threads: 1,
+                default_cpu_affinity: CpuAffinityMode::Auto,
+                cpu_threads_per_instance: &[],
+                cpu_affinity_per_instance: &[],
+                backend_assign_timeout_ms_per_instance: &[],
+                backend_control_timeout_ms_per_instance: &[],
+                backend_assign_timeout_strikes_per_instance: &[],
+            },
+        )
+        .expect("backend specs should parse");
+        assert_eq!(
+            out,
+            vec![
+                BackendSpec {
+                    kind: BackendKind::Cpu,
+                    device_index: None,
+                    cpu_threads: Some(1),
+                    cpu_affinity: Some(CpuAffinityMode::Auto),
+                    assign_timeout_override: None,
+                    control_timeout_override: None,
+                    assign_timeout_strikes_override: None,
+                },
+                BackendSpec {
+                    kind: BackendKind::Nvidia,
+                    device_index: Some(2),
+                    cpu_threads: None,
+                    cpu_affinity: None,
+                    assign_timeout_override: None,
+                    control_timeout_override: None,
+                    assign_timeout_strikes_override: None,
+                },
+                BackendSpec {
+                    kind: BackendKind::Nvidia,
+                    device_index: Some(0),
+                    cpu_threads: None,
+                    cpu_affinity: None,
+                    assign_timeout_override: None,
+                    control_timeout_override: None,
+                    assign_timeout_strikes_override: None,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_backend_specs_requires_nvidia_backend_for_devices() {
+        let err = expand_backend_specs(
+            &[BackendKind::Cpu],
+            &[0],
+            &[],
+            &[],
+            &[],
+            BackendExpansionOptions {
+                default_cpu_threads: 1,
+                default_cpu_affinity: CpuAffinityMode::Auto,
+                cpu_threads_per_instance: &[],
+                cpu_affinity_per_instance: &[],
+                backend_assign_timeout_ms_per_instance: &[],
+                backend_control_timeout_ms_per_instance: &[],
+                backend_assign_timeout_strikes_per_instance: &[],
+            },
+        )
+        .expect_err("nvidia devices without backend should fail");
+        assert!(format!("{err:#}").contains("--nvidia-devices requires selecting nvidia"));
+    }
+
+    #[test]
+    fn expand_backend_specs_expands_amd_devices() {
+        let out = expand_backend_specs(
+            &[BackendKind::Amd],
+            &[],
+            &[1, 0, 1],
+            &[],
+            &[],
+            BackendExpansionOptions {
+                default_cpu_threads: 1,
+                default_cpu_affinity: CpuAffinityMode::Auto,
+                cpu_threads_per_instance: &[],
+                cpu_affinity_per_instance: &[],
+                backend_assign_timeout_ms_per_instance: &[],
+                backend_control_timeout_ms_per_instance: &[],
+                backend_assign_timeout_strikes_per_instance: &[],
+            },
+        )
+        .expect("amd backend specs should parse");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].kind, BackendKind::Amd);
+        assert_eq!(out[0].device_index, Some(1));
+        assert_eq!(out[1].kind, BackendKind::Amd);
+        assert_eq!(out[1].device_index, Some(0));
+    }
+
+    #[test]
+    fn expand_backend_specs_requires_amd_backend_for_devices() {
+        let err = expand_backend_specs(
+            &[BackendKind::Cpu],
+            &[],
+            &[0],
+            &[],
+            &[],
+            BackendExpansionOptions {
+                default_cpu_threads: 1,
+                default_cpu_affinity: CpuAffinityMode::Auto,
+                cpu_threads_per_instance: &[],
+                cpu_affinity_per_instance: &[],
+                backend_assign_timeout_ms_per_instance: &[],
+                backend_control_timeout_ms_per_instance: &[],
+                backend_assign_timeout_strikes_per_instance: &[],
+            },
+        )
+        .expect_err("amd devices without backend should fail");
+        assert!(format!("{err:#}").contains("--amd-devices requires selecting amd"));
+    }
+
+    fn expansion_options_without_overrides() -> BackendExpansionOptions<'static> {
+        BackendExpansionOptions {
+            default_cpu_threads: 1,
+            default_cpu_affinity: CpuAffinityMode::Auto,
+            cpu_threads_per_instance: &[],
+            cpu_affinity_per_instance: &[],
+            backend_assign_timeout_ms_per_instance: &[],
+            backend_control_timeout_ms_per_instance: &[],
+            backend_assign_timeout_strikes_per_instance: &[],
+        }
+    }
+
+    #[test]
+    fn expand_backend_specs_fans_out_auto_nvidia_devices() {
+        let out = expand_backend_specs(
+            &[BackendKind::Cpu, BackendKind::Nvidia],
+            &[],
+            &[],
+            &[0, 1, 2],
+            &[],
+            expansion_options_without_overrides(),
+        )
+        .expect("auto nvidia devices should expand");
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0].kind, BackendKind::Cpu);
+        for (spec, expected_index) in out[1..].iter().zip([0, 1, 2]) {
+            assert_eq!(spec.kind, BackendKind::Nvidia);
+            assert_eq!(spec.device_index, Some(expected_index));
+        }
+    }
+
+    #[test]
+    fn explicit_nvidia_devices_override_auto_list() {
+        let out = expand_backend_specs(
+            &[BackendKind::Nvidia],
+            &[1],
+            &[],
+            &[0, 1, 2],
+            &[],
+            expansion_options_without_overrides(),
+        )
+        .expect("explicit nvidia devices should win over auto list");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].device_index, Some(1));
+    }
+
+    #[test]
+    fn expand_backend_specs_falls_back_to_single_unpinned_spec() {
+        let out = expand_backend_specs(
+            &[BackendKind::Nvidia],
+            &[],
+            &[],
+            &[],
+            &[],
+            expansion_options_without_overrides(),
+        )
+        .expect("empty explicit and auto lists should fall back");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, BackendKind::Nvidia);
+        assert_eq!(out[0].device_index, None);
+    }
+
+    #[test]
+    fn expand_backend_specs_fans_out_auto_amd_devices() {
+        let out = expand_backend_specs(
+            &[BackendKind::Amd],
+            &[],
+            &[],
+            &[],
+            &[0, 1],
+            expansion_options_without_overrides(),
+        )
+        .expect("auto amd devices should expand");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].device_index, Some(0));
+        assert_eq!(out[1].device_index, Some(1));
+        assert!(out.iter().all(|spec| spec.kind == BackendKind::Amd));
+    }
+
+    #[test]
+    fn expand_backend_specs_dedupes_auto_device_list() {
+        let out = expand_backend_specs(
+            &[BackendKind::Nvidia],
+            &[],
+            &[],
+            &[1, 0, 1],
+            &[],
+            expansion_options_without_overrides(),
+        )
+        .expect("auto device list should dedupe");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].device_index, Some(1));
+        assert_eq!(out[1].device_index, Some(0));
+    }
+
+    fn detected_gpu(index: u32, name: &str, memory_total_mib: u64) -> DetectedGpu {
+        DetectedGpu {
+            index,
+            name: name.to_string(),
+            memory_total_mib,
+        }
+    }
+
+    #[test]
+    fn detection_notice_lists_auto_enabled_gpus() {
+        let detection = Ok(vec![
+            detected_gpu(0, "RTX 5090", 32607),
+            detected_gpu(1, "RTX 4090", 24564),
+        ]);
+        let notices = build_gpu_detection_notices("NVIDIA", "nvidia", &detection, &[], true);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("detected 2 NVIDIA GPU(s)"));
+        assert!(notices[0].contains("RTX 5090, RTX 4090"));
+    }
+
+    #[test]
+    fn detection_notice_warns_on_unknown_explicit_index() {
+        let detection = Ok(vec![
+            detected_gpu(0, "RTX 4090", 24564),
+            detected_gpu(1, "RTX 4090", 24564),
+        ]);
+        let notices = build_gpu_detection_notices("NVIDIA", "nvidia", &detection, &[0, 5], true);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("requested NVIDIA device index 5"));
+        assert!(notices[0].contains("available: [0, 1]"));
+    }
+
+    #[test]
+    fn detection_notice_reports_forced_kind_enumeration_failure() {
+        let detection = Err(anyhow::anyhow!("nvidia-smi not found"));
+        let notices = build_gpu_detection_notices("NVIDIA", "nvidia", &detection, &[], true);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("--backend nvidia selected"));
+        assert!(notices[0].contains("nvidia-smi not found"));
+        assert!(notices[0].contains("single instance on the default device"));
+    }
+
+    #[test]
+    fn detection_notices_empty_when_kind_not_selected() {
+        let detection = Ok(vec![detected_gpu(0, "RTX 4090", 24564)]);
+        let notices = build_gpu_detection_notices("NVIDIA", "nvidia", &detection, &[], false);
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn detection_notice_reports_no_usable_devices() {
+        let detection = Ok(Vec::new());
+        let notices = build_gpu_detection_notices("AMD", "amd", &detection, &[], true);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("no usable AMD devices"));
+    }
+
+    #[test]
+    fn detection_notices_silent_for_valid_explicit_indices() {
+        let detection = Ok(vec![
+            detected_gpu(0, "RTX 4090", 24564),
+            detected_gpu(1, "RTX 4090", 24564),
+        ]);
+        let notices = build_gpu_detection_notices("NVIDIA", "nvidia", &detection, &[1, 0], true);
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn per_instance_mismatch_error_mentions_auto_expansion() {
+        let err = expand_backend_specs(
+            &[BackendKind::Cpu, BackendKind::Nvidia],
+            &[],
+            &[],
+            &[0, 1],
+            &[],
+            BackendExpansionOptions {
+                backend_assign_timeout_ms_per_instance: &[900, 1500],
+                ..expansion_options_without_overrides()
+            },
+        )
+        .expect_err("per-instance list length should mismatch after auto expansion");
+        let message = format!("{err:#}");
+        assert!(message.contains("must match backend instances (3)"));
+        assert!(message.contains("auto-expanded from detected GPUs"));
+        assert!(message.contains("--nvidia-devices"));
+    }
+
+    #[test]
+    fn expand_backend_specs_applies_cpu_instance_overrides() {
+        let out = expand_backend_specs(
+            &[BackendKind::Cpu, BackendKind::Cpu],
+            &[],
+            &[],
+            &[],
+            &[],
+            BackendExpansionOptions {
+                default_cpu_threads: 2,
+                default_cpu_affinity: CpuAffinityMode::Auto,
+                cpu_threads_per_instance: &[3, 5],
+                cpu_affinity_per_instance: &[CpuAffinityMode::Off, CpuAffinityMode::Auto],
+                backend_assign_timeout_ms_per_instance: &[],
+                backend_control_timeout_ms_per_instance: &[],
+                backend_assign_timeout_strikes_per_instance: &[],
+            },
+        )
+        .expect("cpu instance overrides should apply");
+
+        assert_eq!(out[0].cpu_threads, Some(3));
+        assert_eq!(out[0].cpu_affinity, Some(CpuAffinityMode::Off));
+        assert_eq!(out[1].cpu_threads, Some(5));
+        assert_eq!(out[1].cpu_affinity, Some(CpuAffinityMode::Auto));
+    }
+
+    #[test]
+    fn expand_backend_specs_applies_per_instance_timeout_overrides() {
+        let out = expand_backend_specs(
+            &[BackendKind::Cpu, BackendKind::Nvidia],
+            &[],
+            &[],
+            &[],
+            &[],
+            BackendExpansionOptions {
+                default_cpu_threads: 1,
+                default_cpu_affinity: CpuAffinityMode::Auto,
+                cpu_threads_per_instance: &[],
+                cpu_affinity_per_instance: &[],
+                backend_assign_timeout_ms_per_instance: &[900, 1500],
+                backend_control_timeout_ms_per_instance: &[30_000, 90_000],
+                backend_assign_timeout_strikes_per_instance: &[2, 4],
+            },
+        )
+        .expect("timeout overrides should apply");
+
+        assert_eq!(
+            out[0].assign_timeout_override,
+            Some(Duration::from_millis(900))
+        );
+        assert_eq!(
+            out[1].assign_timeout_override,
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(
+            out[0].control_timeout_override,
+            Some(Duration::from_millis(30_000))
+        );
+        assert_eq!(
+            out[1].control_timeout_override,
+            Some(Duration::from_millis(90_000))
+        );
+        assert_eq!(out[0].assign_timeout_strikes_override, Some(2));
+        assert_eq!(out[1].assign_timeout_strikes_override, Some(4));
+    }
+
+    #[test]
+    fn cpu_page_mode_labels_and_cli_values_round_trip() {
+        assert_eq!(CpuPageMode::Auto.as_str(), "auto");
+        assert_eq!(CpuPageMode::Regular.as_str(), "regular");
+        assert_eq!(CpuPageMode::Large.as_str(), "large");
+        assert_eq!(CpuPageMode::Large1G.as_str(), "large-1g");
+
+        for mode in [
+            CpuPageMode::Auto,
+            CpuPageMode::Regular,
+            CpuPageMode::Large,
+            CpuPageMode::Large1G,
+        ] {
+            assert_eq!(
+                <CpuPageMode as ValueEnum>::from_str(mode.as_str(), false).unwrap(),
+                mode
+            );
+        }
+        assert!(<CpuPageMode as ValueEnum>::from_str("large1g", false).is_err());
+
+        assert!(CpuPageMode::Large.requires_explicit_large_pages());
+        assert!(CpuPageMode::Large1G.requires_explicit_large_pages());
+        assert!(!CpuPageMode::Auto.requires_explicit_large_pages());
+        assert!(!CpuPageMode::Regular.requires_explicit_large_pages());
+    }
+
+    #[test]
+    fn human_bytes_formats_units() {
+        assert_eq!(human_bytes(1024 * 1024), "1.00 MiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.00 GiB");
+    }
+
+    #[cfg(all(feature = "amd", any(target_os = "linux", windows)))]
+    #[test]
+    fn integrated_amd_graphics_are_not_counted_as_gpus() {
+        assert!(amd_integrated_gpu_device(0x164e), "Ryzen 7000 graphics");
+        assert!(amd_integrated_gpu_device(0x13c0), "Ryzen 9000 graphics");
+        assert!(amd_integrated_gpu_device(0x15bf), "Phoenix");
+        assert!(!amd_integrated_gpu_device(0x744c), "RX 7900 XTX");
+        assert!(!amd_integrated_gpu_device(0x73bf), "RX 6800 XT");
+        assert!(!amd_integrated_gpu_device(0x74a1), "MI300X");
+        assert!(!amd_integrated_gpu_device(0x7550), "RX 9070 XT");
+    }
+
+    #[test]
+    fn auto_cpu_threads_is_never_zero_and_scales_per_instance() {
+        let single_instance =
+            auto_cpu_threads(1, 0, CpuAffinityMode::Auto, CpuPageMode::Auto, Some(5));
+        let dual_instance =
+            auto_cpu_threads(2, 0, CpuAffinityMode::Auto, CpuPageMode::Auto, Some(5));
+
+        assert!(single_instance >= 1);
+        assert!(dual_instance >= 1);
+        assert!(dual_instance <= single_instance);
+    }
+
+    #[test]
+    fn cgroup_headroom_credits_reclaimable_cache_and_keeps_zero_limits() {
+        let budget = MemoryBudgetBytes {
+            effective_total: 100,
+            effective_available: 50,
+        };
+        let child = constrain_cgroup_budget(budget, 80, 70, 20);
+        assert_eq!((child.effective_total, child.effective_available), (80, 30));
+        let parent = constrain_cgroup_budget(child, 60, 55, 5);
+        assert_eq!(
+            (parent.effective_total, parent.effective_available),
+            (60, 10)
+        );
+        let exhausted = constrain_cgroup_budget(budget, 50, 80, 10);
+        assert_eq!(exhausted.effective_available, 0);
+        let zero = constrain_cgroup_budget(budget, 0, 0, 100);
+        assert_eq!((zero.effective_total, zero.effective_available), (0, 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nested_cgroup_budget_inherits_high_and_max_and_excludes_dirty_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "seine-cgroup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let child = root.join("service/worker");
+        fs::create_dir_all(&child).unwrap();
+        for (dir, max, high, current, stats) in [
+            (
+                root.clone(),
+                "100",
+                "max",
+                "90",
+                "inactive_file 20\nfile_dirty 3\nfile_writeback 2\n",
+            ),
+            (
+                root.join("service"),
+                "90",
+                "80",
+                "70",
+                "inactive_file 20\nfile_dirty 0\nfile_writeback 0\n",
+            ),
+            (child, "max", "max", "40", "inactive_file 0\n"),
+        ] {
+            for (name, value) in [
+                ("memory.max", max),
+                ("memory.high", high),
+                ("memory.current", current),
+                ("memory.stat", stats),
+            ] {
+                fs::write(dir.join(name), value).unwrap();
+            }
+        }
+        let budget = MemoryBudgetBytes {
+            effective_total: 200,
+            effective_available: 100,
+        };
+        let result = cgroup_v2_budget_at(budget, &root, "service/worker").unwrap();
+        assert_eq!(
+            (result.effective_total, result.effective_available),
+            (80, 25)
+        );
+        assert!(cgroup_v2_budget_at(budget, &root, "../outside").is_none());
+        assert!(cgroup_v2_budget_at(budget, &root, "/outside").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn adaptive_memory_budget_counts_owned_arenas_once_and_allows_zero() {
+        let gib = 1024 * 1024 * 1024;
+        let budget = MemoryBudgetBytes {
+            effective_total: 32 * gib,
+            effective_available: 8 * gib,
+        };
+        let calculate = |owned| cpu_capacity_from_budget(budget, owned, 0, Some(5), 1, 16);
+        assert_eq!(calculate(0), (15, 3));
+        assert_eq!(calculate(8 * gib), (15, 7));
+        assert_eq!(
+            cpu_capacity_from_budget(budget, 8 * gib, 0, Some(5), 1, 2),
+            (2, 7)
+        );
+        assert_eq!(
+            cpu_capacity_from_budget(
+                MemoryBudgetBytes {
+                    effective_total: 32 * gib,
+                    effective_available: 0
+                },
+                0,
+                0,
+                Some(5),
+                1,
+                16
+            ),
+            (15, 0)
+        );
+        assert_eq!(
+            cpu_capacity_from_budget(budget, 8 * gib, 0, Some(5), 2, 8),
+            (7, 3)
+        );
+        assert_eq!(
+            cpu_capacity_from_budget(budget, u64::MAX, 0, Some(5), 1, 16),
+            (15, 15)
+        );
+    }
+
+    #[test]
+    fn automatic_memory_headroom_respects_effective_total_and_gpu_reservation() {
+        let gib = 1024 * 1024 * 1024;
+        let budget = MemoryBudgetBytes {
+            effective_total: 512 * gib,
+            effective_available: 490 * gib,
+        };
+        let usable = auto_cpu_memory_bytes(budget, 8 * gib, Some(5));
+        assert_eq!(usable, 482 * gib - (512 * gib / 100 * 5));
+        assert_eq!(usable / CPU_LANE_MEMORY_BYTES, 228);
+        assert_eq!(auto_cpu_memory_bytes(budget, 0, Some(0)), 490 * gib);
+        let constrained = MemoryBudgetBytes {
+            effective_total: 16 * gib,
+            effective_available: gib / 2,
+        };
+        assert_eq!(auto_cpu_memory_bytes(constrained, 0, Some(5)), 0);
+        assert_eq!(auto_cpu_memory_bytes(constrained, 20 * gib, Some(0)), 0);
+        // The default reserve is 5% capped at 1 GiB: a 32 GiB host with 29.4 GiB
+        // free fits 14 arenas (an uncapped 5% left 13).
+        let vm = MemoryBudgetBytes {
+            effective_total: 32 * gib,
+            effective_available: 29 * gib + 400 * 1024 * 1024,
+        };
+        assert_eq!(
+            auto_cpu_memory_bytes(vm, 0, None) / CPU_LANE_MEMORY_BYTES,
+            14
+        );
+        assert_eq!(
+            auto_cpu_memory_bytes(vm, 0, Some(5)) / CPU_LANE_MEMORY_BYTES,
+            13
+        );
+        assert_eq!(memory_reserve_bytes(8 * gib, None), 8 * gib / 100 * 5);
+        assert_eq!(memory_reserve_bytes(15 * gib, None), 15 * gib / 100 * 5);
+        assert_eq!(memory_reserve_bytes(16 * gib, None), gib / 2);
+        assert_eq!(memory_reserve_bytes(64 * gib, None), gib / 2);
+    }
+
+    #[test]
+    fn pinned_kernel_trials_only_for_plain_explicit_counts() {
+        assert!(pinned_kernel_trials_wanted(
+            true, 1, false, false, false, false
+        ));
+        assert!(!pinned_kernel_trials_wanted(
+            false, 1, false, false, false, false
+        ));
+        assert!(!pinned_kernel_trials_wanted(
+            true, 0, false, false, false, false
+        ));
+        assert!(!pinned_kernel_trials_wanted(
+            true, 1, true, false, false, false
+        ));
+        assert!(!pinned_kernel_trials_wanted(
+            true, 1, false, true, false, false
+        ));
+        assert!(!pinned_kernel_trials_wanted(
+            true, 1, false, false, true, false
+        ));
+        assert!(!pinned_kernel_trials_wanted(
+            true, 1, false, false, false, true
+        ));
+    }
+
+    #[test]
+    fn wsl_sizing_notice_only_when_memory_caps_workers_under_wsl2() {
+        let gib = 1024 * 1024 * 1024;
+        let notice = wsl_sizing_notice("wsl2", 1, 3, 16, 8 * gib).unwrap();
+        assert!(notice.contains("memory=34GB"), "{notice}");
+        assert!(
+            notice.contains("8 GiB of RAM, enough for 3 of 16 CPU threads"),
+            "{notice}"
+        );
+        assert!(wsl_sizing_notice("wsl2", 1, 16, 16, 64 * gib).is_none());
+        assert!(wsl_sizing_notice("native", 1, 3, 16, 8 * gib).is_none());
+        assert!(wsl_sizing_notice("wsl2", 0, 3, 16, 8 * gib).is_none());
+    }
+
+    #[test]
+    fn underused_explicit_threads_get_a_sizing_hint() {
+        assert!(underused_threads_notice(Some(3), 1, false, 11)
+            .is_some_and(|n| n.contains("--threads 3") && n.contains("under half of the 11")));
+        assert!(underused_threads_notice(Some(6), 1, false, 11).is_none());
+        assert!(underused_threads_notice(None, 1, false, 11).is_none());
+        assert!(underused_threads_notice(Some(3), 1, true, 11).is_none());
+        assert!(underused_threads_notice(Some(3), 0, false, 11).is_none());
+    }
+
+    #[test]
+    fn automatic_memory_reserve_cli_default_and_opt_out() {
+        assert_eq!(
+            Cli::try_parse_from(["seine"])
+                .unwrap()
+                .cpu_memory_reserve_percent,
+            None
+        );
+        let cli = Cli::try_parse_from([
+            "seine",
+            "--cpu-memory-reserve-percent",
+            "0",
+            "--cpu-affinity",
+            "os",
+        ])
+        .unwrap();
+        assert_eq!(cli.cpu_memory_reserve_percent, Some(0));
+        assert_eq!(cli.cpu_affinity, CpuAffinityMode::Os);
+        assert!(Cli::try_parse_from(["seine", "--cpu-memory-reserve-percent", "100"]).is_err());
+    }
+
+    #[test]
+    fn a_fractional_cpu_quota_counts_the_partial_cpu() {
+        // 15.36 CPUs on 16: the partial CPU is usable.
+        assert_eq!(with_fractional_quota(15, Some(15.36), Some(16)), 16);
+        // A whole quota, no quota, or a tighter affinity changes nothing.
+        assert_eq!(with_fractional_quota(8, Some(8.0), Some(16)), 8);
+        assert_eq!(with_fractional_quota(16, None, Some(16)), 16);
+        assert_eq!(with_fractional_quota(4, Some(7.68), Some(4)), 4);
+        // Pinned to as many CPUs as the quota rounds down to.
+        assert_eq!(with_fractional_quota(7, Some(7.68), Some(7)), 7);
+        // A quota below one CPU still gives one worker.
+        assert_eq!(with_fractional_quota(1, Some(0.5), Some(16)), 1);
+        // Affinity unknown: keep what the standard library reported.
+        assert_eq!(with_fractional_quota(7, Some(7.68), None), 7);
+    }
+
+    #[test]
+    fn cgroup_cpu_quotas_parse() {
+        assert_eq!(parse_cgroup_v2_cpu_max("1536000 100000\n"), Some(15.36));
+        assert_eq!(parse_cgroup_v2_cpu_max("max 100000\n"), None);
+        assert_eq!(
+            parse_cgroup_v1_cpu_quota("768000\n", "100000\n"),
+            Some(7.68)
+        );
+        assert_eq!(parse_cgroup_v1_cpu_quota("-1\n", "100000\n"), None);
+    }
+
+    #[test]
+    fn auto_cpu_threads_reduced_by_gpu_reservation() {
+        let without_gpu = auto_cpu_threads(1, 0, CpuAffinityMode::Auto, CpuPageMode::Auto, Some(5));
+        let with_gpu = auto_cpu_threads(
+            1,
+            4 * CPU_LANE_MEMORY_BYTES,
+            CpuAffinityMode::Auto,
+            CpuPageMode::Auto,
+            Some(5),
+        );
+
+        assert!(with_gpu >= 1);
+        // With a 4-lane GPU reservation, the CPU should get fewer (or equal) lanes
+        assert!(with_gpu <= without_gpu);
+    }
+
+    #[test]
+    fn macos_hybrid_pcore_parallelism_cap_is_bounded() {
+        assert_eq!(macos_hybrid_pcore_parallelism_cap(12, 16), 14);
+        assert_eq!(macos_hybrid_pcore_parallelism_cap(10, 12), 11);
+        assert_eq!(macos_hybrid_pcore_parallelism_cap(8, 8), 8);
+        assert_eq!(macos_hybrid_pcore_parallelism_cap(12, 10), 10);
+    }
+
+    #[test]
+    fn distribute_auto_cpu_threads_divides_total_lane_budget() {
+        assert_eq!(distribute_auto_cpu_threads(12, 1), 12);
+        assert_eq!(distribute_auto_cpu_threads(12, 2), 6);
+        assert_eq!(distribute_auto_cpu_threads(12, 5), 2);
+        assert_eq!(distribute_auto_cpu_threads(1, 4), 1);
+    }
+
+    #[test]
+    fn cpu_profile_defaults_adjust_tuning_knobs() {
+        let throughput = cpu_profile_defaults(CpuPerformanceProfile::Throughput, 8);
+        assert_eq!(throughput.threads, 8);
+        assert_eq!(throughput.hash_poll_ms, 100);
+        assert_eq!(throughput.cpu_hash_batch_size, 256);
+
+        let efficiency = cpu_profile_defaults(CpuPerformanceProfile::Efficiency, 8);
+        assert_eq!(efficiency.threads, 4);
+        assert_eq!(efficiency.hash_poll_ms, 400);
+        assert_eq!(efficiency.cpu_hash_batch_size, 32);
+    }
+
+    #[test]
+    fn cpu_autotune_defaults_on_when_threads_omitted() {
+        let mut cli = sample_cli();
+        cli.threads = None;
+        let backends = cli.backends.clone();
+        let cpu_backend_instances = backends
+            .iter()
+            .filter(|kind| matches!(kind, BackendKind::Cpu))
+            .count();
+        let auto_threads_cap = auto_cpu_threads(
+            cpu_backend_instances,
+            0,
+            cli.cpu_affinity,
+            cli.cpu_page_mode,
+            cli.cpu_memory_reserve_percent,
+        );
+        let defaults = cpu_profile_defaults(cli.cpu_profile, auto_threads_cap);
+        let cpu_autotune_threads = cpu_autotune_enabled(&cli, cpu_backend_instances);
+        let resolved_threads = cli.threads.unwrap_or(defaults.threads);
+        assert!(cpu_autotune_threads);
+        assert!(resolved_threads >= 1);
+    }
+
+    #[test]
+    fn explicit_cpu_counts_disable_adaptation_unless_forced() {
+        let mut cli = sample_cli();
+        cli.threads = None;
+        cli.cpu_threads_per_instance = vec![2, 4];
+        assert!(!cpu_autotune_enabled(&cli, 2));
+        cli.cpu_autotune_threads = true;
+        assert!(cpu_autotune_enabled(&cli, 2));
+        cli.cpu_autotune_threads = false;
+        cli.cpu_threads_per_instance.clear();
+        cli.threads = Some(2);
+        assert!(!cpu_autotune_enabled(&cli, 1));
+    }
+
+    #[test]
+    fn cpu_autotune_disable_flag_wins_over_default() {
+        let mut cli = sample_cli();
+        cli.threads = None;
+        cli.disable_cpu_autotune_threads = true;
+        let backends = cli.backends.clone();
+        let cpu_backend_instances = backends
+            .iter()
+            .filter(|kind| matches!(kind, BackendKind::Cpu))
+            .count();
+        let cpu_autotune_threads = cpu_autotune_enabled(&cli, cpu_backend_instances);
+        assert!(!cpu_autotune_threads);
+    }
+
+    /// Pool-mode backend selection.
+    fn resolve_backend_selection(
+        requested_backends: &[BackendKind],
+        nvidia_devices: &[u32],
+        nvidia_available: bool,
+        amd_devices: &[u32],
+        amd_available: bool,
+    ) -> (Vec<BackendKind>, Option<&'static str>) {
+        resolve_backend_selection_in(
+            MiningMode::Pool,
+            requested_backends,
+            nvidia_devices,
+            nvidia_available,
+            amd_devices,
+            amd_available,
+        )
+    }
+
+    /// The default selection: Apple Silicon builds that mine BLAKE2b add Metal
+    /// after the CPU.
+    fn auto_selected(mut kinds: Vec<BackendKind>) -> Vec<BackendKind> {
+        if cfg!(all(feature = "metal", target_os = "macos"))
+            && crate::miner::mines_blake2b_in(MiningMode::Pool)
+        {
+            kinds.insert(1, BackendKind::Metal);
+        }
+        kinds
+    }
+
+    #[test]
+    fn resolve_backend_selection_uses_requested_backends_verbatim() {
+        let (selected, hint) = resolve_backend_selection(
+            &[BackendKind::Nvidia, BackendKind::Cpu],
+            &[],
+            false,
+            &[],
+            false,
+        );
+        assert_eq!(selected, vec![BackendKind::Nvidia, BackendKind::Cpu]);
+        assert!(hint.is_none());
+    }
+
+    #[test]
+    fn resolve_backend_selection_defaults_to_cpu_only_when_nvidia_unavailable() {
+        let (selected, _hint) = resolve_backend_selection(&[], &[], false, &[], false);
+        assert_eq!(selected, auto_selected(vec![BackendKind::Cpu]));
+    }
+
+    #[test]
+    fn resolve_backend_selection_defaults_to_cpu_and_nvidia_when_available() {
+        let (selected, hint) = resolve_backend_selection(&[], &[], true, &[], false);
+        assert_eq!(
+            selected,
+            auto_selected(vec![BackendKind::Cpu, BackendKind::Nvidia])
+        );
+        assert!(hint.is_none());
+    }
+
+    #[test]
+    fn resolve_backend_selection_adds_amd_when_available() {
+        let (selected, hint) = resolve_backend_selection(&[], &[], false, &[], true);
+        assert_eq!(
+            selected,
+            auto_selected(vec![BackendKind::Cpu, BackendKind::Amd])
+        );
+        assert!(hint.is_none());
+        let (selected, _) = resolve_backend_selection(&[], &[], true, &[], true);
+        assert_eq!(
+            selected,
+            auto_selected(vec![
+                BackendKind::Cpu,
+                BackendKind::Nvidia,
+                BackendKind::Amd
+            ])
+        );
+    }
+
+    #[test]
+    fn resolve_backend_selection_enables_amd_when_devices_are_explicit() {
+        let (selected, _) = resolve_backend_selection(&[], &[], false, &[0], false);
+        assert_eq!(
+            selected,
+            auto_selected(vec![BackendKind::Cpu, BackendKind::Amd])
+        );
+    }
+
+    #[test]
+    fn gpu_only_leaves_out_the_cpu_only_when_a_gpu_is_selected() {
+        for (mut selected, expected) in [
+            (
+                vec![BackendKind::Cpu, BackendKind::Nvidia, BackendKind::Amd],
+                vec![BackendKind::Nvidia, BackendKind::Amd],
+            ),
+            (
+                vec![BackendKind::Cpu, BackendKind::Amd],
+                vec![BackendKind::Amd],
+            ),
+            (vec![BackendKind::Cpu], vec![BackendKind::Cpu]),
+        ] {
+            drop_cpu_when_a_gpu_is_selected(&mut selected);
+            assert_eq!(selected, expected);
+        }
+        assert!(Cli::try_parse_from(["seine", "--gpu-only", "--backend", "amd"]).is_err());
+    }
+
+    #[test]
+    fn resolve_backend_selection_keeps_requested_backends_when_amd_available() {
+        let (selected, _) = resolve_backend_selection(&[BackendKind::Cpu], &[], false, &[], true);
+        assert_eq!(selected, vec![BackendKind::Cpu]);
+    }
+
+    #[test]
+    fn bench_mode_skips_pool_mode_input_validation() {
+        let mut cli = sample_cli();
+        cli.mode = Some(MiningMode::Pool);
+        cli.bench = true;
+        assert!(!should_validate_pool_mode_inputs(&cli));
+    }
+
+    #[test]
+    fn normal_pool_mode_still_validates_inputs() {
+        let mut cli = sample_cli();
+        cli.mode = Some(MiningMode::Pool);
+        assert!(should_validate_pool_mode_inputs(&cli));
+    }
+
+    #[test]
+    fn resolve_backend_selection_enables_nvidia_when_devices_are_explicit() {
+        let (selected, hint) = resolve_backend_selection(&[], &[0, 1], false, &[], false);
+        assert_eq!(
+            selected,
+            auto_selected(vec![BackendKind::Cpu, BackendKind::Nvidia])
+        );
+        assert!(hint.is_none());
+    }
+
+    #[cfg(all(feature = "nvidia", not(target_os = "macos")))]
+    #[test]
+    fn resolve_backend_selection_emits_cuda_hint_when_nvidia_unavailable() {
+        let (_, hint) = resolve_backend_selection(&[], &[], false, &[], false);
+        assert!(hint.is_some());
+    }
+
+    #[cfg(all(feature = "nvidia", target_os = "macos"))]
+    #[test]
+    fn resolve_backend_selection_skips_cuda_hint_on_macos() {
+        let (_, hint) = resolve_backend_selection(&[], &[], false, &[], false);
+        assert!(hint.is_none());
+    }
+}
+
+/// Kept separate from config persistence so the restrictions can be tested
+/// without creating a user config or probing GPU drivers.
+pub(crate) fn validate_benchmark_cpu_kernel(
+    kernel: Option<blocknet_pow_kernel::CpuKernel>,
+    bench: bool,
+    backends: &[BackendKind],
+    threads: Option<usize>,
+    autotune: bool,
+) -> Result<()> {
+    let Some(kernel) = kernel else {
+        return Ok(());
+    };
+    if !bench {
+        bail!("--bench-cpu-kernel requires --bench");
+    }
+    if backends.is_empty() || backends.iter().any(|kind| *kind != BackendKind::Cpu) {
+        bail!("--bench-cpu-kernel requires CPU-only backends (--backend cpu)");
+    }
+    if threads.is_none() || threads == Some(0) || autotune {
+        bail!("--bench-cpu-kernel requires fixed --threads and CPU autotuning disabled");
+    }
+    if !kernel.is_supported() {
+        bail!("CPU kernel {kernel} is not supported by this host/build");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod benchmark_kernel_tests {
+    use super::*;
+    use blocknet_pow_kernel::CpuKernel;
+
+    #[test]
+    fn explicit_kernel_requires_offline_fixed_cpu_benchmark() {
+        let kernel = Some(CpuKernel::Scalar);
+        for (bench, backends, threads, autotune) in [
+            (false, vec![BackendKind::Cpu], Some(1), false),
+            (true, vec![], Some(1), false),
+            (true, vec![BackendKind::Nvidia], Some(1), false),
+            (
+                true,
+                vec![BackendKind::Cpu, BackendKind::Nvidia],
+                Some(1),
+                false,
+            ),
+            (true, vec![BackendKind::Cpu], None, false),
+            (true, vec![BackendKind::Cpu], Some(0), false),
+            (true, vec![BackendKind::Cpu], Some(1), true),
+        ] {
+            assert!(
+                validate_benchmark_cpu_kernel(kernel, bench, &backends, threads, autotune).is_err()
+            );
+        }
+        assert!(
+            validate_benchmark_cpu_kernel(kernel, true, &[BackendKind::Cpu], Some(1), false)
+                .is_ok()
+        );
+        assert!(validate_benchmark_cpu_kernel(None, false, &[], None, true).is_ok());
+        for unsupported in CpuKernel::ALL.into_iter().filter(|k| !k.is_supported()) {
+            assert!(validate_benchmark_cpu_kernel(
+                Some(unsupported),
+                true,
+                &[BackendKind::Cpu],
+                Some(1),
+                false
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn cli_requires_bench_and_explicit_threads_for_kernel_override() {
+        assert!(Cli::try_parse_from(["seine", "--bench-cpu-kernel", "scalar"]).is_err());
+        assert!(Cli::try_parse_from(["seine", "--bench", "--bench-cpu-kernel", "scalar"]).is_err());
+        let cli = Cli::try_parse_from([
+            "seine",
+            "--bench",
+            "--threads",
+            "1",
+            "--backend",
+            "cpu",
+            "--bench-cpu-kernel",
+            "scalar",
+        ])
+        .unwrap();
+        assert_eq!(cli.bench_cpu_kernel, Some(CpuKernel::Scalar));
+    }
+
+    /// A new flag stays hidden unless most miners need it.
+    #[test]
+    fn help_lists_only_the_flags_miners_need() {
+        let command = cli_command();
+        let visible: Vec<&str> = command
+            .get_arguments()
+            .filter(|arg| !arg.is_hide_set())
+            .filter_map(|arg| arg.get_long())
+            .collect();
+        assert_eq!(
+            visible,
+            [
+                "pool-url",
+                "address",
+                "pool-worker",
+                "payout-memo",
+                "pool-proxy",
+                "proxy-listen",
+                "backend",
+                "threads",
+                "nvidia-devices",
+                "amd-devices",
+                "nvidia-max-lanes",
+                "amd-max-lanes",
+                "metal-max-lanes",
+                "cpu-profile",
+                "cpu-autotune-max-threads",
+                "cpu-page-mode",
+                "cpu-affinity",
+                "mode",
+                "api-url",
+                "cookie",
+                "wallet-password-file",
+                "ui",
+                "verbose",
+                "stats-secs",
+                "data-dir",
+                "api-server",
+                "api-bind",
+                "self-update",
+                "no-auto-update",
+                "disable-update-check",
+                "telemetry",
+                "bench",
+                "help",
+                "version",
+            ]
+        );
+    }
+
+    #[test]
+    fn long_and_short_help_print_the_same_list() {
+        let render = |flag: &str| {
+            let err = cli_command()
+                .try_get_matches_from(["seine", flag])
+                .expect_err("help exits through an error");
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+            err.to_string()
+        };
+        let long = render("--help");
+        assert_eq!(long, render("-h"));
+        assert!(long.contains("--pool-url"));
+        assert!(!long.contains("--backend-assign-timeout-ms"));
+        assert!(long.contains("MINER_FLAGS.md"));
+    }
+
+    #[test]
+    fn version_flags_still_report_the_version() {
+        for flag in ["--version", "-V"] {
+            let err = cli_command()
+                .try_get_matches_from(["seine", flag])
+                .expect_err("version exits through an error");
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert!(err.to_string().contains(crate::version::RELEASE_VERSION));
+        }
+    }
+
+    /// Auto-update restarts with the same arguments, so a flag removed from the
+    /// parser would stop any rig that passes it.
+    #[test]
+    fn hidden_flags_are_still_accepted() {
+        let cli = cli_command()
+            .try_get_matches_from([
+                "seine",
+                "-p",
+                "x",
+                "--auto-update",
+                "--telemetry-url",
+                "https://example.invalid/v1/reports",
+                "--testnet",
+                "--token",
+                "t",
+                "--daemon-dir",
+                "/tmp/d",
+                "--wallet-password",
+                "w",
+                "--refresh-secs",
+                "20",
+                "--request-timeout-secs",
+                "10",
+                "--events-stream-timeout-secs",
+                "10",
+                "--events-idle-timeout-secs",
+                "90",
+                "--backend-event-capacity",
+                "1024",
+                "--hash-poll-ms",
+                "200",
+                "--cpu-hash-batch-size",
+                "1",
+                "--cpu-control-check-interval-hashes",
+                "1",
+                "--cpu-hash-flush-ms",
+                "200",
+                "--cpu-event-dispatch-capacity",
+                "64",
+                "--cpu-memory-reserve-percent",
+                "5",
+                "--allow-oversubscribe",
+                "--cpu-threads-per-instance",
+                "1",
+                "--cpu-affinity-per-instance",
+                "auto",
+                "--disable-cpu-autotune-threads",
+                "--cpu-autotune-min-threads",
+                "1",
+                "--cpu-autotune-secs",
+                "6",
+                "--cpu-autotune-config",
+                "/tmp/c",
+                "--nvidia-autotune-secs",
+                "5",
+                "--nvidia-autotune-samples",
+                "2",
+                "--nvidia-autotune-config",
+                "/tmp/n",
+                "--nvidia-max-rregcount",
+                "128",
+                "--nvidia-dispatch-iters-per-lane",
+                "1",
+                "--nvidia-allocation-iters-per-lane",
+                "1",
+                "--nvidia-hashes-per-launch-per-lane",
+                "2",
+                "--nvidia-no-adaptive-launch-depth",
+                "--nvidia-fused-target-check",
+                "--nvidia-template-stop-policy",
+                "auto",
+                "--metal-hashes-per-launch-per-lane",
+                "2",
+                "--backend-assign-timeout-ms",
+                "1000",
+                "--backend-assign-timeout-ms-per-instance",
+                "1000",
+                "--backend-assign-timeout-strikes",
+                "3",
+                "--backend-assign-timeout-strikes-per-instance",
+                "3",
+                "--backend-control-timeout-ms",
+                "60000",
+                "--backend-control-timeout-ms-per-instance",
+                "60000",
+                "--allow-best-effort-deadlines",
+                "--prefetch-wait-ms",
+                "250",
+                "--tip-listener-join-wait-ms",
+                "250",
+                "--submit-join-wait-ms",
+                "2000",
+                "--strict-round-accounting",
+                "--start-nonce",
+                "0",
+                "--nonce-iters-per-lane",
+                "1",
+                "--work-allocation",
+                "adaptive",
+                "--sub-round-rebalance-ms",
+                "0",
+                "--disable-sse",
+                "--refresh-on-same-height",
+                "--service",
+                "--api-allow-unsafe-bind",
+                "--api-cors",
+                "*",
+                "--api-token",
+                "t",
+                "--api-cookie",
+                "/tmp/k",
+                "--bench",
+                "--bench-kind",
+                "backend",
+                "--bench-pow",
+                "argon2id",
+                "--bench-secs",
+                "1",
+                "--bench-rounds",
+                "1",
+                "--bench-warmup-rounds",
+                "0",
+                "--bench-output",
+                "/tmp/o",
+                "--bench-baseline",
+                "/tmp/b",
+                "--bench-fail-below-pct",
+                "1",
+                "--bench-baseline-policy",
+                "strict",
+            ])
+            .map(|matches| Cli::from_arg_matches(&matches).unwrap());
+        assert!(cli.is_ok(), "{:?}", cli.err());
+
+        assert!(Cli::try_parse_from(["seine", "--no-payout-memo"]).is_ok());
+        assert!(Cli::try_parse_from(["seine", "--cpu-autotune-threads"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "seine",
+            "--bench",
+            "--threads",
+            "1",
+            "--bench-cpu-kernel",
+            "scalar",
+        ])
+        .is_ok());
+    }
+}

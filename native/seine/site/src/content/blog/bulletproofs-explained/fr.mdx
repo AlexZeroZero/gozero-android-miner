@@ -1,0 +1,111 @@
+---
+title: 'Bulletproofs expliqués : comment vérifier des montants masqués'
+description: 'Les Bulletproofs expliqués simplement : comment les engagements de Pedersen masquent les montants et comment les preuves d''intervalle laissent chaque nœud vérifier.'
+tags: [Bulletproofs, Confidentialité, Cryptographie, Blocknet]
+faq:
+  - q: 'Les Bulletproofs nécessitent-ils une configuration de confiance (trusted setup) ?'
+    a: 'Non. Les Bulletproofs reposent uniquement sur l''hypothèse du logarithme discret, la même que celle des signatures sur courbes elliptiques, et utilisent des paramètres publics que chacun peut dériver. Il n''y a ni cérémonie de configuration ni secret que quelqu''un devrait détruire ensuite, et des cryptomonnaies de confidentialité comme Monero et Blocknet les utilisent pour leurs preuves d''intervalle.'
+  - q: 'Quelle est la taille d''une preuve d''intervalle Bulletproofs ?'
+    a: 'Un seul Bulletproof de 64 bits contient 2 × log2(64) + 9 = 21 éléments. Sur le groupe Ristretto, chaque élément occupe 32 octets : chaque preuve fait donc 672 octets, et l''explorateur Blocknet affiche exactement cette taille pour chaque sortie. La taille croît avec le logarithme de l''intervalle, donc doubler le nombre de bits n''ajoute que deux éléments.'
+  - q: 'Qui peut voir le montant d''une transaction Blocknet ?'
+    a: "Pour un paiement ordinaire, l’expéditeur connaît le montant et le portefeuille destinataire retrouve le montant reçu. Des preuves de paiement ou un accès en lecture volontairement partagés peuvent le révéler à d’autres personnes. Les données publiques de la transaction comprennent toujours les frais et sa structure. Les récompenses coinbase sont différentes : leur montant autorisé et leur encodage se déduisent publiquement de la hauteur du bloc et des données de la transaction."
+  - q: 'Comment les nœuds savent-ils qu''aucun coin n''a été créé si les montants sont masqués ?'
+    a: "Pour les paiements ordinaires, les preuves de plage bornent chaque sortie entre 0 et 2^64−1 et l’équilibre des engagements vérifie la conservation de la valeur, frais compris. La validation complète vérifie aussi l’autorisation de dépense, la liaison à l’anneau et la réutilisation des images de clé. La nouvelle émission suit un contrôle coinbase distinct par rapport à la récompense autorisée. Ce sont des contrôles différents : une preuve de plage ne vérifie pas à elle seule toutes les règles de transaction."
+sourceHash: 3be778e9122b
+translation: draft
+---
+
+Les Bulletproofs sont de courtes preuves de plage à divulgation nulle de connaissance qui aident à vérifier les montants cachés des paiements. Ce guide explique les engagements de Pedersen, pourquoi borner les montants et comment les Bulletproofs restent petites. Dans Blocknet, les preuves de plage accompagnent les contrôles d’autorisation, d’équilibre, de dépenses répétées et de coinbase. Ensemble, ils montrent comment la confidentialité des paiements ordinaires s’accorde avec la validation des mouvements d’argent et de la nouvelle émission.
+
+## Que sont les Bulletproofs ?
+
+<Answer>
+Les Bulletproofs sont des preuves courtes à divulgation nulle de connaissance, publiées par Bünz, Bootle, Boneh, Poelstra, Wuille et Maxwell en 2018. Dans les cryptomonnaies, elles prouvent qu'un montant masqué se situe dans un intervalle valide, par exemple de 0 à 2^64−1, sans le révéler. Elles ne nécessitent aucune configuration de confiance, et leur taille ne croît qu'avec le logarithme de l'intervalle.
+</Answer>
+
+L'article, [Bulletproofs: Short Proofs for Confidential Transactions and More](https://eprint.iacr.org/2017/1066), a été présenté à l'IEEE Symposium on Security and Privacy en 2018. Ses auteurs les ont conçues pour les transactions confidentielles, où les montants d'une blockchain sont remplacés par des engagements. Pour comprendre pourquoi une telle preuve est nécessaire, il faut partir de l'engagement.
+
+## Qu'est-ce qu'un engagement de Pedersen ?
+
+Un engagement (commitment) est la version cryptographique d'une enveloppe scellée. Vous mettez un nombre dedans, montrez l'enveloppe à tout le monde et pouvez plus tard prouver ce qu'elle contenait. Personne ne peut lire le nombre à travers l'enveloppe, et vous ne pouvez pas y glisser un autre nombre après coup.
+
+Un engagement de Pedersen, décrit par Torben Pedersen en 1991, réalise cela avec des points d'une courbe elliptique. Pour s'engager sur un montant `v`, un portefeuille choisit un secret aléatoire `r`, appelé facteur d'aveuglement, et calcule :
+
+```
+C = v·G + r·H
+```
+
+`G` et `H` sont deux points publics fixes de la courbe, choisis pour que personne ne sache exprimer l'un comme un multiple de l'autre. Le résultat `C` est un seul point de 32 octets. Il a deux propriétés :
+
+- **Masquage.** Comme `r` est aléatoire, `C` ressemble à un point aléatoire. Le même montant engagé deux fois donne deux engagements sans lien, et l'engagement seul n'apprend rien à un observateur sur `v`.
+- **Liaison.** Une fois `C` publié, le portefeuille ne peut pas l'ouvrir sur un autre montant. Il faudrait pour cela résoudre le problème du logarithme discret sur la courbe.
+
+## Comment les nœuds peuvent-ils vérifier une transaction qu'ils ne peuvent pas lire ?
+
+<Answer>
+Les engagements de Pedersen peuvent s'additionner. La somme de deux engagements est un engagement sur la somme de leurs montants, les facteurs d'aveuglement s'additionnant eux aussi. Un nœud additionne les engagements d'entrée d'une transaction d'un côté, ses engagements de sortie plus les frais de l'autre, et vérifie que les deux totaux correspondent : il confirme ainsi l'équilibre sans voir aucun montant.
+</Answer>
+
+Additionner deux engagements donne `(v1 + v2)·G + (r1 + r2)·H`, lui-même un engagement sur `v1 + v2`. L’expéditeur choisit les facteurs de masquage pour que leur total aux entrées soit égal à celui des sorties. Si les montants s’équilibrent, soustraire les engagements des sorties et celui des frais à la somme des entrées donne zéro.
+
+Les frais réseau sont publics, comme d’autres données de transaction telles que le hash et la structure des entrées et sorties. Les nœuds transforment les frais en engagement au masquage nul et l’ajoutent du côté des sorties. Pour un paiement ordinaire, le contrôle de conservation s’écrit : entrées = sorties + frais.
+
+## Pourquoi les montants masqués ont-ils besoin de preuves d'intervalle ?
+
+L'arithmétique des engagements fonctionne modulo un très grand nombre, l'ordre du groupe de la courbe, qui vaut environ 2^252. Dans cette arithmétique, un montant « négatif » n'est qu'un énorme montant positif. Quelqu'un pourrait dépenser une entrée valant 10 coins et créer deux sorties, l'une valant 11 et l'autre « moins 1 ». Les engagements s'équilibreraient parfaitement, et 1 coin apparaîtrait à partir de rien, à l'insu de tous les observateurs.
+
+Une preuve d'intervalle comble cette faille. Elle prouve que le montant contenu dans un engagement se situe entre 0 et 2^64−1 sans dire lequel. Avec chaque sortie ainsi bornée, quelques sorties ne peuvent jamais totaliser un nombre assez grand pour dépasser l'ordre du groupe et revenir à zéro : des engagements équilibrés signifient donc des montants équilibrés.
+
+Les conceptions antérieures de transactions confidentielles utilisaient des preuves d'intervalle dont la taille croissait linéairement avec le nombre de bits. Les Bulletproofs ne croissent qu'avec le logarithme, ce qui ramène une preuve de 64 bits à quelques centaines d'octets.
+
+## Comment fonctionnent les Bulletproofs ?
+
+Un Bulletproof prouve un intervalle en trois étapes.
+
+1. **Décomposer le montant en bits.** Un montant de 64 bits devient un vecteur de 64 bits. Le prouveur s'engage sur ce vecteur et montre deux faits à son sujet : chaque entrée vaut 0 ou 1, et les bits, pondérés par les puissances de deux, totalisent le montant engagé.
+2. **Transformer ces faits en un seul produit scalaire.** À l'aide de défis aléatoires, le prouveur réunit toutes ces conditions en une seule affirmation sur le produit scalaire de deux vecteurs. Comme les défis sont aléatoires, une affirmation fausse ne passe qu'avec une probabilité négligeable.
+3. **Prouver le produit scalaire par divisions successives.** À chaque tour, le prouveur envoie deux points de la courbe, `L` et `R`, et les deux vecteurs sont repliés à la moitié de leur longueur. Après log2(64) = 6 tours, il ne reste qu'une seule paire de nombres.
+
+C'est de ces divisions successives que vient la taille. Le résumé de l'article évalue une preuve d'intervalle à `2·log2(n) + 9` éléments de groupe et de corps pour un intervalle de `n` bits. Pour 64 bits, cela fait 12 points pour les six tours plus 9 autres, soit 21 éléments au total, ou 672 octets quand chaque élément fait 32 octets.
+
+La preuve est non interactive. Au lieu d'un vérificateur qui envoie des défis en direct, les deux parties les dérivent en hachant la transcription de la preuve, une technique standard appelée heuristique de Fiat-Shamir. Les Bulletproofs ne nécessitent pas non plus de configuration de confiance : les générateurs sont publics et dérivés ouvertement, et la sécurité repose uniquement sur l'hypothèse du logarithme discret. Plusieurs preuves peuvent être agrégées en n'ajoutant qu'un nombre logarithmique d'éléments, et la vérification peut se faire par lots.
+
+## Qui utilise les Bulletproofs ?
+
+Monero a activé les Bulletproofs lors de sa mise à niveau du réseau du 18 octobre 2018 (la version v0.13.0) pour réduire la taille des transactions. La [bibliothèque Rust bulletproofs](https://github.com/dalek-cryptography/bulletproofs) du projet dalek-cryptography les implémente sur le groupe Ristretto de Curve25519, et la bibliothèque cryptographique de Blocknet est construite sur elle.
+
+## Comment Blocknet valide-t-il les paiements privés ?
+
+Dans la version publiée core v0.22.0, les sorties des paiements ordinaires contiennent des engagements de Pedersen, des montants chiffrés et des Bulletproofs individuelles de 64 bits. Leurs montants sont cachés dans les données publiques ordinaires. La transaction spéciale coinbase crée la récompense du bloc et suit une voie d’émission distincte, vérifiable publiquement.
+
+La validation cryptographique complète d’un paiement ordinaire comprend ces contrôles distincts dans le [validateur de transactions publié](https://github.com/blocknetprivacy/core/blob/5a0a5b510c1dce46f4eeb12c33a291052e44e7b3/transaction.go#L960) :
+
+- **Autorisation et liaison.** Chaque entrée doit utiliser 16 membres canoniques de l’anneau présents sur la chaîne. RingCT prouve la propriété et l’égalité des montants. Le vérificateur contrôle également que l’image de clé et l’engagement de pseudo-sortie correspondent à la preuve signée.
+- **Plage et équilibre.** La Bulletproof de chaque sortie est vérifiée par rapport à son engagement et borne le montant entre 0 et 2^64−1. Le transcript utilise l’étiquette "Blocknet Range Proof". La somme des pseudo-sorties signées doit égaler celle des sorties plus les frais. Ce contrôle porte sur la conservation ; il ne remplace pas l’autorisation.
+- **Dépenses répétées.** Les images de clé doivent être distinctes dans la transaction et ne pas être déjà enregistrées comme dépensées.
+
+[![Quatre tâches de validation distinctes : 1 autorisation de dépense et liaison à l’anneau ; 2 plage du montant et équilibre des engagements ; 3 image de clé pas encore dépensée ; 4 émission coinbase autorisée sur une voie distincte.](/assets/blog/blocknet-private-validation.svg)](/assets/blog/blocknet-private-validation.svg)
+
+Les contrôles **1–3** concernent les dépenses ordinaires. Le contrôle **4** concerne la transaction spéciale créant la récompense du bloc. Le diagramme distingue leurs rôles ; il ne représente pas une transaction en cours et ne remplace pas le reste de la validation du bloc.
+
+## Comment le réseau détecte-t-il une dépense répétée ?
+
+Une preuve de plage valide indique qu’un montant respecte les bornes. Elle ne dit pas que le propriétaire n’a pas déjà dépensé la sortie. L’image de clé fournit ce contrôle distinct de liaison sans identifier le véritable membre de l’anneau. La validation rejette les images dupliquées dans une transaction et celles déjà dépensées sur la chaîne acceptée. Lier l’image à la preuve RingCT signée empêche de la remplacer indépendamment. [Qui contrôle Blocknet](/fr/blog/who-controls-blocknet/) explique le rapport entre ces règles et les nœuds qui les appliquent.
+
+## Comment vérifier l’émission sans lire les soldes ?
+
+La coinbase d’un bloc n’a pas d’entrées de dépense. Le [validateur de blocs publié](https://github.com/blocknetprivacy/core/blob/5a0a5b510c1dce46f4eeb12c33a291052e44e7b3/block.go#L543) calcule la récompense autorisée pour cette hauteur et reconstitue l’engagement et le montant encodé attendus à l’aide d’un masquage dérivé publiquement. Les deux doivent correspondre. Son montant se déduit donc publiquement, contrairement aux montants cachés des paiements ordinaires.
+
+L’émission cumulée se calcule en additionnant les récompenses prévues à partir de la hauteur 1 ; le bloc de genèse n’a pas de coinbase. Ce total ne provient pas de l’addition des soldes privés des portefeuilles et n’indique pas combien est actuellement dépensable ou en circulation. Le [guide de l’offre monétaire](/fr/blog/blocknet-supply/) explique cette distinction, tandis que le [parcours d’une transaction](/fr/blog/blocknet-transaction-explained/) décrit les transferts et la monnaie rendue, qui n’émettent pas à nouveau la récompense.
+
+Vous pouvez le constater sur l'[explorateur Blocknet](https://explorer.blocknetcrypto.com). La page d'une transaction indique ses montants comme « hidden · Pedersen commitments », et chaque sortie affiche son engagement, un mémo chiffré et une preuve d'intervalle de « 672 bytes · Bulletproof », la taille que prévoient les calculs ci-dessus.
+
+Pour les paiements ordinaires, le portefeuille destinataire reconnaît ses sorties et retrouve les montants chiffrés grâce à ses informations privées de lecture. L’expéditeur connaît le montant saisi. Les preuves de paiement ou l’accès en lecture volontairement partagés peuvent apporter des informations supplémentaires à d’autres personnes. Ces choix de divulgation ne modifient pas les contrôles des engagements et des preuves du réseau.
+
+Les montants cachés des paiements ordinaires fonctionnent avec les autres couches de Blocknet : les [signatures en anneau](/fr/blog/ring-signatures-explained/) sur 16 sorties protègent la source dépensée, les [adresses furtives à usage unique](/fr/blog/stealth-addresses-explained/) protègent la destination, et [Dandelion++](/fr/blog/dandelion-plus-plus-explained/) réduit l’exposition de l’origine réseau. Le [guide de confidentialité](/fr/blog/blocknet-privacy-features/) explique chaque couche. Ces contrôles décrivent la validation complète ; la synchronisation rapide peut s’appuyer sur des points de contrôle historiques de confiance pour certaines vérifications coûteuses de signatures et de preuves de plage, conformément à l’implémentation publiée.
+
+## Obtenez vos propres BNT confidentiels
+
+Pour recevoir des paiements ordinaires en BNT dans votre portefeuille, vous pouvez miner dans un pool. Blocknet utilise la [preuve de travail Argon2id](/fr/blog/argon2id-proof-of-work-explained/), exigeante en mémoire, et seine mine avec votre CPU et les GPU NVIDIA pris en charge tout en ajustant son fonctionnement. Les paiements envoyés par bntpool.com sont des transferts ordinaires avec engagements et preuves de plage, distincts de la récompense coinbase du bloc. Le [guide de minage](/fr/blog/how-to-mine-blocknet/) couvre la configuration et les parts acceptées.
+
+<CTA target="seine" title="Minez du BNT avec seine" text="Utilisez seine avec bntpool.com et recevez les paiements ordinaires du pool dans votre propre portefeuille Blocknet." />

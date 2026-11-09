@@ -1,0 +1,147 @@
+---
+title: 'Change seine settings: threads, CPU, GPU and pool'
+description: 'Turn CPU or GPU mining off in seine, set the thread count, choose a graphics card, keep your settings for every start, and change your address or pool.'
+date: 2026-10-26
+updated: 2026-11-02
+tags: ['Mining guide', 'Configuration', 'seine']
+faq:
+  - q: 'How do I turn off CPU mining in seine?'
+    a: 'Start seine with the backend option set to your graphics card, either nvidia or amd. Use both, separated by a comma, if the machine has both kinds of card. Seine then mines on the graphics cards only and leaves the processor free for other work.'
+  - q: 'How do I turn off GPU mining in seine?'
+    a: 'Start seine with the backend option set to cpu. Seine then mines on the processor only and leaves every graphics card free for games and other apps. Remove the option to mine on the processor and the graphics cards together again.'
+  - q: 'How many CPU threads should I use?'
+    a: 'Seine picks the thread count for you, so you only need to set it when you want to leave room for other work. Each thread uses about 2 GB of RAM. Press the minus key in the dashboard until your computer feels right, then use that number.'
+  - q: 'Where does seine save its settings?'
+    a: 'Seine saves your address, pool and worker name in seine-data/seine.config.json, inside the folder you start it from. Thread and backend options are not saved there, so put them in a small start file if you want them on every start.'
+related: [mine-while-using-pc, seine-automatic-cpu-tuning, start-miner-automatically-windows, how-to-mine-blocknet]
+image: /assets/blog/configure-seine-miner.svg
+---
+
+Seine runs well with no settings at all. This guide covers the changes you are most likely to want: turning CPU or GPU mining off, using fewer threads, choosing a graphics card, and changing your address or pool.
+
+## How do you change a seine setting?
+
+<Answer>
+Close seine, open a terminal in its folder, and start it again with the setting added to the command, for example `./seine --threads 4`. On Windows, use PowerShell and `.\seine.exe --threads 4`. Seine keeps your saved address and pool, so you only type what you want to change.
+</Answer>
+
+- **Windows:** open the seine folder in File Explorer, type `powershell` in the address bar and press Enter.
+- **macOS and Linux:** open Terminal and go to the seine folder with `cd`.
+
+The examples below use `./seine`. On Windows, type `.\seine.exe` instead.
+
+## How do you turn CPU or GPU mining off?
+
+Seine mines on your CPU and every supported graphics card by default. The `--backend` setting chooses which ones to use:
+
+| What you want | Add this |
+|---|---|
+| CPU only, GPU off | `--backend cpu` |
+| NVIDIA GPU only, CPU off | `--backend nvidia` |
+| AMD GPU only, CPU off | `--backend amd` |
+| NVIDIA and AMD GPUs, CPU off | `--backend nvidia,amd` |
+
+For example, to mine on an NVIDIA card and leave the CPU free:
+
+```sh
+./seine --backend nvidia
+```
+
+The Devices panel in the [dashboard](/blog/seine-dashboard-explained/) shows a row for each device that is mining.
+
+## How do you use fewer CPU threads?
+
+Add `--threads` with the number you want:
+
+```sh
+./seine --threads 4
+```
+
+Each thread uses about 2 GB of RAM, so 4 threads use about 8 GB. Seine stays on that number until you remove the setting.
+
+To find a good number, start seine normally and press `-` in the dashboard to remove a thread, or `+` to add one. The change takes a moment, and the dashboard shows the new count. Stop when your computer feels right, then use that number with `--threads`, because the keys only last until you close seine.
+
+To let seine choose a lighter thread count itself, use this instead:
+
+```sh
+./seine --cpu-profile efficiency
+```
+
+The [desktop guide](/blog/mine-while-using-pc/) has more on mining while you use your computer.
+
+## How do you choose one graphics card?
+
+Add the card's number. The first card is `0`:
+
+```sh
+./seine --backend cpu,nvidia --nvidia-devices 0
+```
+
+This mines on the CPU and the first NVIDIA card. Use `--nvidia-devices 0,1` for two cards, and leave out `cpu,` to turn the CPU off. AMD cards work the same way:
+
+```sh
+./seine --backend cpu,amd --amd-devices 0
+```
+
+To leave video memory free for other apps, use `--nvidia-max-lanes 2` or `--amd-max-lanes 2`. Each lane uses about 2 GB of video memory. Integrated Radeon graphics stay off unless you add `--backend amd` yourself.
+
+## How do you keep your settings for every start?
+
+Seine saves your address, pool and worker name by itself. Settings such as `--threads` and `--backend` last only for that run, so put them in a small start file and open that file instead of seine.
+
+On Windows, open Notepad, type these lines with your own settings, and save the file in the seine folder as `start-mining.bat`, with **Save as type** set to **All files**:
+
+```bat
+seine.exe --backend cpu --threads 4
+pause
+```
+
+Double-click `start-mining.bat` to start mining. The `pause` line keeps the window open if seine stops, so you can read its last message.
+
+On macOS or Linux, save these lines in the seine folder as `start-mining.sh`:
+
+```sh
+#!/bin/sh
+cd "$(dirname "$0")"
+./seine --backend cpu --threads 4
+```
+
+Run `chmod +x start-mining.sh` once, then start mining with `./start-mining.sh`. Automatic updates restart seine with the same settings. To start mining whenever you sign in to Windows, follow the [automatic start guide](/blog/start-miner-automatically-windows/).
+
+## How do you change your address, pool or worker name?
+
+Close seine and open `seine-data/seine.config.json` in a text editor. The folder is inside the one you start seine from. Change the value you need and save the file:
+
+```json
+{
+  "schema_version": 1,
+  "mode": "pool",
+  "address": "@yourname",
+  "pool_url": "stratum+tcp://bntpool.com:3333",
+  "pool_worker": "desktop-01"
+}
+```
+
+Leave the other lines as they are. Keep the quotes and commas, and don't add your recovery phrase or private keys to this file.
+
+To use a different value for one run, add it to the command. The saved file stays the same:
+
+```sh
+./seine --pool-worker desktop-02
+```
+
+The other two settings are `--address` and `--pool-url`. The [address change guide](https://bntpool.com/blog/change-mining-wallet-address/) explains how the pool credits your work after you change address.
+
+## What if a setting doesn't work?
+
+| What you see | What to do |
+|---|---|
+| `--nvidia-devices requires selecting nvidia in --backend` | Add `nvidia` to the backend: `--backend cpu,nvidia`. The same applies to `amd`. |
+| `configured CPU lanes need` more RAM | Use a lower number with `--threads`, about one thread for every 2 GB of free RAM. |
+| `all GPU backends failed to start` | Install the current driver for your card. The [AMD guide](https://github.com/zpalmtree/seine/blob/master/docs/guides/amd.md) lists what AMD cards need on Linux. |
+| Seine asks for your address again | Start seine from the same folder as before, or set the folder with `--data-dir`. |
+| Your settings are back to automatic | Start seine from your start file. The `-` and `+` keys last only until you close seine. |
+
+The [flag reference](https://github.com/zpalmtree/seine/blob/master/docs/MINER_FLAGS.md) lists every setting.
+
+<CTA target="seine" title="Get the current seine release" text="Download seine, start it once, then add only the settings you want to change." />

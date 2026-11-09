@@ -1,0 +1,6198 @@
+mod adaptive_cpu;
+mod adaptive_kernel;
+#[cfg(any(target_os = "android", test))]
+mod android_kernel_policy;
+mod adaptive_search;
+pub(crate) use adaptive_kernel::{
+    cohort_side_cache_blocks, cohort_skip_store_permille, fixed_count_trials_wanted,
+};
+mod adaptive_telemetry;
+mod auth;
+mod backend_control;
+mod backend_executor;
+mod bench;
+pub(crate) mod block_latency;
+mod hash_poll;
+mod hashrate_tracker;
+pub(crate) mod live_stats;
+mod mining;
+mod mining_pool;
+mod mining_tui;
+mod round_control;
+mod round_driver;
+mod runtime;
+mod scheduler;
+pub(crate) mod session;
+mod solution_cache;
+mod stats;
+mod submit;
+mod template_prefetch;
+pub(crate) mod thread_control;
+mod tip;
+mod tui;
+mod tui_prompt;
+pub(crate) mod ui;
+mod wallet;
+mod work_allocator;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, bail, Result};
+use blocknet_pow_spec::CPU_LANE_MEMORY_BYTES;
+use crossbeam_channel::{bounded, Receiver, Sender};
+use serde::{Deserialize, Serialize};
+use sysinfo::System;
+
+use crate::backend::amd::{AmdBackend, AmdBackendTuningOptions};
+use crate::backend::cpu::{CpuBackend, CpuBackendTuning};
+use crate::backend::metal::MetalBackend;
+use crate::backend::nvidia::{NvidiaBackend, NvidiaBackendTuningOptions};
+use crate::backend::{
+    normalize_backend_capabilities, BackendCapabilities, BackendEvent, BackendExecutionModel,
+    BackendInstanceId, BackendTelemetry, DeadlineSupport, DynamicShareTarget, MiningSolution,
+    PowBackend, PreemptionGranularity, WORK_ID_MAX,
+};
+#[cfg(any(target_os = "linux", test))]
+use crate::config::CpuPageMode;
+use crate::config::{
+    BackendKind, BackendSpec, Config, CpuPerformanceProfile, MiningMode, UiMode, WorkAllocation,
+};
+use crate::daemon_api::ApiClient;
+pub(crate) use mining_tui::{close_dashboard, start_dashboard};
+use scheduler::NonceReservation;
+use stats::{format_hashrate, Stats};
+use tui::{new_tui_state, TuiState};
+pub(crate) use tui_prompt::{prompt_screen, PromptSpec};
+use ui::{info, warn};
+
+const TEMPLATE_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Re-fetch spacing while solo work needs a newer release.
+const UNSUPPORTED_WORK_RETRY_DELAY: Duration = Duration::from_secs(30);
+const MIN_EVENT_WAIT: Duration = Duration::from_millis(1);
+const BACKEND_EVENT_SOURCE_CAPACITY_MAX: usize = 256;
+const CPU_AUTOTUNE_RECORD_SCHEMA_VERSION: u32 = 11;
+const CPU_AUTOTUNE_RECORD_MAX_AGE_SECS: u64 = 14 * 24 * 60 * 60;
+const CPU_AUTOTUNE_LINEAR_SCAN_MAX_CANDIDATES: usize = 8;
+const CPU_AUTOTUNE_FINAL_SWEEP_RADIUS: usize = 2;
+const CPU_AUTOTUNE_TARGET_HASHES_PER_CANDIDATE: u64 = 20;
+const CPU_AUTOTUNE_MAX_SAMPLE_SECS_PER_CANDIDATE: u64 = 30;
+// Default mining targets the measured peak. Only the explicit efficiency
+// profile may trade measured hashrate for fewer workers.
+const CPU_AUTOTUNE_BALANCED_PEAK_FLOOR_FRAC: f64 = 1.0;
+const CPU_AUTOTUNE_EFFICIENCY_PEAK_FLOOR_FRAC: f64 = 0.75;
+const CPU_AUTOTUNE_FINAL_CONFIRM_CLOSE_FRAC: f64 = 0.97;
+const CPU_AUTOTUNE_FINAL_CONFIRM_MIN_SECS: u64 = 6;
+const CPU_AUTOTUNE_FINAL_CONFIRM_WINDOW_MULTIPLIER: u64 = 2;
+
+#[derive(Debug, Clone, Copy)]
+struct BackendRuntimePolicy {
+    assignment_timeout: Duration,
+    assignment_timeout_strikes: u32,
+    control_timeout: Duration,
+}
+
+impl Default for BackendRuntimePolicy {
+    fn default() -> Self {
+        Self {
+            assignment_timeout: Duration::from_millis(1_000),
+            assignment_timeout_strikes: 3,
+            control_timeout: Duration::from_millis(60_000),
+        }
+    }
+}
+
+struct BackendSlot {
+    id: BackendInstanceId,
+    backend: Arc<dyn PowBackend>,
+    lanes: u64,
+    runtime_policy: BackendRuntimePolicy,
+    capabilities: BackendCapabilities,
+}
+
+struct ActivatedBackend {
+    slot: BackendSlot,
+    event_rx: Receiver<BackendEvent>,
+}
+
+/// Until the BLAKE2b parameters are final
+/// (`blocknet_pow_spec::BLAKE2B_POW_PARAMS_FINAL`), pool mining mines
+/// fork-height work with the provisional ones and tells pools so with the
+/// `pow_blake2b_v1` login capability; a pool on other parameters turns it away
+/// with an update notice. Direct daemon mining has no such check, so it mines
+/// provisional work only with `1` here. `0` refuses it in every mode.
+pub(super) const PROVISIONAL_FARADAY_POW_ENV: &str = "SEINE_FARADAY_PROVISIONAL_POW";
+
+/// Set for the duration of a direct daemon mining run.
+static DIRECT_DAEMON_MINING: AtomicBool = AtomicBool::new(false);
+
+fn note_mining_mode(mode: MiningMode) {
+    DIRECT_DAEMON_MINING.store(mode == MiningMode::Daemon, Ordering::Release);
+}
+
+fn current_mining_mode() -> MiningMode {
+    if DIRECT_DAEMON_MINING.load(Ordering::Acquire) {
+        MiningMode::Daemon
+    } else {
+        MiningMode::Pool
+    }
+}
+
+fn provisional_pow_allowed_in(mode: MiningMode, setting: Option<&std::ffi::OsStr>) -> bool {
+    match mode {
+        MiningMode::Pool => setting.is_none_or(|value| value != "0"),
+        MiningMode::Daemon => setting.is_some_and(|value| value == "1"),
+    }
+}
+
+/// Whether the current run mines fork-height work with the provisional
+/// BLAKE2b parameters.
+pub(crate) fn provisional_faraday_pow_allowed() -> bool {
+    provisional_pow_allowed_in(
+        current_mining_mode(),
+        std::env::var_os(PROVISIONAL_FARADAY_POW_ENV).as_deref(),
+    )
+}
+
+/// True when a run in `mode` mines fork-height (BLAKE2b) work: final
+/// parameters, or provisional ones allowed in that mode.
+pub(crate) fn mines_blake2b_in(mode: MiningMode) -> bool {
+    blocknet_pow_spec::ensure_supported_pow(
+        blocknet_pow_spec::FARADAY_ACTIVATION_HEIGHT,
+        provisional_pow_allowed_in(
+            mode,
+            std::env::var_os(PROVISIONAL_FARADAY_POW_ENV).as_deref(),
+        ),
+    )
+    .is_ok()
+}
+
+/// True when the current run mines fork-height (BLAKE2b) work.
+pub(crate) fn mines_blake2b() -> bool {
+    mines_blake2b_in(current_mining_mode())
+}
+
+/// The first fork-height work mined with provisional parameters asks for an
+/// update check, so a release with the final parameters installs promptly.
+pub(super) fn note_provisional_pow(pow: crate::backend::PowAlgorithm) {
+    static NOTED: AtomicBool = AtomicBool::new(false);
+    if pow == crate::backend::PowAlgorithm::Blake2b512
+        && !blocknet_pow_spec::BLAKE2B_POW_PARAMS_FINAL
+        && !NOTED.swap(true, Ordering::AcqRel)
+    {
+        crate::update_check::request_check_soon();
+    }
+}
+
+static UNSUPPORTED_WORK_NOTICE: AtomicBool = AtomicBool::new(false);
+
+/// Work this build cannot mine (a PoW or header format from a later release)
+/// pauses mining instead of ending the process, so the update checker can
+/// install a release that supports it. Warns once per pause.
+pub(crate) fn note_unsupported_work(reason: &str) {
+    crate::update_check::set_mining_blocked(true);
+    crate::update_check::request_check_soon();
+    crate::diagnostics::unsupported_work(true);
+    if !UNSUPPORTED_WORK_NOTICE.swap(true, Ordering::AcqRel) {
+        let action = if crate::update_check::auto_install_active() {
+            "checking for an update"
+        } else {
+            "install the newest release (seine --self-update)"
+        };
+        ui::warn("UPDATE", format!("mining paused: {reason}; {action}"));
+    }
+}
+
+pub(crate) fn clear_unsupported_work_notice() {
+    crate::update_check::set_mining_blocked(false);
+    crate::diagnostics::unsupported_work(false);
+    if UNSUPPORTED_WORK_NOTICE.swap(false, Ordering::AcqRel) {
+        ui::info("UPDATE", "mining resumed");
+    }
+}
+
+struct DistributeWorkOptions<'a> {
+    epoch: u64,
+    work_id: u64,
+    header_base: Arc<[u8]>,
+    pow: crate::backend::PowAlgorithm,
+    target: [u8; 32],
+    dynamic_share_target: Option<Arc<DynamicShareTarget>>,
+    pause_on_solution: bool,
+    reservation: NonceReservation,
+    stop_at: Instant,
+    backend_weights: Option<&'a BTreeMap<BackendInstanceId, f64>>,
+    // Pool-assigned windows are strict: never dispatch outside nonce_start..nonce_end.
+    strict_reservation: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct WorkDistributionOutcome {
+    consumed_span: u64,
+    additional_span_consumed: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct BackendRoundTelemetry {
+    dropped_events: u64,
+    completed_assignments: u64,
+    completed_assignment_hashes: u64,
+    completed_assignment_micros: u64,
+    peak_active_lanes: u64,
+    peak_pending_work: u64,
+    memory_explicit_large_workers: u64,
+    memory_explicit_large_1g_workers: u64,
+    memory_transparent_huge_workers: u64,
+    memory_regular_workers: u64,
+    memory_heap_workers: u64,
+    memory_explicit_large_bytes: u64,
+    memory_explicit_large_1g_bytes: u64,
+    memory_transparent_huge_bytes: u64,
+    memory_regular_bytes: u64,
+    memory_heap_bytes: u64,
+    memory_allocation_failures: u64,
+    peak_inflight_assignment_hashes: u64,
+    peak_inflight_assignment_micros: u64,
+    assignment_enqueue_timeouts: u64,
+    assignment_execution_timeouts: u64,
+    control_enqueue_timeouts: u64,
+    control_execution_timeouts: u64,
+    peak_assignment_timeout_strikes: u32,
+    assignment_enqueue_latency_samples: u64,
+    assignment_enqueue_latency_p95_micros: u64,
+    assignment_enqueue_latency_max_micros: u64,
+    assignment_execution_latency_samples: u64,
+    assignment_execution_latency_p95_micros: u64,
+    assignment_execution_latency_max_micros: u64,
+    control_enqueue_latency_samples: u64,
+    control_enqueue_latency_p95_micros: u64,
+    control_enqueue_latency_max_micros: u64,
+    control_execution_latency_samples: u64,
+    control_execution_latency_p95_micros: u64,
+    control_execution_latency_max_micros: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Eq, PartialEq)]
+#[serde(default)]
+struct CpuAutotuneHostFingerprint {
+    cpu_brand: Option<String>,
+    cpu_arch: Option<String>,
+    logical_cores: usize,
+    physical_cores: Option<usize>,
+    total_memory_bytes: u64,
+    os: String,
+    kernel_version: Option<String>,
+    runtime_environment: String,
+    build_fingerprint: String,
+    affinity_topology: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CpuAutotuneRecord {
+    schema_version: u32,
+    profile: String,
+    affinity: String,
+    page_mode: String,
+    cpu_instances: usize,
+    min_threads: usize,
+    max_threads: usize,
+    selected_threads: usize,
+    measured_hps: f64,
+    autotune_secs: u64,
+    #[serde(default)]
+    host_fingerprint: CpuAutotuneHostFingerprint,
+    timestamp_unix_secs: u64,
+    #[serde(default)]
+    measurements: BTreeMap<usize, CpuAutotuneMeasurement>,
+    #[serde(default)]
+    memory_limited: bool,
+    #[serde(default)]
+    mining_measurement: bool,
+    /// The live search's result. Older records stay useful as a starting count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    search: Option<adaptive_search::Saved>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct CpuAutotuneMeasurement {
+    hashes: u64,
+    elapsed_secs: f64,
+    wall_secs: f64,
+    hps: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CpuAutotuneSelection {
+    selected_threads: usize,
+    selected_hps: f64,
+    peak_threads: usize,
+    peak_hps: f64,
+    peak_floor_frac: f64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CpuAutotuneMeasureOutcome {
+    Measured,
+    Interrupted,
+    MemoryLimited,
+}
+
+fn resolve_mining_config(
+    cfg: &Config,
+    resolver: &crate::shortname::ShortnameResolver,
+) -> Result<Config> {
+    let mut resolved = cfg.clone();
+    if let Some(destination) = cfg.mining_address.as_deref() {
+        let mut address = resolver.resolve(destination)?;
+        if address != destination.trim() {
+            info("ADDRESS", format!("resolved {destination} to {address}"));
+        }
+        // Daemon mining is already solo: the block template pays the address.
+        let (solo, bare) = crate::shortname::split_solo(&address);
+        if solo && cfg.mode == MiningMode::Daemon {
+            info(
+                "ADDRESS",
+                "daemon mining is always solo; ignoring the solo: prefix",
+            );
+            address = bare.to_string();
+        }
+        // A shortname or the API can reach an exchange address the startup checks never saw.
+        crate::payout_destination::ensure_exchange_memo(
+            &address,
+            cfg.payout_memo.as_deref(),
+            cfg.mode == MiningMode::Pool,
+        )?;
+        resolved.mining_address = Some(address);
+    }
+    Ok(resolved)
+}
+
+pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
+    run_with_thread_control(
+        cfg,
+        shutdown,
+        None,
+        Arc::new(session::SessionHistory::new()),
+        Arc::default(),
+    )
+}
+
+pub(crate) fn run_with_thread_control(
+    cfg: &Config,
+    shutdown: Arc<AtomicBool>,
+    thread_control: Option<thread_control::ThreadControl>,
+    history: Arc<session::SessionHistory>,
+    stop_origin: Arc<crate::diagnostics::StopOrigin>,
+) -> Result<()> {
+    if cfg.bench {
+        return bench::run_benchmark(cfg, shutdown.as_ref());
+    }
+    note_mining_mode(cfg.mode);
+    // Install before address resolution, backend initialization and autotuning so
+    // failures before productive work are observable too. No network I/O here.
+    let telemetry = cfg
+        .hardware_telemetry
+        .as_ref()
+        .and_then(|options| crate::hardware_telemetry::start(options, cfg).ok());
+    if let Some((_, worker)) = &telemetry {
+        worker.attach_stop_origin(&stop_origin);
+    }
+    let recorder = telemetry.as_ref().map(|(recorder, _)| recorder.clone());
+    let result = normalize_startup_cancellation(run_with_thread_control_inner(
+        cfg,
+        shutdown,
+        thread_control,
+        history,
+        recorder,
+    ));
+    if let Err(error) = &result {
+        crate::diagnostics::record(
+            seine_telemetry::DiagnosticCode::RunFailed,
+            crate::diagnostics::classify(&format!("{error:#}")),
+            None,
+        );
+    }
+    crate::diagnostics::set_phase(seine_telemetry::RunPhase::ShuttingDown);
+    crate::diagnostics::cleanup_stage(seine_telemetry::CleanupStage::FinalizingTelemetry);
+    drop(telemetry);
+    result
+}
+
+// Cancellation is control flow, not evidence of a broken backend. Keep it typed
+// through anyhow contexts so unrelated failures are never hidden by a stop flag.
+#[derive(Debug)]
+struct StartupCancelled;
+
+impl std::fmt::Display for StartupCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("startup cancelled by shutdown request")
+    }
+}
+
+impl std::error::Error for StartupCancelled {}
+
+fn normalize_startup_cancellation(result: Result<()>) -> Result<()> {
+    match result {
+        Err(error) if error.is::<StartupCancelled>() => Ok(()),
+        other => other,
+    }
+}
+
+fn check_startup_shutdown(shutdown: &AtomicBool) -> Result<()> {
+    if shutdown.load(Ordering::Relaxed) {
+        return Err(StartupCancelled.into());
+    }
+    Ok(())
+}
+
+fn wait_for_startup<T>(
+    receiver: &Receiver<T>,
+    shutdown: &AtomicBool,
+    disconnected: &str,
+) -> Result<T> {
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => return Ok(result),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                check_startup_shutdown(shutdown)?;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                check_startup_shutdown(shutdown)?;
+                bail!("{disconnected}");
+            }
+        }
+    }
+}
+
+fn start_backend_interruptibly(
+    backend: &Arc<dyn PowBackend>,
+    backend_id: BackendInstanceId,
+    shutdown: &AtomicBool,
+) -> Result<()> {
+    check_startup_shutdown(shutdown)?;
+    let backend_name = backend.name();
+    let backend_ref = Arc::clone(backend);
+    let (tx, rx) = bounded::<Result<()>>(0);
+    // Rendezvous delivery ensures a cancelled receiver cannot strand a
+    // successful startup result in a buffer without an owner to stop it.
+    // Native driver/compiler calls can block. Once cancelled, the startup
+    // thread owns cleanup if it eventually returns; never stop concurrently
+    // with start() on the waiting thread.
+    std::thread::Builder::new()
+        .name(format!("{backend_name}-{backend_id}-start"))
+        .spawn(move || {
+            // Held through the cancelled stop too: a new mining session on the
+            // same card must not start until this one has let go of it.
+            let _serial = amd_start_serial(backend_ref.name());
+            if tx.send(backend_ref.start()).is_err() {
+                backend_ref.stop();
+            }
+        })
+        .map_err(|err| {
+            anyhow::Error::new(err).context(format!("failed to spawn {backend_name} init thread"))
+        })?;
+    wait_for_startup(
+        &rx,
+        shutdown,
+        &format!("{backend_name} init thread panicked"),
+    )
+    .and_then(|result| result)
+}
+
+fn backend_start_failure_detail(error: &anyhow::Error) -> seine_telemetry::FailureDetail {
+    let mut detail = seine_telemetry::FailureDetail::new(
+        seine_telemetry::FailureReason::BackendStartFailed,
+        seine_telemetry::DiagnosticOperation::BackendStartup,
+    );
+    detail.os_error = error
+        .chain()
+        .find_map(|e| e.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::raw_os_error)
+        .map(i64::from);
+    detail
+}
+
+/// GPU backends start in background threads and join the run when ready.
+fn starts_in_background(kind: BackendKind) -> bool {
+    matches!(kind, BackendKind::Nvidia | BackendKind::Amd)
+}
+
+/// Removes one pending GPU of `name` (a backend name such as "nvidia").
+pub(super) fn remove_pending_gpu(pending: &mut Vec<&'static str>, name: &str) {
+    if let Some(index) = pending.iter().position(|kind| *kind == name) {
+        pending.remove(index);
+    }
+}
+
+/// AMD cards start one at a time, as they did when startup was synchronous.
+static AMD_START_LOCK: Mutex<()> = Mutex::new(());
+
+fn amd_start_serial(backend_name: &str) -> Option<MutexGuard<'static, ()>> {
+    (backend_name == "amd").then(|| AMD_START_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Stops a backend that never joined the run, in turn with AMD starts.
+fn stop_unjoined_backend(backend: &dyn PowBackend) {
+    let _serial = amd_start_serial(backend.name());
+    backend.stop();
+}
+
+/// Starts one GPU backend off the main thread and hands it to the run through
+/// `deferred_tx`, or reports why it is unavailable.
+fn start_deferred_backend(
+    backend: Arc<dyn PowBackend>,
+    backend_id: BackendInstanceId,
+    display_id: u64,
+    spec: BackendSpec,
+    cfg: &Config,
+    shutdown: &AtomicBool,
+    deferred_tx: &Sender<BackendSlot>,
+) {
+    let backend_name = backend.name();
+    let detail = match spec.kind {
+        BackendKind::Nvidia => "initializing CUDA engine...",
+        BackendKind::Amd => "initializing HIP engine...",
+        BackendKind::Cpu | BackendKind::Metal => "initializing...",
+    };
+    ui::detail("BACKEND", format!("{backend_name}: {detail}"));
+    let start_t = Instant::now();
+    match start_backend_interruptibly(&backend, backend_id, shutdown) {
+        Ok(()) => {
+            ui::detail(
+                "BACKEND",
+                format!(
+                    "{backend_name}#{display_id}: initialized in {:.1}s (awaiting activation)",
+                    start_t.elapsed().as_secs_f64(),
+                ),
+            );
+            let capabilities =
+                match backend_capabilities_for_start(backend.as_ref(), backend_name, backend_id) {
+                    Ok(capabilities) => capabilities,
+                    Err(err) => {
+                        warn(
+                            "BACKEND",
+                            format!(
+                                "{backend_name}#{display_id} capability contract violation: {err:#}"
+                            ),
+                        );
+                        stop_unjoined_backend(backend.as_ref());
+                        return;
+                    }
+                };
+            if capabilities.max_inflight_assignments > 1 && !backend.supports_assignment_batching()
+            {
+                warn(
+                    "BACKEND",
+                    format!(
+                        "{backend_name}#{display_id} reports inflight={} but does not support batched assignment dispatch; clamping runtime inflight to 1",
+                        capabilities.max_inflight_assignments
+                    ),
+                );
+            }
+            let lanes = backend.lanes() as u64;
+            if lanes == 0 {
+                warn(
+                    "BACKEND",
+                    format!("skipping {backend_name}#{display_id}: reported zero lanes"),
+                );
+                stop_unjoined_backend(backend.as_ref());
+                return;
+            }
+            let runtime_policy = backend_runtime_policy(cfg, &spec, capabilities);
+            let slot = BackendSlot {
+                id: backend_id,
+                backend,
+                lanes,
+                runtime_policy,
+                capabilities,
+            };
+            // The run may have ended (or failed to start) meanwhile.
+            if let Err(unsent) = deferred_tx.send(slot) {
+                stop_unjoined_backend(unsent.into_inner().backend.as_ref());
+            }
+        }
+        Err(err) => {
+            if err.is::<StartupCancelled>() {
+                return;
+            }
+            record_backend_start_failure(&err, spec.kind);
+            warn(
+                "BACKEND",
+                format!("{backend_name}#{display_id} unavailable: {err:#}"),
+            );
+            warn("BACKEND", backend_requirements_hint(spec.kind));
+            stop_unjoined_backend(backend.as_ref());
+        }
+    }
+}
+
+/// CPU/Metal all failed to start, but a pending GPU can still carry the run.
+fn wait_for_gpu_after_failed_start(
+    deferred_rx: &Receiver<BackendSlot>,
+    shutdown: &AtomicBool,
+) -> Result<BackendSlot> {
+    check_startup_shutdown(shutdown)?;
+    warn(
+        "MINER",
+        "no CPU/Metal backend started; waiting for a GPU to finish initializing...",
+    );
+    wait_for_startup(deferred_rx, shutdown, "all GPU backends failed to start")
+}
+
+fn backend_requirements_hint(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Amd => {
+            if cfg!(windows) {
+                "AMD mining requires a current AMD graphics driver (Adrenalin or Radeon PRO) \
+                 — https://www.amd.com/en/support"
+            } else {
+                "AMD mining requires the amdgpu driver and the ROCm HIP runtime \
+                 (libamdhip64) — https://rocm.docs.amd.com"
+            }
+        }
+        _ => {
+            "NVIDIA mining requires an up-to-date NVIDIA GPU driver \
+              — https://www.nvidia.com/drivers"
+        }
+    }
+}
+
+fn record_backend_start_failure(error: &anyhow::Error, kind: BackendKind) {
+    crate::diagnostics::record_failure(
+        seine_telemetry::DiagnosticCode::Warning,
+        crate::diagnostics::classify(&format!("{error:#}")),
+        Some(crate::diagnostics::backend_name(kind)),
+        backend_start_failure_detail(error),
+    );
+}
+
+fn run_with_thread_control_inner(
+    cfg: &Config,
+    shutdown: Arc<AtomicBool>,
+    thread_control: Option<thread_control::ThreadControl>,
+    history: Arc<session::SessionHistory>,
+    telemetry: Option<crate::hardware_telemetry::Recorder>,
+) -> Result<()> {
+    check_startup_shutdown(shutdown.as_ref())?;
+    if cfg!(debug_assertions) {
+        warn(
+            "MINER",
+            "debug build detected; expected hashrate is much lower than release. Use a --release build for real mining throughput.",
+        );
+    }
+
+    if cfg.bench {
+        return bench::run_benchmark(cfg, shutdown.as_ref());
+    }
+
+    // Pin the destination for this run, including pool reconnects and daemon
+    // template requests. Keep the user's saved shortname for the next run.
+    crate::diagnostics::set_phase(seine_telemetry::RunPhase::ResolvingAddress);
+    ui::set_startup_phase("preparing miners");
+    let resolved_cfg = resolve_mining_config(cfg, &crate::shortname::ShortnameResolver::default())?;
+    let cfg = &resolved_cfg;
+
+    if cfg.cpu_manual_memory_check && !cfg.cpu_autotune_threads {
+        let requested = cfg
+            .backend_specs
+            .iter()
+            .filter(|spec| spec.kind == BackendKind::Cpu)
+            .map(|spec| spec.cpu_threads.unwrap_or(cfg.threads))
+            .max()
+            .unwrap_or(0);
+        let (_, available) = crate::config::cpu_autotune_capacity(cfg, 0);
+        thread_control::validate_headroom(requested, available)?;
+    }
+
+    crate::diagnostics::set_phase(seine_telemetry::RunPhase::InitializingBackends);
+    if crate::backend::amd::automatic_start_skipped()
+        && !cfg
+            .backend_specs
+            .iter()
+            .any(|spec| spec.kind == BackendKind::Amd)
+    {
+        record_backend_start_failure(
+            &anyhow!("AMD GPUs skipped after failed starts"),
+            BackendKind::Amd,
+        );
+    }
+    // Phase 1: Build GPU backends (NVIDIA, AMD) and start them in background
+    // threads so CPU/Metal mining does not wait for kernel builds, memory
+    // probes or a slow driver. Each GPU joins the run once it is ready.
+    let per_backend_event_capacity = cfg
+        .backend_event_capacity
+        .clamp(8, BACKEND_EVENT_SOURCE_CAPACITY_MAX);
+    // ID assignment: CPU/Metal backends get IDs 1..M (assigned in
+    // activate_backends), GPU backends get IDs M+1..M+N so there are no
+    // collisions.
+    let immediate_count = cfg
+        .backend_specs
+        .iter()
+        .filter(|s| !starts_in_background(s.kind))
+        .count() as BackendInstanceId;
+    let mut deferred_kinds: Vec<&'static str> = Vec::new();
+    let (deferred_tx, deferred_rx) = bounded::<BackendSlot>(cfg.backend_specs.len());
+    // With another backend to start on, the network loop runs while GPU
+    // backends initialize, so they can learn the network's PoW first.
+    crate::backend::set_network_pow_expected(immediate_count > 0);
+    let mut deferred_event_sources: Vec<Receiver<BackendEvent>> = Vec::new();
+    {
+        let mut display_ids: BTreeMap<&'static str, u64> = BTreeMap::new();
+        for spec in cfg.backend_specs.iter().copied() {
+            if !starts_in_background(spec.kind) {
+                continue;
+            }
+            let backend_id = immediate_count + deferred_kinds.len() as BackendInstanceId + 1;
+            let backend = match spec.kind {
+                BackendKind::Nvidia => Arc::new(NvidiaBackend::new(
+                    spec.device_index,
+                    cfg.nvidia_autotune_config_path.clone(),
+                    cfg.nvidia_autotune_secs,
+                    NvidiaBackendTuningOptions {
+                        max_rregcount_override: cfg.nvidia_max_rregcount,
+                        max_lanes_override: cfg.nvidia_max_lanes,
+                        autotune_samples: cfg.nvidia_autotune_samples,
+                        dispatch_iters_per_lane: cfg.nvidia_dispatch_iters_per_lane,
+                        allocation_iters_per_lane: cfg.nvidia_allocation_iters_per_lane,
+                        hashes_per_launch_per_lane: cfg.nvidia_hashes_per_launch_per_lane,
+                        hashes_per_launch_per_lane_was_set: cfg
+                            .nvidia_hashes_per_launch_per_lane_was_set,
+                        fused_target_check: cfg.nvidia_fused_target_check,
+                        adaptive_launch_depth: cfg.nvidia_adaptive_launch_depth,
+                        enforce_template_stop: cfg.nvidia_enforce_template_stop,
+                    },
+                )) as Arc<dyn PowBackend>,
+                BackendKind::Amd => Arc::new(AmdBackend::new(
+                    spec.device_index,
+                    AmdBackendTuningOptions {
+                        max_lanes_override: cfg.amd_max_lanes,
+                        ..AmdBackendTuningOptions::default()
+                    },
+                )) as Arc<dyn PowBackend>,
+                BackendKind::Cpu | BackendKind::Metal => unreachable!(),
+            };
+            let backend_name = backend.name();
+            deferred_kinds.push(backend_name);
+            let display_id = {
+                let next = display_ids.entry(backend_name).or_insert(0);
+                *next += 1;
+                *next
+            };
+
+            // Wire up the event channel now so it's included in the fan-in.
+            let (backend_event_tx, backend_event_rx) =
+                bounded::<BackendEvent>(per_backend_event_capacity);
+            deferred_event_sources.push(backend_event_rx);
+            backend.set_instance_id(backend_id);
+            backend.set_event_sink(backend_event_tx);
+
+            let cfg_clone = cfg.clone();
+            let shutdown_clone = Arc::clone(&shutdown);
+            let deferred_tx = deferred_tx.clone();
+            std::thread::Builder::new()
+                .name(format!("{backend_name}-{backend_id}-init"))
+                .spawn(move || {
+                    start_deferred_backend(
+                        backend,
+                        backend_id,
+                        display_id,
+                        spec,
+                        &cfg_clone,
+                        shutdown_clone.as_ref(),
+                        &deferred_tx,
+                    );
+                })
+                .expect("failed to spawn GPU init thread");
+        }
+        for (kind, count) in &display_ids {
+            ui::detail(
+                "BACKEND",
+                format!(
+                    "{kind}: launching {count} background initialization task(s) (CPU mining starts meanwhile)"
+                ),
+            );
+        }
+    }
+    // Drop sender so receiver knows when all threads are done.
+    drop(deferred_tx);
+
+    // Phase 2: CPU autotune (runs in parallel with GPU initialization).
+    crate::diagnostics::set_phase(seine_telemetry::RunPhase::Tuning);
+    let runtime_cfg = prepare_runtime_config(cfg, shutdown.as_ref(), RuntimeMode::Mining)?;
+    if shutdown.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let cfg = &runtime_cfg;
+
+    crate::diagnostics::set_phase(seine_telemetry::RunPhase::InitializingBackends);
+    let backend_executor = backend_executor::BackendExecutor::new();
+    if let Some(recorder) = telemetry.clone() {
+        backend_executor.set_hardware_telemetry(recorder);
+    }
+    let daemon_client = if let Some(token) = cfg.token.clone() {
+        Some(ApiClient::new(
+            cfg.api_url.clone(),
+            token,
+            cfg.request_timeout,
+            cfg.events_stream_timeout,
+            cfg.events_idle_timeout,
+        )?)
+    } else {
+        None
+    };
+    if cfg.mode == MiningMode::Daemon && daemon_client.is_none() {
+        bail!("missing API token in daemon mining mode");
+    }
+
+    // Phase 3: Build and activate CPU/Metal backends synchronously.
+    // They start fast and get IDs 1..M; GPU backends have IDs M+1..M+N.
+    let mut cpu_memory_backends = Vec::new();
+    let mut adaptive_backends = Vec::new();
+    let immediate_instances: Vec<(BackendSpec, Arc<dyn PowBackend>)> = cfg
+        .backend_specs
+        .iter()
+        .copied()
+        .filter(|spec| !starts_in_background(spec.kind))
+        .map(|backend_spec| {
+            let backend = match backend_spec.kind {
+                BackendKind::Cpu => {
+                    let tuning = CpuBackendTuning {
+                        hash_batch_size: cfg.cpu_hash_batch_size,
+                        control_check_interval_hashes: cfg.cpu_control_check_interval_hashes,
+                        hash_flush_interval: cfg.cpu_hash_flush_interval,
+                        event_dispatch_capacity: cfg.cpu_event_dispatch_capacity,
+                        page_mode: cfg.cpu_page_mode,
+                        side_cache_blocks: cfg.cpu_side_cache_blocks,
+                        skip_store_permille: cfg.cpu_skip_store_permille,
+                        kernel: None,
+                    };
+                    let threads = backend_spec.cpu_threads.unwrap_or(cfg.threads);
+                    let affinity = backend_spec.cpu_affinity.unwrap_or(cfg.cpu_affinity);
+                    let backend = Arc::new(if cfg.cpu_autotune_threads {
+                        let tuning = CpuBackendTuning {
+                            kernel: adaptive_cpu::initial_kernel(cfg, threads),
+                            ..tuning
+                        };
+                        CpuBackend::adaptive(
+                            threads,
+                            cfg.cpu_autotune_worker_slots
+                                .expect("automatic slots prepared"),
+                            affinity,
+                            tuning,
+                        )
+                    } else {
+                        // Fixed counts run no kernel trials; start from the cohort default.
+                        let kernel = adaptive_kernel::static_kernel_for(threads);
+                        if let Some(kernel) = kernel {
+                            info(
+                                "CPU",
+                                format!(
+                                    "{threads} fixed workers: using the {kernel} kernel \
+                                     validated for this CPU family"
+                                ),
+                            );
+                        }
+                        let tuning = CpuBackendTuning { kernel, ..tuning };
+                        CpuBackend::with_tuning(threads, affinity, tuning)
+                    });
+                    cpu_memory_backends.push(Arc::clone(&backend));
+                    if cfg.cpu_autotune_threads {
+                        adaptive_backends.push(Arc::clone(&backend));
+                    }
+                    backend as Arc<dyn PowBackend>
+                }
+                BackendKind::Metal => {
+                    let backend = MetalBackend::new(
+                        cfg.metal_max_lanes,
+                        cfg.metal_hashes_per_launch_per_lane,
+                    );
+                    Arc::new(if cfg.metal_blake2b_only {
+                        backend.blake2b_only()
+                    } else {
+                        backend
+                    }) as Arc<dyn PowBackend>
+                }
+                BackendKind::Nvidia | BackendKind::Amd => unreachable!(),
+            };
+            (backend_spec, backend)
+        })
+        .collect();
+
+    // Phase 4: Collect any GPU backends that finished during autotune+CPU init.
+    // Also drain them into the initial backends vec if they're ready.
+    let mut early_gpu_backends = Vec::new();
+    while let Ok(slot) = deferred_rx.try_recv() {
+        early_gpu_backends.push(slot);
+    }
+
+    let has_immediate = !immediate_instances.is_empty();
+    let has_gpu_ready = !early_gpu_backends.is_empty();
+
+    // If we have no CPU/Metal backends and no GPU ready yet, we need to wait
+    // for at least one GPU to finish (or we'd start with zero backends).
+    if !has_immediate && !has_gpu_ready {
+        check_startup_shutdown(shutdown.as_ref())?;
+        if deferred_kinds.is_empty() {
+            crate::diagnostics::record_failure(
+                seine_telemetry::DiagnosticCode::Error,
+                seine_telemetry::DiagnosticKind::General,
+                None,
+                seine_telemetry::FailureDetail::new(
+                    seine_telemetry::FailureReason::NoBackendAvailable,
+                    seine_telemetry::DiagnosticOperation::BackendStartup,
+                ),
+            );
+            bail!("no mining backend could be started");
+        }
+        info(
+            "MINER",
+            "no CPU/Metal backends; waiting for a GPU to finish initializing...",
+        );
+        early_gpu_backends.push(wait_for_startup(
+            &deferred_rx,
+            shutdown.as_ref(),
+            "all GPU backends failed to start",
+        )?);
+        // Also grab any others that finished
+        while let Ok(slot) = deferred_rx.try_recv() {
+            early_gpu_backends.push(slot);
+        }
+    }
+
+    let (mut backends, backend_events) = activate_backends_with_start_id(
+        immediate_instances,
+        cfg.backend_event_capacity,
+        cfg,
+        shutdown.as_ref(),
+        deferred_event_sources,
+        1, // CPU/Metal backends get IDs starting from 1
+    )?;
+
+    // Merge early GPU backends into the activated set; the rest are pending.
+    let mut pending_gpus = deferred_kinds;
+    if backends.is_empty() && early_gpu_backends.is_empty() && !pending_gpus.is_empty() {
+        early_gpu_backends.push(wait_for_gpu_after_failed_start(
+            &deferred_rx,
+            shutdown.as_ref(),
+        )?);
+    }
+    for slot in early_gpu_backends {
+        remove_pending_gpu(&mut pending_gpus, slot.backend.name());
+        let slot_name = pending_backend_slot_label(&backends, &slot);
+        info(
+            "BACKEND",
+            format!("{slot_name}: online ({} lanes)", slot.lanes),
+        );
+        backends.push(slot);
+    }
+
+    enforce_deadline_policy(
+        &mut backends,
+        cfg.allow_best_effort_deadlines,
+        RuntimeMode::Mining,
+        &backend_executor,
+    )?;
+    let (live_thread_tx, live_thread_rx) = bounded(1);
+    let total_lanes: usize = backends.iter().map(|s| s.backend.enabled_lanes()).sum();
+    let cpu_lanes = cpu_lane_count(&backends);
+    let cpu_ram_gib =
+        (cpu_lanes as f64 * CPU_LANE_MEMORY_BYTES as f64) / (1024.0 * 1024.0 * 1024.0);
+    let tui_state = if should_enable_tui(cfg) {
+        let state = build_tui_state(cfg, &backends);
+        history.attach_tui(&state);
+        if let Ok(mut s) = state.lock() {
+            if let Some(mut control) = thread_control {
+                let cpu_backends: Vec<_> = backends
+                    .iter()
+                    .filter(|slot| slot.backend.name() == "cpu")
+                    .collect();
+                if let Some(first) = cpu_backends.first() {
+                    control.current_threads = cpu_backends
+                        .iter()
+                        .map(|slot| slot.backend.enabled_lanes())
+                        .min()
+                        .unwrap_or(first.backend.enabled_lanes());
+                    // Preserve the ability to reduce an explicit above-auto count.
+                    control.max_threads = if cfg.cpu_autotune_threads {
+                        adaptive_cpu::manual_limit(cfg, &adaptive_backends)
+                    } else {
+                        cfg.cpu_auto_threads_cap.max(
+                            cpu_backends
+                                .iter()
+                                .map(|slot| slot.backend.enabled_lanes())
+                                .min()
+                                .unwrap_or(1),
+                        )
+                    };
+                    control.memory = Some(Arc::new(thread_control::ThreadMemoryGuard::new(
+                        cfg,
+                        cpu_memory_backends.clone(),
+                    )));
+                    // Tuned runs have parked workers the controller can wake.
+                    control.live = cfg.cpu_autotune_threads.then(|| live_thread_tx.clone());
+                    s.thread_control = Some(control);
+                }
+            }
+        }
+        if !pending_gpus.is_empty() {
+            if let Ok(mut s) = state.lock() {
+                s.pending_gpus = pending_gpus.clone();
+                s.pending_gpus_since = Some(Instant::now());
+            }
+        }
+        Some(state)
+    } else {
+        None
+    };
+
+    // Once per process: a thread-change restart must not repeat setup advice.
+    static NOTICES_SHOWN: AtomicBool = AtomicBool::new(false);
+    if !NOTICES_SHOWN.swap(true, Ordering::Relaxed) {
+        if let Some(hint) = cfg.nvidia_hint {
+            info("HINT", hint);
+        }
+        for notice in &cfg.startup_notices {
+            info("BACKEND", notice);
+        }
+        for detail in &cfg.startup_details {
+            ui::detail("BACKEND", detail);
+        }
+    }
+    ui::detail(
+        "CONFIG",
+        format!("data directory: {}", cfg.data_dir.display()),
+    );
+    ui::detail(
+        "CONFIG",
+        format!("user settings file: {}", cfg.user_config_path.display()),
+    );
+    if cfg.user_config_created {
+        info(
+            "CONFIG",
+            format!("settings saved to {}", cfg.user_config_path.display()),
+        );
+    }
+    if let Some(summary) = cfg.daemon_connection_summary() {
+        ui::detail("CONFIG", format!("daemon discovery: {summary}"));
+    }
+
+    let endpoint_label = match cfg.mode {
+        MiningMode::Daemon => format!("api={}", cfg.api_url),
+        MiningMode::Pool => format!(
+            "pool={} worker={}",
+            cfg.pool_url.as_deref().unwrap_or("<missing-pool-url>"),
+            cfg.pool_worker
+                .as_deref()
+                .unwrap_or("<missing-pool-worker>")
+        ),
+    };
+    let auth_label = if cfg.mode == MiningMode::Daemon {
+        auth_source_label(cfg)
+    } else {
+        "n/a".to_string()
+    };
+    let effective_prefix = match cfg.mode {
+        MiningMode::Daemon => "effective | daemon",
+        MiningMode::Pool => "effective",
+    };
+    ui::detail(
+        "MINER",
+        format!(
+            "{effective_prefix} | {} auth={} backends={} cpu_threads={} ui={}",
+            endpoint_label,
+            auth_label,
+            backend_names(&backends),
+            cpu_threads_summary(&backends),
+            if tui_state.is_some() { "tui" } else { "plain" }
+        ),
+    );
+
+    ui::detail(
+        "MINER",
+        format!(
+            "starting | {} | {} lanes | ~{:.1} GiB RAM",
+            backend_names(&backends),
+            total_lanes,
+            cpu_ram_gib
+        ),
+    );
+    ui::verbose(
+        "MINER",
+        format!("preemption | {}", backend_preemption_profiles(&backends)),
+    );
+    ui::verbose(
+        "MINER",
+        format!(
+            "allocation | {}",
+            match cfg.work_allocation {
+                WorkAllocation::Static => "static-lanes",
+                WorkAllocation::Adaptive => "adaptive-weighted",
+            }
+        ),
+    );
+    if cfg.work_allocation == WorkAllocation::Static && cfg.sub_round_rebalance_interval.is_some() {
+        warn(
+            "MINER",
+            "--sub-round-rebalance-ms is set but --work-allocation=static; in-round rebalance is disabled",
+        );
+    }
+    ui::verbose(
+        "MINER",
+        format!(
+            "chunking | {}",
+            backend_chunk_profiles(&backends, cfg.nonce_iters_per_lane)
+        ),
+    );
+    let append_semantics = backends
+        .iter()
+        .filter_map(|slot| {
+            let semantics = backend_capabilities(slot).assignment_semantics;
+            if semantics == crate::backend::AssignmentSemantics::Append {
+                Some(format!("{}#{}", slot.backend.name(), slot.id))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if !append_semantics.is_empty() {
+        warn(
+            "MINER",
+            format!(
+                "append assignment semantics reported by {}; relaxed mode will force round-boundary cancels",
+                append_semantics.join(", ")
+            ),
+        );
+    }
+    ui::verbose(
+        "MINER",
+        format!(
+            "hash-poll | configured={}ms effective={}ms",
+            cfg.hash_poll_interval.as_millis(),
+            effective_hash_poll_interval(&backends, cfg.hash_poll_interval).as_millis(),
+        ),
+    );
+    ui::verbose(
+        "MINER",
+        format!(
+            "cpu-profile | {} | page_mode={} | auto-cap={} | autotune={} range={}..{} secs={}",
+            cpu_profile_label(cfg.cpu_profile),
+            cfg.cpu_page_mode.as_str(),
+            cfg.cpu_auto_threads_cap,
+            if cfg.cpu_autotune_threads {
+                "on"
+            } else {
+                "off"
+            },
+            cfg.cpu_autotune_min_threads,
+            cfg.cpu_autotune_max_threads
+                .unwrap_or(cfg.cpu_auto_threads_cap.max(1)),
+            cfg.cpu_autotune_secs,
+        ),
+    );
+    ui::verbose(
+        "MINER",
+        format!(
+            "cpu-tuning | hash_batch={} control_check={} hash_flush={}ms event_q={}",
+            cfg.cpu_hash_batch_size,
+            cfg.cpu_control_check_interval_hashes,
+            cfg.cpu_hash_flush_interval.as_millis(),
+            cfg.cpu_event_dispatch_capacity,
+        ),
+    );
+    let sub_round_rebalance = cfg
+        .sub_round_rebalance_interval
+        .map(|interval| format!("{}ms", interval.as_millis()))
+        .unwrap_or_else(|| "off".to_string());
+    ui::verbose(
+        "MINER",
+        format!(
+            "timeouts | assign={}ms assign_strikes={} control={}ms prefetch_wait={}ms tip_join_wait={}ms submit_join_wait={}ms sub_round_rebalance={}",
+            cfg.backend_assign_timeout.as_millis(),
+            cfg.backend_assign_timeout_strikes,
+            cfg.backend_control_timeout.as_millis(),
+            cfg.prefetch_wait.as_millis(),
+            cfg.tip_listener_join_wait.as_millis(),
+            cfg.submit_join_wait.as_millis(),
+            sub_round_rebalance,
+        ),
+    );
+    ui::verbose(
+        "MINER",
+        format!("timeout-policy | {}", backend_timeout_profiles(&backends)),
+    );
+    if cfg.strict_round_accounting {
+        let constrained: Vec<String> = backends
+            .iter()
+            .filter_map(|slot| {
+                let granularity = slot.backend.preemption_granularity();
+                if matches!(granularity, PreemptionGranularity::Hashes(1)) {
+                    None
+                } else {
+                    Some(format!(
+                        "{}#{}={}",
+                        slot.backend.name(),
+                        slot.id,
+                        granularity.describe()
+                    ))
+                }
+            })
+            .collect();
+        if !constrained.is_empty() {
+            warn(
+                "MINER",
+                format!(
+                    "strict accounting fence latency depends on backend preemption ({})",
+                    constrained.join(", ")
+                ),
+            );
+        }
+        let best_effort_deadlines: Vec<String> = backends
+            .iter()
+            .filter_map(|slot| {
+                let capabilities = backend_capabilities(slot);
+                if capabilities.deadline_support == DeadlineSupport::BestEffort {
+                    Some(format!("{}#{}", slot.backend.name(), slot.id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !best_effort_deadlines.is_empty() {
+            warn(
+                "MINER",
+                format!(
+                    "deadline enforcement is best-effort for {}",
+                    best_effort_deadlines.join(", ")
+                ),
+            );
+        }
+    }
+
+    let deferred_backends = if pending_gpus.is_empty() {
+        None
+    } else {
+        Some((deferred_rx, pending_gpus))
+    };
+
+    let tip_listener = if cfg.mode == MiningMode::Daemon && cfg.sse_enabled {
+        let client = daemon_client
+            .as_ref()
+            .ok_or_else(|| anyhow!("daemon client is not initialized"))?;
+        Some(mining::spawn_tip_listener(
+            client.clone(),
+            Arc::clone(&shutdown),
+            cfg.refresh_on_same_height,
+            cfg.clone(),
+        ))
+    } else {
+        None
+    };
+
+    let mut adaptive_controller = match adaptive_cpu::Controller::start(
+        cfg.clone(),
+        adaptive_backends,
+        tui_state.clone(),
+        telemetry,
+        live_thread_rx,
+        Arc::clone(&history),
+    ) {
+        Ok(controller) => controller,
+        Err(err) => {
+            stop_backend_slots(
+                &mut backends,
+                &backend_executor,
+                cfg.backend_control_timeout,
+                "BACKEND",
+            );
+            return Err(err.context("starting CPU autotune controller"));
+        }
+    };
+    crate::diagnostics::set_phase(seine_telemetry::RunPhase::Mining);
+    let result = match cfg.mode {
+        MiningMode::Daemon => {
+            let client = daemon_client
+                .as_ref()
+                .ok_or_else(|| anyhow!("daemon client is not initialized"))?;
+            mining::run_mining_loop(
+                cfg,
+                client,
+                Arc::clone(&shutdown),
+                mining::MiningRuntimeBackends {
+                    backends: &mut backends,
+                    backend_events: &backend_events,
+                    backend_executor: &backend_executor,
+                },
+                tui_state,
+                Arc::clone(&history),
+                tip_listener.as_ref().map(mining::TipListener::signal),
+                deferred_backends,
+            )
+        }
+        MiningMode::Pool => mining_pool::run_pool_mining_loop(
+            cfg,
+            Arc::clone(&shutdown),
+            mining::MiningRuntimeBackends {
+                backends: &mut backends,
+                backend_events: &backend_events,
+                backend_executor: &backend_executor,
+            },
+            daemon_client.clone(),
+            tui_state,
+            Arc::clone(&history),
+            deferred_backends,
+        ),
+    };
+
+    crate::diagnostics::set_phase(seine_telemetry::RunPhase::ShuttingDown);
+    crate::diagnostics::cleanup_stage(seine_telemetry::CleanupStage::StoppingAutotune);
+    adaptive_controller.stop();
+    let shutdown_requested = shutdown.load(Ordering::SeqCst);
+    ui::detail("MINER", "shutting down: stopping backends...");
+    let stop_t = Instant::now();
+    stop_backend_slots(
+        &mut backends,
+        &backend_executor,
+        cfg.backend_control_timeout,
+        "BACKEND",
+    );
+    ui::detail(
+        "MINER",
+        format!("backends stopped in {:.1}s", stop_t.elapsed().as_secs_f64()),
+    );
+    shutdown.store(true, Ordering::SeqCst);
+    crate::diagnostics::cleanup_stage(seine_telemetry::CleanupStage::StoppingTipListener);
+    if let Some(listener) = tip_listener {
+        if shutdown_requested {
+            listener.detach();
+        } else if !listener.join_for(cfg.tip_listener_join_wait) {
+            warn(
+                "EVENTS",
+                format!(
+                    "tip listener shutdown exceeded {}ms; detached",
+                    cfg.tip_listener_join_wait.as_millis()
+                ),
+            );
+        }
+    }
+    result
+}
+
+pub(crate) fn should_enable_tui(cfg: &Config) -> bool {
+    ui_mode_enables_tui(cfg.ui_mode)
+}
+
+pub(crate) fn ui_mode_enables_tui(mode: UiMode) -> bool {
+    match mode {
+        UiMode::Plain => false,
+        UiMode::Tui => true,
+        UiMode::Auto => std::io::stdout().is_terminal() && std::io::stderr().is_terminal(),
+    }
+}
+
+fn build_tui_state(cfg: &Config, backends: &[BackendSlot]) -> TuiState {
+    // Read before locking the dashboard; the update checker takes these locks
+    // in the opposite order.
+    let update = crate::update_check::for_new_dashboard();
+    // An open dashboard keeps its state, and with it the log so far, across runs.
+    let (tui_state, reused) = match ui::current_tui_state() {
+        Some(state) => (state, true),
+        None => (new_tui_state(), false),
+    };
+    if let Ok(mut s) = tui_state.lock() {
+        s.reset_for_new_run();
+        s.mode = match cfg.mode {
+            MiningMode::Pool => "pool".to_string(),
+            MiningMode::Daemon => "daemon".to_string(),
+        };
+        s.wallet_visible = cfg.mode == MiningMode::Daemon;
+        s.api_url = match cfg.mode {
+            MiningMode::Daemon => cfg.api_url.clone(),
+            MiningMode::Pool => cfg.pool_url.as_deref().map_or_else(
+                || "---".to_string(),
+                |urls| match urls.split(',').count() - 1 {
+                    0 => urls.to_string(),
+                    1 => format!("{} (+1 backup)", crate::pool::primary_pool_url(urls)),
+                    backups => format!(
+                        "{} (+{backups} backups)",
+                        crate::pool::primary_pool_url(urls)
+                    ),
+                },
+            ),
+        };
+        s.pool_worker = cfg.pool_worker.clone().unwrap_or_else(|| "---".to_string());
+        s.threads = cpu_lane_count(backends) as usize;
+        s.refresh_secs = cfg.refresh_interval.as_secs();
+        s.sse_enabled = cfg.sse_enabled;
+        s.backends_desc = backend_descriptions(backends);
+        s.accounting = if cfg.strict_round_accounting {
+            "strict".to_string()
+        } else {
+            "relaxed".to_string()
+        };
+        s.version = crate::version::ui_display_version();
+        if let Some(update) = update {
+            s.update_available = Some(update.latest);
+            if let Some(message) = update.log_message {
+                s.push_log(tui::LogEntry::new(
+                    0.0,
+                    tui::LogLevel::Info,
+                    "UPDATE",
+                    &message,
+                ));
+            }
+        }
+        // Without an open dashboard these lines go to the plain log, which the
+        // dashboard is about to cover; carry them over.
+        if !reused {
+            if let Some(hint) = cfg.nvidia_hint {
+                s.push_log(tui::LogEntry::new(0.0, tui::LogLevel::Info, "HINT", hint));
+            }
+            for notice in &cfg.startup_notices {
+                s.push_log(tui::LogEntry::new(
+                    0.0,
+                    tui::LogLevel::Info,
+                    "BACKEND",
+                    notice,
+                ));
+            }
+        }
+    }
+    tui_state
+}
+
+pub(super) fn prepare_runtime_config(
+    cfg: &Config,
+    shutdown: &AtomicBool,
+    mode: RuntimeMode,
+) -> Result<Config> {
+    let mut runtime_cfg = cfg.clone();
+    maybe_autotune_cpu_threads(&mut runtime_cfg, shutdown, mode)?;
+    maybe_warn_linux_hugepages_setup(&runtime_cfg, mode);
+    Ok(runtime_cfg)
+}
+
+fn maybe_autotune_cpu_threads(
+    cfg: &mut Config,
+    shutdown: &AtomicBool,
+    mode: RuntimeMode,
+) -> Result<()> {
+    if !cfg.cpu_autotune_threads {
+        if cfg
+            .backend_specs
+            .iter()
+            .any(|spec| spec.kind == BackendKind::Cpu)
+        {
+            ui::detail(
+                runtime_mode_tag(mode),
+                "cpu-autotune | disabled; using configured thread count",
+            );
+        }
+        return Ok(());
+    }
+    if matches!(mode, RuntimeMode::Mining) {
+        return adaptive_cpu::prepare(cfg);
+    }
+
+    let tag = runtime_mode_tag(mode);
+    // BLAKE2b work runs every CPU worker; the thread search measures Argon2.
+    if cfg.bench_pow == crate::config::BenchPow::Blake2b {
+        info(
+            tag,
+            "cpu-autotune | skipped for BLAKE2b; every CPU worker runs",
+        );
+        return Ok(());
+    }
+    let cpu_instance_count = cfg
+        .backend_specs
+        .iter()
+        .filter(|spec| spec.kind == BackendKind::Cpu)
+        .count();
+    if cpu_instance_count == 0 {
+        info(tag, "cpu-autotune | skipped (no CPU backend instances)");
+        return Ok(());
+    }
+
+    let safe_threads_cap = cfg.cpu_auto_threads_cap.max(1);
+    let mut min_threads = cfg.cpu_autotune_min_threads.max(1);
+    if min_threads > safe_threads_cap {
+        warn(
+            tag,
+            format!(
+                "cpu-autotune | clamping min threads {} -> {} (safe cap)",
+                min_threads, safe_threads_cap
+            ),
+        );
+        min_threads = safe_threads_cap;
+    }
+
+    let requested_max_threads = cfg.cpu_autotune_max_threads.unwrap_or(safe_threads_cap);
+    let mut max_threads = requested_max_threads.max(min_threads);
+    if max_threads > safe_threads_cap {
+        warn(
+            tag,
+            format!(
+                "cpu-autotune | clamping max threads {} -> {} (safe cap)",
+                max_threads, safe_threads_cap
+            ),
+        );
+        max_threads = safe_threads_cap;
+    }
+
+    let autotune_secs = cfg.cpu_autotune_secs.max(1);
+    if let Some(record) = load_cpu_autotune_record(
+        cfg,
+        tag,
+        cpu_instance_count,
+        min_threads,
+        max_threads,
+        autotune_secs,
+    ) {
+        apply_cpu_threads(cfg, record.selected_threads);
+        info(
+            tag,
+            format!(
+                "cpu-autotune | using cached result: {} threads at {} (from {})",
+                record.selected_threads,
+                format_hashrate(record.measured_hps),
+                cfg.cpu_autotune_config_path.display()
+            ),
+        );
+        return Ok(());
+    }
+
+    info(
+        tag,
+        format!(
+            "cpu-autotune | finding the fastest thread count for your CPU (profile={}, page_mode={}, testing {}..{} threads, ~{}s per candidate)",
+            cpu_profile_label(cfg.cpu_profile),
+            cfg.cpu_page_mode.as_str(),
+            min_threads,
+            max_threads,
+            autotune_secs,
+        ),
+    );
+    info(
+        tag,
+        "cpu-autotune | results are cached for compatible future launches",
+    );
+
+    let candidate_count = max_threads.saturating_sub(min_threads).saturating_add(1);
+    let mut measurements = BTreeMap::<usize, CpuAutotuneMeasurement>::new();
+    let mut interrupted = false;
+
+    if candidate_count <= CPU_AUTOTUNE_LINEAR_SCAN_MAX_CANDIDATES {
+        info(
+            tag,
+            format!("cpu-autotune | testing all {candidate_count} thread counts in range"),
+        );
+        for (step, threads) in (min_threads..=max_threads).enumerate() {
+            info(
+                tag,
+                format!(
+                    "cpu-autotune | [{}/{}] benchmarking {} threads ...",
+                    step + 1,
+                    candidate_count,
+                    threads
+                ),
+            );
+            match measure_cpu_autotune_candidate(
+                cfg,
+                tag,
+                shutdown,
+                threads,
+                autotune_secs,
+                &mut measurements,
+            )? {
+                CpuAutotuneMeasureOutcome::Measured => {}
+                CpuAutotuneMeasureOutcome::Interrupted => {
+                    interrupted = true;
+                    break;
+                }
+                CpuAutotuneMeasureOutcome::MemoryLimited => break,
+            }
+        }
+    } else {
+        // Coarse descending grid, then the local refinement below.
+        let mut coarse: Vec<usize> = [
+            max_threads,
+            max_threads * 3 / 4,
+            max_threads / 2,
+            max_threads / 4,
+        ]
+        .into_iter()
+        .filter(|&threads| threads >= min_threads)
+        .collect();
+        coarse.dedup();
+        info(
+            tag,
+            format!(
+                "cpu-autotune | {candidate_count} thread counts possible — measuring {coarse:?} first, then refining around the best",
+            ),
+        );
+        let mut peak_threads = min_threads;
+        let mut peak_hps = 0.0f64;
+        for (step, threads) in coarse.into_iter().enumerate() {
+            info(
+                tag,
+                format!(
+                    "cpu-autotune | phase 1 step {}: benchmarking {} threads ...",
+                    step + 1,
+                    threads
+                ),
+            );
+            match measure_cpu_autotune_candidate(
+                cfg,
+                tag,
+                shutdown,
+                threads,
+                autotune_secs,
+                &mut measurements,
+            )? {
+                CpuAutotuneMeasureOutcome::Measured => {}
+                CpuAutotuneMeasureOutcome::Interrupted => {
+                    interrupted = true;
+                    break;
+                }
+                // A smaller coarse candidate may still fit.
+                CpuAutotuneMeasureOutcome::MemoryLimited => continue,
+            }
+            let current_hps = measurements.get(&threads).map(|m| m.hps).unwrap_or(0.0);
+            if current_hps > peak_hps {
+                peak_hps = current_hps;
+                peak_threads = threads;
+            }
+        }
+        let ramp_stopped_early = false;
+
+        if !interrupted && !measurements.is_empty() {
+            let phase2_center = select_peak_autotune_candidate(&measurements)
+                .map(|(threads, _)| threads)
+                .unwrap_or(peak_threads);
+            let include_low_anchor = cfg.cpu_profile != CpuPerformanceProfile::Throughput;
+            let (sweep_min, sweep_max) =
+                cpu_autotune_refinement_window(min_threads, max_threads, phase2_center);
+            let final_candidates = cpu_autotune_refinement_candidates(
+                min_threads,
+                max_threads,
+                phase2_center,
+                include_low_anchor,
+                &measurements,
+            );
+            if !final_candidates.is_empty() {
+                info(
+                    tag,
+                    format!(
+                        "cpu-autotune | phase 2/2: fine-tuning in {}..{} threads around peak {} ({} candidates left) ...",
+                        sweep_min,
+                        sweep_max,
+                        phase2_center,
+                        final_candidates.len()
+                    ),
+                );
+            } else if ramp_stopped_early {
+                info(
+                    tag,
+                    "cpu-autotune | phase 2/2: no extra candidates needed after ramp stop",
+                );
+            }
+
+            for (step, threads) in final_candidates.iter().enumerate() {
+                info(
+                    tag,
+                    format!(
+                        "cpu-autotune | [{}/{}] benchmarking {} threads ...",
+                        step + 1,
+                        final_candidates.len(),
+                        threads
+                    ),
+                );
+                match measure_cpu_autotune_candidate(
+                    cfg,
+                    tag,
+                    shutdown,
+                    *threads,
+                    autotune_secs,
+                    &mut measurements,
+                )? {
+                    CpuAutotuneMeasureOutcome::Measured => {}
+                    CpuAutotuneMeasureOutcome::Interrupted => {
+                        interrupted = true;
+                        break;
+                    }
+                    CpuAutotuneMeasureOutcome::MemoryLimited => break,
+                }
+            }
+        }
+    }
+
+    if measurements.is_empty() {
+        warn(
+            tag,
+            "cpu-autotune | no measurements collected; keeping configured thread count",
+        );
+        return Ok(());
+    }
+
+    if interrupted {
+        warn(tag, "cpu-autotune | interrupted by shutdown request");
+        return Ok(());
+    }
+
+    if let Some(provisional) = select_cpu_autotune_candidate(cfg.cpu_profile, &measurements) {
+        let finalists =
+            cpu_autotune_confirmation_threads(cfg.cpu_profile, provisional, &measurements);
+        if !finalists.is_empty() {
+            let confirmation_secs = cpu_autotune_confirmation_window_secs(autotune_secs);
+            info(
+                tag,
+                format!(
+                    "cpu-autotune | close balanced finalists need confirmation; rechecking {} for ~{}s each (descending thread order)",
+                    finalists
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    confirmation_secs,
+                ),
+            );
+            for threads in finalists {
+                match remeasure_cpu_autotune_candidate(
+                    cfg,
+                    tag,
+                    shutdown,
+                    threads,
+                    confirmation_secs,
+                    &mut measurements,
+                )? {
+                    CpuAutotuneMeasureOutcome::Measured => {}
+                    CpuAutotuneMeasureOutcome::Interrupted => {
+                        interrupted = true;
+                        break;
+                    }
+                    CpuAutotuneMeasureOutcome::MemoryLimited => break,
+                }
+            }
+        }
+    }
+
+    if interrupted {
+        warn(
+            tag,
+            "cpu-autotune | interrupted during finalist confirmation",
+        );
+        return Ok(());
+    }
+
+    let selection = select_cpu_autotune_candidate(cfg.cpu_profile, &measurements).unwrap_or(
+        CpuAutotuneSelection {
+            selected_threads: cfg.threads.max(1),
+            selected_hps: 0.0,
+            peak_threads: cfg.threads.max(1),
+            peak_hps: 0.0,
+            peak_floor_frac: 1.0,
+        },
+    );
+    apply_cpu_threads(cfg, selection.selected_threads);
+    if selection.selected_threads != selection.peak_threads {
+        let saved_threads = selection
+            .peak_threads
+            .saturating_sub(selection.selected_threads);
+        let saved_ram_gib =
+            (saved_threads as f64 * CPU_LANE_MEMORY_BYTES as f64) / (1024.0 * 1024.0 * 1024.0);
+        info(
+            tag,
+            format!(
+                "cpu-autotune | done — selected {} threads at {} (peak {} threads at {}; profile={} keeps >= {:.0}% peak, saves ~{:.1} GiB RAM per CPU instance)",
+                selection.selected_threads,
+                format_hashrate(selection.selected_hps),
+                selection.peak_threads,
+                format_hashrate(selection.peak_hps),
+                cpu_profile_label(cfg.cpu_profile),
+                selection.peak_floor_frac * 100.0,
+                saved_ram_gib,
+            ),
+        );
+    } else {
+        info(
+            tag,
+            format!(
+                "cpu-autotune | done — best: {} threads at {} per CPU instance",
+                selection.selected_threads,
+                format_hashrate(selection.selected_hps)
+            ),
+        );
+    }
+    if let Err(err) = persist_cpu_autotune_record(
+        cfg,
+        cpu_instance_count,
+        min_threads,
+        max_threads,
+        selection.selected_threads,
+        selection.selected_hps,
+        autotune_secs,
+        &measurements,
+    ) {
+        warn(
+            tag,
+            format!(
+                "cpu-autotune | failed to persist {} ({err:#})",
+                cfg.cpu_autotune_config_path.display()
+            ),
+        );
+    } else {
+        info(
+            tag,
+            format!(
+                "cpu-autotune | wrote {}",
+                cfg.cpu_autotune_config_path.display()
+            ),
+        );
+    }
+    Ok(())
+}
+
+fn cpu_autotune_peak_floor_frac(profile: CpuPerformanceProfile) -> f64 {
+    match profile {
+        CpuPerformanceProfile::Throughput => 1.0,
+        CpuPerformanceProfile::Balanced => CPU_AUTOTUNE_BALANCED_PEAK_FLOOR_FRAC,
+        CpuPerformanceProfile::Efficiency => CPU_AUTOTUNE_EFFICIENCY_PEAK_FLOOR_FRAC,
+    }
+}
+
+fn cpu_autotune_confirmation_window_secs(autotune_secs: u64) -> u64 {
+    autotune_secs
+        .max(1)
+        .saturating_mul(CPU_AUTOTUNE_FINAL_CONFIRM_WINDOW_MULTIPLIER)
+        .max(CPU_AUTOTUNE_FINAL_CONFIRM_MIN_SECS)
+        .min(CPU_AUTOTUNE_MAX_SAMPLE_SECS_PER_CANDIDATE)
+}
+
+fn cpu_autotune_confirmation_threads(
+    profile: CpuPerformanceProfile,
+    selection: CpuAutotuneSelection,
+    measurements: &BTreeMap<usize, CpuAutotuneMeasurement>,
+) -> Vec<usize> {
+    if profile != CpuPerformanceProfile::Balanced || measurements.len() < 2 {
+        return Vec::new();
+    }
+
+    let runner_up = measurements
+        .iter()
+        .filter(|(threads, _)| **threads != selection.peak_threads)
+        .max_by(|(left_threads, left), (right_threads, right)| {
+            left.hps
+                .total_cmp(&right.hps)
+                .then_with(|| right_threads.cmp(left_threads))
+        })
+        .map(|(threads, measurement)| (*threads, *measurement));
+
+    let runner_up_is_close = runner_up.is_some_and(|(_, measurement)| {
+        selection.peak_hps > 0.0
+            && measurement.hps + f64::EPSILON
+                >= selection.peak_hps * CPU_AUTOTUNE_FINAL_CONFIRM_CLOSE_FRAC
+    });
+    if selection.selected_threads == selection.peak_threads && !runner_up_is_close {
+        return Vec::new();
+    }
+
+    let mut finalists = vec![selection.peak_threads, selection.selected_threads];
+    if runner_up_is_close {
+        if let Some((threads, _)) = runner_up {
+            finalists.push(threads);
+        }
+    }
+    // The initial ramp measures ascending thread counts. Reverse that order for
+    // confirmation so temperature and run position do not consistently favor
+    // either the lower-memory candidate or the higher-throughput candidate.
+    finalists.sort_unstable_by(|left, right| right.cmp(left));
+    finalists.dedup();
+    finalists
+}
+
+fn select_peak_autotune_candidate(
+    measurements: &BTreeMap<usize, CpuAutotuneMeasurement>,
+) -> Option<(usize, CpuAutotuneMeasurement)> {
+    measurements
+        .iter()
+        .max_by(|(left_threads, left), (right_threads, right)| {
+            // Prefer lower thread counts when measured H/s ties.
+            left.hps
+                .total_cmp(&right.hps)
+                .then_with(|| right_threads.cmp(left_threads))
+        })
+        .map(|(threads, measurement)| (*threads, *measurement))
+}
+
+fn select_cpu_autotune_candidate(
+    profile: CpuPerformanceProfile,
+    measurements: &BTreeMap<usize, CpuAutotuneMeasurement>,
+) -> Option<CpuAutotuneSelection> {
+    let (peak_threads, peak) = select_peak_autotune_candidate(measurements)?;
+    let peak_floor_frac = cpu_autotune_peak_floor_frac(profile).clamp(0.0, 1.0);
+    let min_acceptable_hps = peak.hps * peak_floor_frac;
+
+    let (selected_threads, selected) = if peak_floor_frac >= 1.0 || peak.hps <= 0.0 {
+        (peak_threads, peak)
+    } else {
+        measurements
+            .iter()
+            .find(|(_, measurement)| measurement.hps + f64::EPSILON >= min_acceptable_hps)
+            .map(|(threads, measurement)| (*threads, *measurement))
+            .unwrap_or((peak_threads, peak))
+    };
+
+    Some(CpuAutotuneSelection {
+        selected_threads,
+        selected_hps: selected.hps,
+        peak_threads,
+        peak_hps: peak.hps,
+        peak_floor_frac,
+    })
+}
+
+fn cpu_autotune_refinement_window(
+    min_threads: usize,
+    max_threads: usize,
+    center_threads: usize,
+) -> (usize, usize) {
+    let sweep_min = center_threads
+        .saturating_sub(CPU_AUTOTUNE_FINAL_SWEEP_RADIUS)
+        .max(min_threads);
+    let sweep_max = center_threads
+        .saturating_add(CPU_AUTOTUNE_FINAL_SWEEP_RADIUS)
+        .min(max_threads);
+    (sweep_min, sweep_max)
+}
+
+fn cpu_autotune_refinement_candidates(
+    min_threads: usize,
+    max_threads: usize,
+    center_threads: usize,
+    include_low_anchor: bool,
+    measurements: &BTreeMap<usize, CpuAutotuneMeasurement>,
+) -> Vec<usize> {
+    let (sweep_min, sweep_max) =
+        cpu_autotune_refinement_window(min_threads, max_threads, center_threads);
+    let mut final_candidates = BTreeSet::new();
+    for threads in sweep_min..=sweep_max {
+        final_candidates.insert(threads);
+    }
+    if include_low_anchor {
+        final_candidates.insert(min_threads);
+    }
+    final_candidates
+        .into_iter()
+        .filter(|threads| !measurements.contains_key(threads))
+        .collect()
+}
+
+fn cpu_autotune_is_memory_limit_error(err: &anyhow::Error) -> bool {
+    let rendered = format!("{err:#}").to_ascii_lowercase();
+    let hints = [
+        "out of memory",
+        "cannot allocate",
+        "memory allocation",
+        "allocation failed",
+        "failed to allocate",
+        "hugetlb",
+        "mmap",
+    ];
+    hints.iter().any(|hint| rendered.contains(hint))
+}
+
+fn cpu_autotune_next_sample_chunk_secs(
+    sample_window_secs: u64,
+    sampled_secs: u64,
+    sampled_hashes: u64,
+    wall_secs: f64,
+) -> u64 {
+    let remaining_secs = CPU_AUTOTUNE_MAX_SAMPLE_SECS_PER_CANDIDATE.saturating_sub(sampled_secs);
+    if remaining_secs == 0 {
+        return 0;
+    }
+    let mut chunk_secs = sample_window_secs.min(remaining_secs).max(1);
+    if sampled_hashes > 0
+        && sampled_hashes < CPU_AUTOTUNE_TARGET_HASHES_PER_CANDIDATE
+        && wall_secs > f64::EPSILON
+    {
+        let hashes_remaining = CPU_AUTOTUNE_TARGET_HASHES_PER_CANDIDATE - sampled_hashes;
+        let estimated_hps = sampled_hashes as f64 / wall_secs;
+        if estimated_hps > f64::EPSILON {
+            let estimated_secs = ((hashes_remaining as f64) / estimated_hps).ceil() as u64;
+            chunk_secs = chunk_secs.min(estimated_secs.max(1));
+        }
+    }
+    chunk_secs
+}
+
+fn measure_cpu_autotune_candidate(
+    cfg: &Config,
+    tag: &str,
+    shutdown: &AtomicBool,
+    threads: usize,
+    window_secs: u64,
+    measurements: &mut BTreeMap<usize, CpuAutotuneMeasurement>,
+) -> Result<CpuAutotuneMeasureOutcome> {
+    if measurements.contains_key(&threads) {
+        return Ok(CpuAutotuneMeasureOutcome::Measured);
+    }
+
+    let measurement = match bench_cpu_autotune_candidate(cfg, shutdown, threads, window_secs) {
+        Ok(Some(measurement)) => measurement,
+        Ok(None) => return Ok(CpuAutotuneMeasureOutcome::Interrupted),
+        Err(err) => {
+            if cpu_autotune_is_memory_limit_error(&err) {
+                warn(
+                    tag,
+                    format!(
+                        "cpu-autotune | {} threads exceeded memory headroom ({err:#}); stopping ramp at this point",
+                        threads
+                    ),
+                );
+                return Ok(CpuAutotuneMeasureOutcome::MemoryLimited);
+            }
+            return Err(err);
+        }
+    };
+    info(
+        tag,
+        format!(
+            "cpu-autotune |   -> {} threads: {} ({} hashes in {:.3}s hashing, {:.3}s total)",
+            threads,
+            format_hashrate(measurement.hps),
+            measurement.hashes,
+            measurement.elapsed_secs,
+            measurement.wall_secs,
+        ),
+    );
+    measurements.insert(threads, measurement);
+    Ok(CpuAutotuneMeasureOutcome::Measured)
+}
+
+fn merge_cpu_autotune_measurements(
+    initial: CpuAutotuneMeasurement,
+    confirmation: CpuAutotuneMeasurement,
+) -> CpuAutotuneMeasurement {
+    let hashes = initial.hashes.saturating_add(confirmation.hashes);
+    let elapsed_secs = initial.elapsed_secs + confirmation.elapsed_secs;
+    let wall_secs = initial.wall_secs + confirmation.wall_secs;
+    CpuAutotuneMeasurement {
+        hashes,
+        elapsed_secs,
+        wall_secs,
+        hps: hashes as f64 / elapsed_secs.max(f64::EPSILON),
+    }
+}
+
+fn remeasure_cpu_autotune_candidate(
+    cfg: &Config,
+    tag: &str,
+    shutdown: &AtomicBool,
+    threads: usize,
+    window_secs: u64,
+    measurements: &mut BTreeMap<usize, CpuAutotuneMeasurement>,
+) -> Result<CpuAutotuneMeasureOutcome> {
+    let confirmation = match bench_cpu_autotune_candidate(cfg, shutdown, threads, window_secs) {
+        Ok(Some(measurement)) => measurement,
+        Ok(None) => return Ok(CpuAutotuneMeasureOutcome::Interrupted),
+        Err(err) => {
+            if cpu_autotune_is_memory_limit_error(&err) {
+                warn(
+                    tag,
+                    format!(
+                        "cpu-autotune | finalist confirmation at {} threads exceeded memory headroom ({err:#}); keeping completed measurements",
+                        threads
+                    ),
+                );
+                return Ok(CpuAutotuneMeasureOutcome::MemoryLimited);
+            }
+            return Err(err);
+        }
+    };
+
+    let combined = measurements
+        .get(&threads)
+        .copied()
+        .map(|initial| merge_cpu_autotune_measurements(initial, confirmation))
+        .unwrap_or(confirmation);
+    measurements.insert(threads, combined);
+    info(
+        tag,
+        format!(
+            "cpu-autotune |   -> {} threads confirmed at {} (combined {} hashes in {:.3}s hashing, {:.3}s total)",
+            threads,
+            format_hashrate(combined.hps),
+            combined.hashes,
+            combined.elapsed_secs,
+            combined.wall_secs,
+        ),
+    );
+    Ok(CpuAutotuneMeasureOutcome::Measured)
+}
+
+fn bench_cpu_autotune_candidate(
+    cfg: &Config,
+    shutdown: &AtomicBool,
+    threads: usize,
+    window_secs: u64,
+) -> Result<Option<CpuAutotuneMeasurement>> {
+    if shutdown.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+
+    let backend = CpuBackend::with_tuning(
+        threads,
+        cfg.cpu_affinity,
+        CpuBackendTuning {
+            hash_batch_size: cfg.cpu_hash_batch_size,
+            control_check_interval_hashes: cfg.cpu_control_check_interval_hashes,
+            hash_flush_interval: cfg.cpu_hash_flush_interval,
+            event_dispatch_capacity: cfg.cpu_event_dispatch_capacity,
+            page_mode: cfg.cpu_page_mode,
+            side_cache_blocks: cfg.cpu_side_cache_blocks,
+            skip_store_permille: cfg.cpu_skip_store_permille,
+            // Size workers for the kernel that will mine, not the plain fallback.
+            kernel: cfg.bench_cpu_kernel.or_else(adaptive_kernel::cohort_kernel),
+        },
+    );
+
+    let sample_window_secs = window_secs.max(1);
+    let mut sampled_secs = 0u64;
+    let mut sampled_hashes = 0u64;
+    let mut elapsed_secs = 0.0f64;
+    let mut wall_secs = 0.0f64;
+
+    while sampled_secs < CPU_AUTOTUNE_MAX_SAMPLE_SECS_PER_CANDIDATE
+        && sampled_hashes < CPU_AUTOTUNE_TARGET_HASHES_PER_CANDIDATE
+    {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let chunk_secs = cpu_autotune_next_sample_chunk_secs(
+            sample_window_secs,
+            sampled_secs,
+            sampled_hashes,
+            elapsed_secs,
+        );
+        if chunk_secs == 0 {
+            break;
+        }
+        let sample = backend.autotune_sample(chunk_secs, shutdown)?;
+        elapsed_secs += sample.elapsed_secs;
+        wall_secs += sample.wall_elapsed_secs;
+        sampled_secs = sampled_secs.saturating_add(chunk_secs);
+        sampled_hashes = sampled_hashes.saturating_add(sample.hashes);
+    }
+
+    if sampled_secs == 0 || shutdown.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+
+    // Include last-hash overrun, but exclude allocation, warmup and arena teardown.
+    let hps = (sampled_hashes as f64) / elapsed_secs.max(f64::EPSILON);
+    Ok(Some(CpuAutotuneMeasurement {
+        hashes: sampled_hashes,
+        elapsed_secs,
+        wall_secs,
+        hps,
+    }))
+}
+
+fn apply_cpu_threads(cfg: &mut Config, threads: usize) {
+    let threads = threads.max(1);
+    cfg.threads = threads;
+    for spec in cfg
+        .backend_specs
+        .iter_mut()
+        .filter(|spec| spec.kind == BackendKind::Cpu)
+    {
+        spec.cpu_threads = Some(threads);
+    }
+}
+
+// Keep cache diagnostics free of host identifiers and filesystem contents.
+fn read_cpu_autotune_cache(path: &std::path::Path) -> Result<CpuAutotuneRecord, &'static str> {
+    let raw = fs::read(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            "no saved tuning result"
+        } else {
+            "saved tuning result could not be read"
+        }
+    })?;
+    serde_json::from_slice(&raw).map_err(|_| "saved tuning result is invalid")
+}
+
+fn cpu_autotune_host_change(
+    saved: &CpuAutotuneHostFingerprint,
+    current: &CpuAutotuneHostFingerprint,
+) -> Option<&'static str> {
+    if saved.build_fingerprint != current.build_fingerprint {
+        Some("miner build changed")
+    } else if saved.cpu_brand != current.cpu_brand
+        || saved.cpu_arch != current.cpu_arch
+        || saved.logical_cores != current.logical_cores
+        || saved.physical_cores != current.physical_cores
+        || saved.total_memory_bytes != current.total_memory_bytes
+    {
+        Some("CPU or memory configuration changed")
+    } else if saved.os != current.os
+        || saved.kernel_version != current.kernel_version
+        || saved.runtime_environment != current.runtime_environment
+    {
+        Some("operating system or runtime changed")
+    } else if saved.affinity_topology != current.affinity_topology {
+        Some("CPU affinity or topology changed")
+    } else {
+        None
+    }
+}
+
+fn load_cpu_autotune_record(
+    cfg: &Config,
+    tag: &str,
+    cpu_instance_count: usize,
+    min_threads: usize,
+    max_threads: usize,
+    autotune_secs: u64,
+) -> Option<CpuAutotuneRecord> {
+    let record = match read_cpu_autotune_cache(&cfg.cpu_autotune_config_path) {
+        Ok(record) => record,
+        Err(reason) => {
+            info(tag, format!("cpu-autotune | {reason}; running autotune"));
+            return None;
+        }
+    };
+
+    let reason = if record.schema_version != CPU_AUTOTUNE_RECORD_SCHEMA_VERSION {
+        Some("cache format changed")
+    } else if record.mining_measurement {
+        Some("cached result is from live mining")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        info(tag, format!("cpu-autotune | {reason}; re-running autotune"));
+        return None;
+    }
+
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let record_age_secs = now_unix_secs.saturating_sub(record.timestamp_unix_secs);
+    if record_age_secs > CPU_AUTOTUNE_RECORD_MAX_AGE_SECS {
+        info(
+            tag,
+            format!(
+                "cpu-autotune | cache expired (age={}h > {}h); re-running autotune",
+                record_age_secs / 3600,
+                CPU_AUTOTUNE_RECORD_MAX_AGE_SECS / 3600
+            ),
+        );
+        return None;
+    }
+
+    let current_host = cpu_autotune_host_fingerprint();
+    if let Some(reason) = cpu_autotune_host_change(&record.host_fingerprint, &current_host) {
+        info(tag, format!("cpu-autotune | {reason}; re-running autotune"));
+        return None;
+    }
+
+    if !cpu_autotune_record_matches_config(
+        &record,
+        cfg,
+        cpu_instance_count,
+        min_threads,
+        max_threads,
+        autotune_secs,
+    ) {
+        info(
+            tag,
+            "cpu-autotune | tuning settings changed; re-running autotune",
+        );
+        return None;
+    }
+
+    Some(record)
+}
+
+fn cpu_autotune_record_matches_config(
+    record: &CpuAutotuneRecord,
+    cfg: &Config,
+    cpu_instance_count: usize,
+    min_threads: usize,
+    max_threads: usize,
+    autotune_secs: u64,
+) -> bool {
+    record.profile == cpu_profile_label(cfg.cpu_profile)
+        && record.affinity == cpu_affinity_label(cfg.cpu_affinity)
+        && record.page_mode == cfg.cpu_page_mode.as_str()
+        && record.cpu_instances == cpu_instance_count
+        && record.min_threads == min_threads
+        && record.max_threads == max_threads
+        && record.autotune_secs == autotune_secs
+        && record.selected_threads >= min_threads
+        && record.selected_threads <= max_threads
+}
+
+fn persist_cpu_autotune_record(
+    cfg: &Config,
+    cpu_instance_count: usize,
+    min_threads: usize,
+    max_threads: usize,
+    selected_threads: usize,
+    measured_hps: f64,
+    autotune_secs: u64,
+    measurements: &BTreeMap<usize, CpuAutotuneMeasurement>,
+) -> Result<()> {
+    if let Some(parent) = cfg.cpu_autotune_config_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let record = CpuAutotuneRecord {
+        schema_version: CPU_AUTOTUNE_RECORD_SCHEMA_VERSION,
+        profile: cpu_profile_label(cfg.cpu_profile).to_string(),
+        affinity: cpu_affinity_label(cfg.cpu_affinity).to_string(),
+        page_mode: cfg.cpu_page_mode.as_str().to_string(),
+        cpu_instances: cpu_instance_count,
+        min_threads,
+        max_threads,
+        selected_threads,
+        measured_hps,
+        autotune_secs,
+        host_fingerprint: cpu_autotune_host_fingerprint(),
+        timestamp_unix_secs: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0),
+        measurements: measurements.clone(),
+        memory_limited: max_threads < adaptive_cpu::limits(cfg, 0).1,
+        search: None,
+        mining_measurement: false,
+    };
+    let payload = serde_json::to_string_pretty(&record)?;
+    fs::write(&cfg.cpu_autotune_config_path, payload)?;
+    Ok(())
+}
+
+fn runtime_mode_tag(mode: RuntimeMode) -> &'static str {
+    match mode {
+        RuntimeMode::Mining => "MINER",
+        RuntimeMode::Bench => "BENCH",
+    }
+}
+
+fn cpu_profile_label(profile: CpuPerformanceProfile) -> &'static str {
+    match profile {
+        CpuPerformanceProfile::Balanced => "balanced",
+        CpuPerformanceProfile::Throughput => "throughput",
+        CpuPerformanceProfile::Efficiency => "efficiency",
+    }
+}
+
+fn cpu_affinity_label(affinity: crate::config::CpuAffinityMode) -> &'static str {
+    match affinity {
+        crate::config::CpuAffinityMode::Os => "os",
+        crate::config::CpuAffinityMode::Off => "off",
+        crate::config::CpuAffinityMode::Auto => "auto",
+        crate::config::CpuAffinityMode::PcoreOnly => "pcore-only",
+    }
+}
+
+fn cpu_autotune_host_fingerprint() -> CpuAutotuneHostFingerprint {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    sys.refresh_cpu_all();
+    CpuAutotuneHostFingerprint {
+        cpu_brand: sys.cpus().first().map(|cpu| cpu.brand().to_string()),
+        cpu_arch: System::cpu_arch(),
+        logical_cores: std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0),
+        physical_cores: sys.physical_core_count(),
+        total_memory_bytes: sys.total_memory(),
+        os: std::env::consts::OS.to_string(),
+        kernel_version: crate::runtime_identity::runtime_kernel_version(),
+        runtime_environment: crate::runtime_identity::runtime_environment(),
+        build_fingerprint: crate::runtime_identity::build_fingerprint(),
+        affinity_topology: crate::backend::cpu::affinity_topology_fingerprint(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default)]
+struct LinuxHugepagesMeminfo {
+    total_pages: u64,
+    free_pages: u64,
+    reserved_pages: u64,
+    page_size_kib: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn maybe_warn_linux_hugepages_setup(cfg: &Config, mode: RuntimeMode) {
+    if cfg.cpu_page_mode == CpuPageMode::Regular {
+        return;
+    }
+    let cpu_lanes = cfg
+        .backend_specs
+        .iter()
+        .filter(|spec| spec.kind == BackendKind::Cpu)
+        .map(|spec| spec.cpu_threads.unwrap_or(cfg.threads).max(1) as u64)
+        .sum::<u64>();
+    if cpu_lanes == 0 {
+        return;
+    }
+
+    if cfg.cpu_page_mode == CpuPageMode::Large1G {
+        maybe_warn_linux_1g_hugepages_setup(cpu_lanes, mode);
+        return;
+    }
+    // Auto mode backs arenas with transparent huge pages when the kernel allows
+    // them; only hint when THP is off.
+    if cfg.cpu_page_mode == CpuPageMode::Auto && linux_thp_enabled() {
+        return;
+    }
+
+    let Some(meminfo) = read_linux_hugepages_meminfo() else {
+        return;
+    };
+    let page_size_bytes = meminfo.page_size_kib.saturating_mul(1024);
+    if page_size_bytes == 0 {
+        return;
+    }
+
+    let per_lane_pages = div_ceil_u64(CPU_LANE_MEMORY_BYTES, page_size_bytes).max(1);
+    let required_pages = per_lane_pages.saturating_mul(cpu_lanes);
+    let unreserved_pages = meminfo.free_pages.saturating_sub(meminfo.reserved_pages);
+
+    if meminfo.total_pages >= required_pages && unreserved_pages >= required_pages {
+        return;
+    }
+
+    let shortage_pages = required_pages.saturating_sub(unreserved_pages);
+    let min_total_pages = required_pages.max(meminfo.total_pages.saturating_add(shortage_pages));
+    let suggested_pages = min_total_pages.saturating_add(div_ceil_u64(min_total_pages, 20)); // +5% headroom
+    let tag = runtime_mode_tag(mode);
+
+    warn(
+        tag,
+        format!(
+            "hugepages | CPU lanes={} need ~{} HugeTLB pages ({} per lane @ {} KiB/page), but current pool is total={} free={} rsvd={} (usable ~= {}).",
+            cpu_lanes,
+            required_pages,
+            per_lane_pages,
+            meminfo.page_size_kib,
+            meminfo.total_pages,
+            meminfo.free_pages,
+            meminfo.reserved_pages,
+            unreserved_pages,
+        ),
+    );
+    warn(
+        tag,
+        format!(
+            "hugepages | setup: sudo sysctl -w vm.nr_hugepages={}  (minimum: {})",
+            suggested_pages, min_total_pages
+        ),
+    );
+    info(
+        tag,
+        format!(
+            "hugepages | persist: echo 'vm.nr_hugepages={}' | sudo tee /etc/sysctl.d/99-seine-hugepages.conf && sudo sysctl --system",
+            suggested_pages
+        ),
+    );
+    info(tag, "hugepages | docs: see docs/guides/linux-hugepages.md");
+    info(
+        tag,
+        "hugepages | if allocation is partial, run: echo 3 | sudo tee /proc/sys/vm/drop_caches && echo 1 | sudo tee /proc/sys/vm/compact_memory",
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn linux_thp_enabled() -> bool {
+    std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
+        .is_ok_and(|mode| !mode.contains("[never]"))
+}
+
+/// Sizing guidance for `--cpu-page-mode large-1g`: each 2 GiB worker arena
+/// needs two 1 GiB HugeTLB pages. 1 GiB pools are a non-default hugepage size
+/// on most hosts, so they are read from sysfs rather than /proc/meminfo.
+#[cfg(target_os = "linux")]
+fn maybe_warn_linux_1g_hugepages_setup(cpu_lanes: u64, mode: RuntimeMode) {
+    const HUGE_1G_POOL: &str = "/sys/kernel/mm/hugepages/hugepages-1048576kB";
+    let per_lane_pages = div_ceil_u64(CPU_LANE_MEMORY_BYTES, 1024 * 1024 * 1024).max(1);
+    let required_pages = per_lane_pages.saturating_mul(cpu_lanes);
+    let tag = runtime_mode_tag(mode);
+
+    let read_pool = |name: &str| -> Option<u64> {
+        fs::read_to_string(format!("{HUGE_1G_POOL}/{name}"))
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    };
+    let Some(total_pages) = read_pool("nr_hugepages") else {
+        warn(
+            tag,
+            "hugepages-1g | kernel does not expose a 1 GiB HugeTLB pool; --cpu-page-mode large-1g will fail closed (requires x86_64 with 1 GiB page support)",
+        );
+        return;
+    };
+    let free_pages = read_pool("free_hugepages").unwrap_or(0);
+    let reserved_pages = read_pool("resv_hugepages").unwrap_or(0);
+    let unreserved_pages = free_pages.saturating_sub(reserved_pages);
+    if total_pages >= required_pages && unreserved_pages >= required_pages {
+        return;
+    }
+
+    warn(
+        tag,
+        format!(
+            "hugepages-1g | CPU lanes={} need {} x 1 GiB HugeTLB pages ({} per lane), but current pool is total={} free={} rsvd={}.",
+            cpu_lanes, required_pages, per_lane_pages, total_pages, free_pages, reserved_pages,
+        ),
+    );
+    warn(
+        tag,
+        format!(
+            "hugepages-1g | setup: echo {required_pages} | sudo tee {HUGE_1G_POOL}/nr_hugepages  (or boot with hugepagesz=1G hugepages={required_pages})"
+        ),
+    );
+    info(
+        tag,
+        "hugepages-1g | WSL2: set kernelCommandLine=hugepagesz=1G hugepages=<N> in %UserProfile%\\.wslconfig, then restart WSL",
+    );
+    info(
+        tag,
+        "hugepages-1g | docs: see docs/guides/linux-hugepages.md#1-gib-pages",
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn maybe_warn_linux_hugepages_setup(_cfg: &Config, _mode: RuntimeMode) {}
+
+#[cfg(target_os = "linux")]
+fn read_linux_hugepages_meminfo() -> Option<LinuxHugepagesMeminfo> {
+    let content = fs::read_to_string("/proc/meminfo").ok()?;
+    let mut out = LinuxHugepagesMeminfo::default();
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("HugePages_Total:") {
+            out.total_pages = parse_meminfo_u64(rest).unwrap_or(out.total_pages);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("HugePages_Free:") {
+            out.free_pages = parse_meminfo_u64(rest).unwrap_or(out.free_pages);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("HugePages_Rsvd:") {
+            out.reserved_pages = parse_meminfo_u64(rest).unwrap_or(out.reserved_pages);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Hugepagesize:") {
+            out.page_size_kib = parse_meminfo_u64(rest).unwrap_or(out.page_size_kib);
+        }
+    }
+
+    if out.page_size_kib == 0 {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_meminfo_u64(value: &str) -> Option<u64> {
+    value.split_whitespace().next()?.parse::<u64>().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn div_ceil_u64(numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+    numerator
+        .saturating_add(denominator.saturating_sub(1))
+        .saturating_div(denominator)
+}
+
+fn build_backend_instances(cfg: &Config) -> Vec<(BackendSpec, Arc<dyn PowBackend>)> {
+    cfg.backend_specs
+        .iter()
+        .copied()
+        .map(|backend_spec| {
+            let backend = match backend_spec.kind {
+                BackendKind::Cpu => Arc::new(CpuBackend::with_tuning(
+                    backend_spec.cpu_threads.unwrap_or(cfg.threads),
+                    backend_spec.cpu_affinity.unwrap_or(cfg.cpu_affinity),
+                    CpuBackendTuning {
+                        hash_batch_size: cfg.cpu_hash_batch_size,
+                        control_check_interval_hashes: cfg.cpu_control_check_interval_hashes,
+                        hash_flush_interval: cfg.cpu_hash_flush_interval,
+                        event_dispatch_capacity: cfg.cpu_event_dispatch_capacity,
+                        page_mode: cfg.cpu_page_mode,
+                        side_cache_blocks: cfg.cpu_side_cache_blocks,
+                        skip_store_permille: cfg.cpu_skip_store_permille,
+                        kernel: cfg.bench_cpu_kernel.or_else(|| {
+                            adaptive_kernel::static_kernel_for(
+                                backend_spec.cpu_threads.unwrap_or(cfg.threads),
+                            )
+                        }),
+                    },
+                )) as Arc<dyn PowBackend>,
+                BackendKind::Nvidia => Arc::new(NvidiaBackend::new(
+                    backend_spec.device_index,
+                    cfg.nvidia_autotune_config_path.clone(),
+                    cfg.nvidia_autotune_secs,
+                    NvidiaBackendTuningOptions {
+                        max_rregcount_override: cfg.nvidia_max_rregcount,
+                        max_lanes_override: cfg.nvidia_max_lanes,
+                        autotune_samples: cfg.nvidia_autotune_samples,
+                        dispatch_iters_per_lane: cfg.nvidia_dispatch_iters_per_lane,
+                        allocation_iters_per_lane: cfg.nvidia_allocation_iters_per_lane,
+                        hashes_per_launch_per_lane: cfg.nvidia_hashes_per_launch_per_lane,
+                        hashes_per_launch_per_lane_was_set: cfg
+                            .nvidia_hashes_per_launch_per_lane_was_set,
+                        fused_target_check: cfg.nvidia_fused_target_check,
+                        adaptive_launch_depth: cfg.nvidia_adaptive_launch_depth,
+                        enforce_template_stop: cfg.nvidia_enforce_template_stop,
+                    },
+                )) as Arc<dyn PowBackend>,
+                BackendKind::Amd => Arc::new(AmdBackend::new(
+                    backend_spec.device_index,
+                    AmdBackendTuningOptions {
+                        max_lanes_override: cfg.amd_max_lanes,
+                        ..AmdBackendTuningOptions::default()
+                    },
+                )) as Arc<dyn PowBackend>,
+                BackendKind::Metal => {
+                    let backend = MetalBackend::new(
+                        cfg.metal_max_lanes,
+                        cfg.metal_hashes_per_launch_per_lane,
+                    );
+                    Arc::new(if cfg.metal_blake2b_only {
+                        backend.blake2b_only()
+                    } else {
+                        backend
+                    }) as Arc<dyn PowBackend>
+                }
+            };
+            (backend_spec, backend)
+        })
+        .collect()
+}
+
+fn activate_single_backend(
+    backend_spec: BackendSpec,
+    backend: Arc<dyn PowBackend>,
+    backend_id: BackendInstanceId,
+    event_capacity: usize,
+    cfg: &Config,
+    shutdown: &AtomicBool,
+) -> Result<ActivatedBackend> {
+    check_startup_shutdown(shutdown)?;
+    let backend_name = backend.name();
+    backend.set_instance_id(backend_id);
+    let (backend_event_tx, backend_event_rx) = bounded::<BackendEvent>(event_capacity);
+    backend.set_event_sink(backend_event_tx);
+    let backend_start_detail = match backend_name {
+        "cpu" => {
+            let lanes = backend.enabled_lanes();
+            let ram_gib =
+                (lanes as f64 * CPU_LANE_MEMORY_BYTES as f64) / (1024.0 * 1024.0 * 1024.0);
+            format!("{backend_name}: starting {lanes} threads (~{ram_gib:.1} GiB RAM)",)
+        }
+        "nvidia" => format!("{backend_name}: starting CUDA engine",),
+        "amd" => {
+            format!("{backend_name}: starting HIP engine (first run can take about a minute)",)
+        }
+        _ => format!("{backend_name}: starting"),
+    };
+    info("BACKEND", &backend_start_detail);
+    let start_t = Instant::now();
+
+    let start_result = start_backend_interruptibly(&backend, backend_id, shutdown);
+    match start_result {
+        Ok(()) => {
+            ui::detail(
+                "BACKEND",
+                format!(
+                    "{backend_name}#{backend_id}: ready in {:.1}s",
+                    start_t.elapsed().as_secs_f64(),
+                ),
+            );
+            let capabilities =
+                backend_capabilities_for_start(backend.as_ref(), backend_name, backend_id)
+                    .map_err(|err| {
+                        warn(
+                            "BACKEND",
+                            format!(
+                        "{backend_name}#{backend_id} capability contract violation: {err:#}"
+                    ),
+                        );
+                        backend.stop();
+                        anyhow!(
+                            "{backend_name}#{backend_id} capability contract violation: {err:#}"
+                        )
+                    })?;
+            if capabilities.max_inflight_assignments > 1 && !backend.supports_assignment_batching()
+            {
+                warn(
+                    "BACKEND",
+                    format!(
+                        "{}#{} reports inflight={} but does not support batched assignment dispatch; clamping runtime inflight to 1",
+                        backend_name,
+                        backend_id,
+                        capabilities.max_inflight_assignments
+                    ),
+                );
+            }
+            let lanes = backend.lanes() as u64;
+            if lanes == 0 {
+                warn(
+                    "BACKEND",
+                    format!(
+                        "skipping {}#{}: reported zero lanes",
+                        backend_name, backend_id
+                    ),
+                );
+                backend.stop();
+                bail!("{backend_name}#{backend_id} reported zero lanes");
+            }
+            let runtime_policy = backend_runtime_policy(cfg, &backend_spec, capabilities);
+            Ok(ActivatedBackend {
+                slot: BackendSlot {
+                    id: backend_id,
+                    backend,
+                    lanes,
+                    runtime_policy,
+                    capabilities,
+                },
+                event_rx: backend_event_rx,
+            })
+        }
+        Err(err) => {
+            if err.is::<StartupCancelled>() {
+                return Err(err);
+            }
+            if backend_name == "nvidia" {
+                warn(
+                    "BACKEND",
+                    "NVIDIA mining requires an up-to-date NVIDIA GPU driver \
+                     — https://www.nvidia.com/drivers",
+                );
+            }
+            if backend_name == "amd" {
+                warn("BACKEND", backend_requirements_hint(BackendKind::Amd));
+            }
+            backend.stop();
+            Err(err.context(format!("{backend_name}#{backend_id} unavailable")))
+        }
+    }
+}
+
+fn activate_backends(
+    backends: Vec<(BackendSpec, Arc<dyn PowBackend>)>,
+    event_capacity: usize,
+    cfg: &Config,
+    shutdown: &AtomicBool,
+    extra_event_sources: Vec<Receiver<BackendEvent>>,
+) -> Result<(Vec<BackendSlot>, Receiver<BackendEvent>)> {
+    activate_backends_with_start_id(
+        backends,
+        event_capacity,
+        cfg,
+        shutdown,
+        extra_event_sources,
+        1,
+    )
+}
+
+fn activate_backends_with_start_id(
+    mut backends: Vec<(BackendSpec, Arc<dyn PowBackend>)>,
+    event_capacity: usize,
+    cfg: &Config,
+    shutdown: &AtomicBool,
+    extra_event_sources: Vec<Receiver<BackendEvent>>,
+    start_id: BackendInstanceId,
+) -> Result<(Vec<BackendSlot>, Receiver<BackendEvent>)> {
+    let mut active = Vec::new();
+    let mut backend_event_sources = Vec::new();
+    let (event_tx, event_rx) = bounded::<BackendEvent>(event_capacity.max(1));
+    let mut next_backend_id: BackendInstanceId = start_id;
+    let per_backend_event_capacity = event_capacity.clamp(8, BACKEND_EVENT_SOURCE_CAPACITY_MAX);
+
+    for (backend_spec, backend) in backends.drain(..) {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let backend_id = next_backend_id;
+        next_backend_id = next_backend_id.saturating_add(1);
+        match activate_single_backend(
+            backend_spec,
+            backend,
+            backend_id,
+            per_backend_event_capacity,
+            cfg,
+            shutdown,
+        ) {
+            Ok(activated) => {
+                active.push(activated.slot);
+                backend_event_sources.push(activated.event_rx);
+            }
+            Err(err) => {
+                if err.is::<StartupCancelled>() {
+                    for slot in &active {
+                        slot.backend.stop();
+                    }
+                    return Err(err);
+                }
+                record_backend_start_failure(&err, backend_spec.kind);
+                warn("BACKEND", format!("{err:#}"));
+            }
+        }
+    }
+
+    if let Err(cancelled) = check_startup_shutdown(shutdown) {
+        for slot in &active {
+            slot.backend.stop();
+        }
+        return Err(cancelled);
+    }
+
+    if active.is_empty() && extra_event_sources.is_empty() {
+        crate::diagnostics::record_failure(
+            seine_telemetry::DiagnosticCode::Error,
+            seine_telemetry::DiagnosticKind::General,
+            None,
+            seine_telemetry::FailureDetail::new(
+                seine_telemetry::FailureReason::NoBackendAvailable,
+                seine_telemetry::DiagnosticOperation::BackendStartup,
+            ),
+        );
+        bail!("no mining backend could be started");
+    }
+
+    backend_event_sources.extend(extra_event_sources);
+    spawn_backend_event_fan_in(backend_event_sources, event_tx)?;
+
+    Ok((active, event_rx))
+}
+
+fn spawn_backend_event_fan_in(
+    sources: Vec<Receiver<BackendEvent>>,
+    sink: Sender<BackendEvent>,
+) -> Result<()> {
+    if sources.is_empty() {
+        return Ok(());
+    }
+    let thread_name = "seine-backend-events-fanin".to_string();
+    std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let mut receivers = sources;
+            while !receivers.is_empty() {
+                let mut select = crossbeam_channel::Select::new();
+                for receiver in &receivers {
+                    select.recv(receiver);
+                }
+                let operation = select.select();
+                let idx = operation.index();
+                match operation.recv(&receivers[idx]) {
+                    Ok(event) => {
+                        if sink.send(event).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        receivers.swap_remove(idx);
+                    }
+                }
+            }
+        })
+        .map_err(|err| anyhow!("failed to spawn backend event fan-in thread: {err}"))?;
+    Ok(())
+}
+
+fn start_backend_slots(
+    backends: &mut Vec<BackendSlot>,
+    backend_executor: &backend_executor::BackendExecutor,
+    stop_timeout: Duration,
+) -> Result<()> {
+    let mut failed_indices = Vec::new();
+    for (idx, slot) in backends.iter_mut().enumerate() {
+        if let Err(err) = slot.backend.start() {
+            warn(
+                "BENCH",
+                format!(
+                    "backend {}#{} failed to restart: {err:#}",
+                    slot.backend.name(),
+                    slot.id
+                ),
+            );
+            failed_indices.push(idx);
+        }
+    }
+
+    for idx in failed_indices.into_iter().rev() {
+        let slot = backends.remove(idx);
+        let backend_name = slot.backend.name();
+        let backend_id = slot.id;
+        backend_executor.quarantine_backend(backend_id, Arc::clone(&slot.backend));
+        warn(
+            "BENCH",
+            format!("quarantined {backend_name}#{backend_id} after restart failure"),
+        );
+    }
+
+    if !backend_executor.wait_for_quarantine_drain(stop_timeout.max(Duration::from_millis(100))) {
+        warn(
+            "BENCH",
+            format!(
+                "backend restart cleanup exceeded {}ms; detached",
+                stop_timeout.max(Duration::from_millis(100)).as_millis()
+            ),
+        );
+    }
+
+    if backends.is_empty() {
+        bail!("all benchmark backends are unavailable after restart failure");
+    }
+    Ok(())
+}
+
+fn stop_backend_slots(
+    backends: &mut [BackendSlot],
+    backend_executor: &backend_executor::BackendExecutor,
+    stop_timeout: Duration,
+    log_tag: &'static str,
+) {
+    crate::diagnostics::cleanup_stage(seine_telemetry::CleanupStage::StoppingBackends);
+    for slot in backends.iter() {
+        backend_executor.quarantine_backend(slot.id, Arc::clone(&slot.backend));
+    }
+
+    let wait_timeout = stop_timeout.max(Duration::from_millis(100));
+    if !backend_executor.wait_for_quarantine_drain(wait_timeout) {
+        warn(
+            log_tag,
+            format!(
+                "backend stop did not quiesce within {}ms; detached",
+                wait_timeout.as_millis()
+            ),
+        );
+    }
+    backend_executor.clear();
+}
+
+fn distribute_work(
+    backends: &mut Vec<BackendSlot>,
+    options: DistributeWorkOptions<'_>,
+    backend_executor: &backend_executor::BackendExecutor,
+) -> Result<WorkDistributionOutcome> {
+    work_allocator::distribute_work(backends, options, backend_executor)
+}
+
+#[cfg(test)]
+fn compute_backend_nonce_counts(
+    backends: &[BackendSlot],
+    max_iters_per_lane: u64,
+    backend_weights: Option<&BTreeMap<BackendInstanceId, f64>>,
+) -> Vec<u64> {
+    work_allocator::compute_backend_nonce_counts(
+        backends,
+        max_iters_per_lane,
+        backend_weights,
+        crate::backend::PowAlgorithm::Argon2id,
+    )
+}
+
+fn backend_iters_per_lane(slot: &BackendSlot, default_iters_per_lane: u64) -> u64 {
+    work_allocator::backend_iters_per_lane(slot, default_iters_per_lane)
+}
+
+fn backend_dispatch_iters_per_lane(slot: &BackendSlot, default_iters_per_lane: u64) -> u64 {
+    work_allocator::backend_dispatch_iters_per_lane(slot, default_iters_per_lane)
+}
+
+fn collect_backend_hashes(
+    backends: &[BackendSlot],
+    backend_executor: &backend_executor::BackendExecutor,
+    stats: Option<&Stats>,
+    round_hashes: &mut u64,
+    mut round_backend_hashes: Option<&mut BTreeMap<BackendInstanceId, u64>>,
+    mut round_backend_telemetry: Option<&mut BTreeMap<BackendInstanceId, BackendRoundTelemetry>>,
+) {
+    let mut collected = 0u64;
+    let runtime_telemetry = backend_executor.take_backend_telemetry_ordered(backends.iter());
+    for (slot, runtime) in backends.iter().zip(runtime_telemetry.into_iter()) {
+        let slot_hashes = slot.backend.take_hashes();
+        backend_executor.record_hardware_sample(slot, slot_hashes);
+        let telemetry = slot.backend.take_telemetry();
+        if let Some(per_backend_telemetry) = round_backend_telemetry.as_deref_mut() {
+            merge_backend_telemetry(per_backend_telemetry, slot.id, telemetry);
+            merge_backend_telemetry(per_backend_telemetry, slot.id, runtime);
+        }
+
+        if slot_hashes == 0 {
+            continue;
+        }
+
+        collected = collected.saturating_add(slot_hashes);
+        if let Some(per_backend) = round_backend_hashes.as_deref_mut() {
+            let entry = per_backend.entry(slot.id).or_insert(0);
+            *entry = entry.saturating_add(slot_hashes);
+        }
+    }
+
+    if collected == 0 {
+        return;
+    }
+
+    if let Some(stats) = stats {
+        stats.add_hashes(collected);
+    }
+    *round_hashes = round_hashes.saturating_add(collected);
+}
+
+fn collect_round_backend_samples(
+    backends: &[BackendSlot],
+    backend_executor: &backend_executor::BackendExecutor,
+    configured_hash_poll_interval: Duration,
+    poll_state: &mut hash_poll::BackendPollState,
+    round_backend_hashes: &mut BTreeMap<BackendInstanceId, u64>,
+    round_backend_telemetry: &mut BTreeMap<BackendInstanceId, BackendRoundTelemetry>,
+) -> u64 {
+    let due_slots =
+        hash_poll::due_backend_slots(backends, configured_hash_poll_interval, poll_state);
+    if due_slots.is_empty() {
+        return 0;
+    }
+
+    let mut collected = 0u64;
+    let runtime_telemetry =
+        backend_executor.take_backend_telemetry_ordered(due_slots.iter().copied());
+    for (slot, runtime) in due_slots.into_iter().zip(runtime_telemetry.into_iter()) {
+        let backend_id = slot.id;
+        let hashes = slot.backend.take_hashes();
+        backend_executor.record_hardware_sample(slot, hashes);
+        let telemetry = slot.backend.take_telemetry();
+        merge_backend_telemetry(round_backend_telemetry, backend_id, telemetry);
+        merge_backend_telemetry(round_backend_telemetry, backend_id, runtime);
+        if hashes > 0 {
+            collected = collected.saturating_add(hashes);
+            let entry = round_backend_hashes.entry(backend_id).or_insert(0);
+            *entry = entry.saturating_add(hashes);
+        }
+    }
+    collected
+}
+
+fn merge_backend_telemetry(
+    per_backend_telemetry: &mut BTreeMap<BackendInstanceId, BackendRoundTelemetry>,
+    backend_id: BackendInstanceId,
+    telemetry: BackendTelemetry,
+) {
+    let telemetry = backend_round_telemetry_delta(telemetry);
+    if telemetry.peak_active_lanes == 0
+        && telemetry.peak_pending_work == 0
+        && telemetry.dropped_events == 0
+        && telemetry.completed_assignments == 0
+        && telemetry.completed_assignment_hashes == 0
+        && telemetry.completed_assignment_micros == 0
+        && telemetry.memory_explicit_large_workers == 0
+        && telemetry.memory_explicit_large_1g_workers == 0
+        && telemetry.memory_transparent_huge_workers == 0
+        && telemetry.memory_regular_workers == 0
+        && telemetry.memory_heap_workers == 0
+        && telemetry.memory_explicit_large_bytes == 0
+        && telemetry.memory_explicit_large_1g_bytes == 0
+        && telemetry.memory_transparent_huge_bytes == 0
+        && telemetry.memory_regular_bytes == 0
+        && telemetry.memory_heap_bytes == 0
+        && telemetry.memory_allocation_failures == 0
+        && telemetry.peak_inflight_assignment_hashes == 0
+        && telemetry.peak_inflight_assignment_micros == 0
+        && telemetry.assignment_enqueue_timeouts == 0
+        && telemetry.assignment_execution_timeouts == 0
+        && telemetry.control_enqueue_timeouts == 0
+        && telemetry.control_execution_timeouts == 0
+        && telemetry.peak_assignment_timeout_strikes == 0
+        && telemetry.assignment_enqueue_latency_samples == 0
+        && telemetry.assignment_enqueue_latency_p95_micros == 0
+        && telemetry.assignment_enqueue_latency_max_micros == 0
+        && telemetry.assignment_execution_latency_samples == 0
+        && telemetry.assignment_execution_latency_p95_micros == 0
+        && telemetry.assignment_execution_latency_max_micros == 0
+        && telemetry.control_enqueue_latency_samples == 0
+        && telemetry.control_enqueue_latency_p95_micros == 0
+        && telemetry.control_enqueue_latency_max_micros == 0
+        && telemetry.control_execution_latency_samples == 0
+        && telemetry.control_execution_latency_p95_micros == 0
+        && telemetry.control_execution_latency_max_micros == 0
+    {
+        return;
+    }
+
+    let entry = per_backend_telemetry.entry(backend_id).or_default();
+    entry.dropped_events = entry
+        .dropped_events
+        .saturating_add(telemetry.dropped_events);
+    entry.completed_assignments = entry
+        .completed_assignments
+        .saturating_add(telemetry.completed_assignments);
+    entry.completed_assignment_hashes = entry
+        .completed_assignment_hashes
+        .saturating_add(telemetry.completed_assignment_hashes);
+    entry.completed_assignment_micros = entry
+        .completed_assignment_micros
+        .saturating_add(telemetry.completed_assignment_micros);
+    entry.peak_active_lanes = entry.peak_active_lanes.max(telemetry.peak_active_lanes);
+    entry.peak_pending_work = entry.peak_pending_work.max(telemetry.peak_pending_work);
+    entry.memory_explicit_large_workers = entry
+        .memory_explicit_large_workers
+        .max(telemetry.memory_explicit_large_workers);
+    entry.memory_explicit_large_1g_workers = entry
+        .memory_explicit_large_1g_workers
+        .max(telemetry.memory_explicit_large_1g_workers);
+    entry.memory_transparent_huge_workers = entry
+        .memory_transparent_huge_workers
+        .max(telemetry.memory_transparent_huge_workers);
+    entry.memory_regular_workers = entry
+        .memory_regular_workers
+        .max(telemetry.memory_regular_workers);
+    entry.memory_heap_workers = entry.memory_heap_workers.max(telemetry.memory_heap_workers);
+    entry.memory_explicit_large_bytes = entry
+        .memory_explicit_large_bytes
+        .max(telemetry.memory_explicit_large_bytes);
+    entry.memory_explicit_large_1g_bytes = entry
+        .memory_explicit_large_1g_bytes
+        .max(telemetry.memory_explicit_large_1g_bytes);
+    entry.memory_transparent_huge_bytes = entry
+        .memory_transparent_huge_bytes
+        .max(telemetry.memory_transparent_huge_bytes);
+    entry.memory_regular_bytes = entry
+        .memory_regular_bytes
+        .max(telemetry.memory_regular_bytes);
+    entry.memory_heap_bytes = entry.memory_heap_bytes.max(telemetry.memory_heap_bytes);
+    entry.memory_allocation_failures = entry
+        .memory_allocation_failures
+        .saturating_add(telemetry.memory_allocation_failures);
+    entry.peak_inflight_assignment_hashes = entry
+        .peak_inflight_assignment_hashes
+        .max(telemetry.peak_inflight_assignment_hashes);
+    entry.peak_inflight_assignment_micros = entry
+        .peak_inflight_assignment_micros
+        .max(telemetry.peak_inflight_assignment_micros);
+    entry.assignment_enqueue_timeouts = entry
+        .assignment_enqueue_timeouts
+        .saturating_add(telemetry.assignment_enqueue_timeouts);
+    entry.assignment_execution_timeouts = entry
+        .assignment_execution_timeouts
+        .saturating_add(telemetry.assignment_execution_timeouts);
+    entry.control_enqueue_timeouts = entry
+        .control_enqueue_timeouts
+        .saturating_add(telemetry.control_enqueue_timeouts);
+    entry.control_execution_timeouts = entry
+        .control_execution_timeouts
+        .saturating_add(telemetry.control_execution_timeouts);
+    entry.peak_assignment_timeout_strikes = entry
+        .peak_assignment_timeout_strikes
+        .max(telemetry.peak_assignment_timeout_strikes);
+    entry.assignment_enqueue_latency_samples = entry
+        .assignment_enqueue_latency_samples
+        .saturating_add(telemetry.assignment_enqueue_latency_samples);
+    entry.assignment_enqueue_latency_p95_micros = entry
+        .assignment_enqueue_latency_p95_micros
+        .max(telemetry.assignment_enqueue_latency_p95_micros);
+    entry.assignment_enqueue_latency_max_micros = entry
+        .assignment_enqueue_latency_max_micros
+        .max(telemetry.assignment_enqueue_latency_max_micros);
+    entry.assignment_execution_latency_samples = entry
+        .assignment_execution_latency_samples
+        .saturating_add(telemetry.assignment_execution_latency_samples);
+    entry.assignment_execution_latency_p95_micros = entry
+        .assignment_execution_latency_p95_micros
+        .max(telemetry.assignment_execution_latency_p95_micros);
+    entry.assignment_execution_latency_max_micros = entry
+        .assignment_execution_latency_max_micros
+        .max(telemetry.assignment_execution_latency_max_micros);
+    entry.control_enqueue_latency_samples = entry
+        .control_enqueue_latency_samples
+        .saturating_add(telemetry.control_enqueue_latency_samples);
+    entry.control_enqueue_latency_p95_micros = entry
+        .control_enqueue_latency_p95_micros
+        .max(telemetry.control_enqueue_latency_p95_micros);
+    entry.control_enqueue_latency_max_micros = entry
+        .control_enqueue_latency_max_micros
+        .max(telemetry.control_enqueue_latency_max_micros);
+    entry.control_execution_latency_samples = entry
+        .control_execution_latency_samples
+        .saturating_add(telemetry.control_execution_latency_samples);
+    entry.control_execution_latency_p95_micros = entry
+        .control_execution_latency_p95_micros
+        .max(telemetry.control_execution_latency_p95_micros);
+    entry.control_execution_latency_max_micros = entry
+        .control_execution_latency_max_micros
+        .max(telemetry.control_execution_latency_max_micros);
+}
+
+pub(super) fn backend_round_telemetry_delta(telemetry: BackendTelemetry) -> BackendRoundTelemetry {
+    BackendRoundTelemetry {
+        dropped_events: telemetry.dropped_events,
+        completed_assignments: telemetry.completed_assignments,
+        completed_assignment_hashes: telemetry.completed_assignment_hashes,
+        completed_assignment_micros: telemetry.completed_assignment_micros,
+        peak_active_lanes: telemetry.active_lanes,
+        peak_pending_work: telemetry.pending_work,
+        memory_explicit_large_workers: telemetry.memory_explicit_large_workers,
+        memory_explicit_large_1g_workers: telemetry.memory_explicit_large_1g_workers,
+        memory_transparent_huge_workers: telemetry.memory_transparent_huge_workers,
+        memory_regular_workers: telemetry.memory_regular_workers,
+        memory_heap_workers: telemetry.memory_heap_workers,
+        memory_explicit_large_bytes: telemetry.memory_explicit_large_bytes,
+        memory_explicit_large_1g_bytes: telemetry.memory_explicit_large_1g_bytes,
+        memory_transparent_huge_bytes: telemetry.memory_transparent_huge_bytes,
+        memory_regular_bytes: telemetry.memory_regular_bytes,
+        memory_heap_bytes: telemetry.memory_heap_bytes,
+        memory_allocation_failures: telemetry.memory_allocation_failures,
+        peak_inflight_assignment_hashes: telemetry.inflight_assignment_hashes,
+        peak_inflight_assignment_micros: telemetry.inflight_assignment_micros,
+        assignment_enqueue_timeouts: telemetry.assignment_enqueue_timeouts,
+        assignment_execution_timeouts: telemetry.assignment_execution_timeouts,
+        control_enqueue_timeouts: telemetry.control_enqueue_timeouts,
+        control_execution_timeouts: telemetry.control_execution_timeouts,
+        peak_assignment_timeout_strikes: telemetry.assignment_timeout_strikes,
+        assignment_enqueue_latency_samples: telemetry.assignment_enqueue_latency_samples,
+        assignment_enqueue_latency_p95_micros: telemetry.assignment_enqueue_latency_p95_micros,
+        assignment_enqueue_latency_max_micros: telemetry.assignment_enqueue_latency_max_micros,
+        assignment_execution_latency_samples: telemetry.assignment_execution_latency_samples,
+        assignment_execution_latency_p95_micros: telemetry.assignment_execution_latency_p95_micros,
+        assignment_execution_latency_max_micros: telemetry.assignment_execution_latency_max_micros,
+        control_enqueue_latency_samples: telemetry.control_enqueue_latency_samples,
+        control_enqueue_latency_p95_micros: telemetry.control_enqueue_latency_p95_micros,
+        control_enqueue_latency_max_micros: telemetry.control_enqueue_latency_max_micros,
+        control_execution_latency_samples: telemetry.control_execution_latency_samples,
+        control_execution_latency_p95_micros: telemetry.control_execution_latency_p95_micros,
+        control_execution_latency_max_micros: telemetry.control_execution_latency_max_micros,
+    }
+}
+
+fn cancel_backend_slots(
+    backends: &mut Vec<BackendSlot>,
+    mode: RuntimeMode,
+    backend_executor: &backend_executor::BackendExecutor,
+) -> Result<RuntimeBackendEventAction> {
+    backend_control::cancel_backend_slots(backends, mode, backend_executor)
+}
+
+fn quiesce_backend_slots(
+    backends: &mut Vec<BackendSlot>,
+    mode: RuntimeMode,
+    backend_executor: &backend_executor::BackendExecutor,
+) -> Result<RuntimeBackendEventAction> {
+    backend_control::quiesce_backend_slots(backends, mode, backend_executor)
+}
+
+fn remove_backend_by_id(
+    backends: &mut Vec<BackendSlot>,
+    backend_id: BackendInstanceId,
+    backend_executor: &backend_executor::BackendExecutor,
+) -> bool {
+    let Some(idx) = backends.iter().position(|slot| slot.id == backend_id) else {
+        return false;
+    };
+
+    let slot = backends.remove(idx);
+    crate::diagnostics::record(
+        seine_telemetry::DiagnosticCode::BackendQuarantined,
+        seine_telemetry::DiagnosticKind::General,
+        Some(slot.backend.name()),
+    );
+    backend_executor.quarantine_backend(slot.id, Arc::clone(&slot.backend));
+    backend_executor.remove_backend_worker(slot.id, &slot.backend);
+    backend_executor.prune(backends);
+    true
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum RuntimeMode {
+    Mining,
+    Bench,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RuntimeBackendEventAction {
+    None,
+    TopologyChanged,
+}
+
+fn enforce_deadline_policy(
+    backends: &mut Vec<BackendSlot>,
+    allow_best_effort_deadlines: bool,
+    mode: RuntimeMode,
+    backend_executor: &backend_executor::BackendExecutor,
+) -> Result<()> {
+    if !allow_best_effort_deadlines {
+        let mut best_effort = Vec::new();
+        let mut survivors = Vec::with_capacity(backends.len());
+        for slot in std::mem::take(backends) {
+            let capabilities = backend_capabilities(&slot);
+            if capabilities.deadline_support == DeadlineSupport::BestEffort {
+                best_effort.push(slot);
+            } else {
+                survivors.push(slot);
+            }
+        }
+        *backends = survivors;
+
+        for slot in best_effort {
+            let backend_name = slot.backend.name();
+            let backend_id = slot.id;
+            backend_executor.quarantine_backend(backend_id, Arc::clone(&slot.backend));
+            backend_executor.remove_backend_worker(backend_id, &slot.backend);
+            warn(
+                "BACKEND",
+                format!(
+                    "quarantined {backend_name}#{backend_id}: best-effort deadlines disabled (pass --allow-best-effort-deadlines to allow)"
+                ),
+            );
+        }
+
+        backend_executor.prune(backends);
+        if backends.is_empty() {
+            bail!(
+                "all active backends report best-effort deadlines; pass --allow-best-effort-deadlines to continue"
+            );
+        }
+    }
+
+    if backends.is_empty() {
+        return Ok(());
+    }
+
+    let action = quiesce_backend_slots(backends, mode, backend_executor)?;
+    if action == RuntimeBackendEventAction::TopologyChanged {
+        warn(
+            "BACKEND",
+            format!(
+                "deadline probe quarantined backend(s); remaining={}",
+                backend_names(backends)
+            ),
+        );
+    }
+    Ok(())
+}
+
+fn handle_runtime_backend_event(
+    event: BackendEvent,
+    epoch: u64,
+    backends: &mut Vec<BackendSlot>,
+    mode: RuntimeMode,
+    backend_executor: &backend_executor::BackendExecutor,
+) -> Result<(
+    RuntimeBackendEventAction,
+    Option<crate::backend::MiningSolution>,
+)> {
+    backend_control::handle_runtime_backend_event(event, epoch, backends, mode, backend_executor)
+}
+
+fn drain_runtime_backend_events(
+    backend_events: &Receiver<BackendEvent>,
+    epoch: u64,
+    backends: &mut Vec<BackendSlot>,
+    mode: RuntimeMode,
+    backend_executor: &backend_executor::BackendExecutor,
+) -> Result<(
+    RuntimeBackendEventAction,
+    Vec<crate::backend::MiningSolution>,
+)> {
+    backend_control::drain_runtime_backend_events(
+        backend_events,
+        epoch,
+        backends,
+        mode,
+        backend_executor,
+    )
+}
+
+/// Stable "name#instance_id" labels used for degraded-run tracking. Unlike
+/// `backend_display_names`, these never renumber when a backend is
+/// quarantined, so they stay consistent with quarantine log lines.
+fn backend_instance_labels(backends: &[BackendSlot]) -> Vec<String> {
+    backends
+        .iter()
+        .map(|slot| format!("{}#{}", slot.backend.name(), slot.id))
+        .collect()
+}
+
+fn backend_name_list(backends: &[BackendSlot]) -> Vec<String> {
+    let display_names = backend_display_names(backends);
+    backends
+        .iter()
+        .map(|slot| {
+            display_names
+                .get(&slot.id)
+                .cloned()
+                .unwrap_or_else(|| format!("{}#{}", slot.backend.name(), slot.id))
+        })
+        .collect()
+}
+
+fn auth_source_label(cfg: &Config) -> String {
+    if let Some(path) = &cfg.token_cookie_path {
+        if let Some(source) = cfg.daemon_discovery_source.as_deref() {
+            format!("cookie:{} ({})", path.display(), source)
+        } else {
+            format!("cookie:{}", path.display())
+        }
+    } else {
+        "token:static".to_string()
+    }
+}
+
+fn cpu_threads_summary(backends: &[BackendSlot]) -> String {
+    let cpu_threads: Vec<String> = backends
+        .iter()
+        .filter(|slot| slot.backend.name() == "cpu")
+        .map(|slot| format!("cpu#{}={}", slot.id, slot.backend.enabled_lanes()))
+        .collect();
+    if cpu_threads.is_empty() {
+        "none".to_string()
+    } else {
+        cpu_threads.join(",")
+    }
+}
+
+fn backend_names(backends: &[BackendSlot]) -> String {
+    backend_name_list(backends).join(",")
+}
+
+fn backend_descriptions(backends: &[BackendSlot]) -> String {
+    let display_names = backend_display_names(backends);
+    backends
+        .iter()
+        .map(|slot| {
+            let name = display_names
+                .get(&slot.id)
+                .cloned()
+                .unwrap_or_else(|| format!("{}#{}", slot.backend.name(), slot.id));
+            let lanes = slot.backend.enabled_lanes();
+            if slot.backend.name() == "cpu" {
+                let ram_gib =
+                    (lanes as f64 * CPU_LANE_MEMORY_BYTES as f64) / (1024.0 * 1024.0 * 1024.0);
+                format!("{} ({} lanes, ~{:.1} GiB RAM)", name, lanes, ram_gib)
+            } else if let Some(mem_bytes) = slot.backend.device_memory_bytes() {
+                let mem_gib = mem_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                format!("{} ({} lanes, {:.1} GiB VRAM)", name, lanes, mem_gib)
+            } else {
+                format!("{} ({} lanes)", name, lanes)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn backend_preemption_profiles(backends: &[BackendSlot]) -> String {
+    backends
+        .iter()
+        .map(|slot| {
+            format!(
+                "{}#{}={}",
+                slot.backend.name(),
+                slot.id,
+                slot.backend.preemption_granularity().describe()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn backend_chunk_profiles(backends: &[BackendSlot], default_iters_per_lane: u64) -> String {
+    backends
+        .iter()
+        .map(|slot| {
+            let allocation_hint = backend_iters_per_lane(slot, default_iters_per_lane);
+            let dispatch_hint = backend_dispatch_iters_per_lane(slot, default_iters_per_lane);
+            let capabilities = backend_capabilities(slot);
+            let inflight = capabilities.max_inflight_assignments.max(1);
+            let poll_hint = capabilities
+                .preferred_hash_poll_interval
+                .map(|d| format!("{}ms", d.as_millis()))
+                .unwrap_or_else(|| "none".to_string());
+            let deadline_support = capabilities.deadline_support.describe();
+            let assignment_semantics = capabilities.assignment_semantics.describe();
+            let execution_model = capabilities.execution_model.describe();
+            let worker_queue_depth =
+                backend_executor::effective_backend_worker_queue_capacity(capabilities);
+            let nonblocking_poll = match (
+                capabilities.nonblocking_poll_min,
+                capabilities.nonblocking_poll_max,
+            ) {
+                (Some(min_poll), Some(max_poll)) => {
+                    format!("{}us..{}us", min_poll.as_micros(), max_poll.as_micros())
+                }
+                _ => "default".to_string(),
+            };
+            format!(
+                "{}#{}=alloc:{} dispatch:{} iters/lane inflight={} worker_q={} poll_hint={} nb_poll={} deadline={} assign={} exec={} assign_timeout={}ms control_timeout={}ms assign_strikes={}",
+                slot.backend.name(),
+                slot.id,
+                allocation_hint,
+                dispatch_hint,
+                inflight,
+                worker_queue_depth,
+                poll_hint,
+                nonblocking_poll,
+                deadline_support,
+                assignment_semantics,
+                execution_model,
+                slot.runtime_policy.assignment_timeout.as_millis(),
+                slot.runtime_policy.control_timeout.as_millis(),
+                slot.runtime_policy.assignment_timeout_strikes,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn backend_timeout_profiles(backends: &[BackendSlot]) -> String {
+    backends
+        .iter()
+        .map(|slot| {
+            format!(
+                "{}#{}=assign:{}ms strikes:{} control:{}ms",
+                slot.backend.name(),
+                slot.id,
+                slot.runtime_policy.assignment_timeout.as_millis(),
+                slot.runtime_policy.assignment_timeout_strikes,
+                slot.runtime_policy.control_timeout.as_millis(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn effective_hash_poll_interval(backends: &[BackendSlot], configured: Duration) -> Duration {
+    let mut effective = configured.max(Duration::from_millis(1));
+    for slot in backends {
+        if let Some(hint) = backend_capabilities(slot).preferred_hash_poll_interval {
+            if hint > Duration::from_millis(0) {
+                effective = effective.min(hint);
+            }
+        }
+    }
+    effective
+}
+
+fn backend_capabilities_for_start(
+    backend: &dyn PowBackend,
+    backend_name: &'static str,
+    backend_id: BackendInstanceId,
+) -> Result<BackendCapabilities> {
+    let capabilities = normalize_backend_capabilities(
+        backend.capabilities(),
+        backend.supports_assignment_batching(),
+    );
+    if capabilities.execution_model == BackendExecutionModel::Nonblocking
+        && !backend.supports_true_nonblocking()
+    {
+        bail!(
+            "{backend_name}#{backend_id} reports nonblocking execution model without true nonblocking hook support"
+        );
+    }
+    Ok(capabilities)
+}
+
+fn backend_runtime_policy(
+    cfg: &Config,
+    backend_spec: &BackendSpec,
+    capabilities: BackendCapabilities,
+) -> BackendRuntimePolicy {
+    let assignment_timeout = backend_spec
+        .assign_timeout_override
+        .or(capabilities.preferred_assignment_timeout)
+        .unwrap_or(cfg.backend_assign_timeout)
+        .max(Duration::from_millis(1));
+    let control_timeout = backend_spec
+        .control_timeout_override
+        .or(capabilities.preferred_control_timeout)
+        .unwrap_or(cfg.backend_control_timeout)
+        .max(Duration::from_millis(1));
+    let assignment_timeout_strikes = backend_spec
+        .assign_timeout_strikes_override
+        .or(capabilities.preferred_assignment_timeout_strikes)
+        .unwrap_or(cfg.backend_assign_timeout_strikes)
+        .max(1);
+    BackendRuntimePolicy {
+        assignment_timeout,
+        assignment_timeout_strikes,
+        control_timeout,
+    }
+}
+
+fn backend_capabilities(slot: &BackendSlot) -> BackendCapabilities {
+    slot.capabilities
+}
+
+fn cpu_lane_count(backends: &[BackendSlot]) -> u64 {
+    backends
+        .iter()
+        .filter(|slot| slot.backend.name() == "cpu")
+        .map(|slot| slot.backend.enabled_lanes() as u64)
+        .sum()
+}
+
+fn backends_have_append_assignment_semantics(backends: &[BackendSlot]) -> bool {
+    backends.iter().any(|slot| {
+        backend_capabilities(slot).assignment_semantics
+            == crate::backend::AssignmentSemantics::Append
+    })
+}
+
+fn backend_names_by_id(backends: &[BackendSlot]) -> BTreeMap<BackendInstanceId, &'static str> {
+    backends
+        .iter()
+        .map(|slot| (slot.id, slot.backend.name()))
+        .collect()
+}
+
+/// Build a display-name map with per-type numbering (e.g. "cpu#1", "nvidia#1").
+fn backend_display_names(backends: &[BackendSlot]) -> BTreeMap<BackendInstanceId, String> {
+    let mut type_counters: BTreeMap<&str, u64> = BTreeMap::new();
+    backends
+        .iter()
+        .map(|slot| {
+            let name = slot.backend.name();
+            let counter = type_counters.entry(name).or_insert(0);
+            *counter += 1;
+            (slot.id, format!("{name}#{counter}"))
+        })
+        .collect()
+}
+
+fn solution_backend_label(backends: &[BackendSlot], solution: &MiningSolution) -> String {
+    let mut type_counter = 0u64;
+    for slot in backends {
+        if slot.backend.name() == solution.backend {
+            type_counter += 1;
+        }
+        if slot.id == solution.backend_id {
+            return format!("{}#{type_counter}", solution.backend);
+        }
+    }
+    format!("{}#{}", solution.backend, solution.backend_id)
+}
+
+fn pending_backend_slot_label(backends: &[BackendSlot], slot: &BackendSlot) -> String {
+    let display_id = backends
+        .iter()
+        .filter(|existing| existing.backend.name() == slot.backend.name())
+        .count() as u64
+        + 1;
+    format!("{}#{}", slot.backend.name(), display_id)
+}
+
+fn format_round_backend_telemetry(
+    backends: &[BackendSlot],
+    round_backend_telemetry: &BTreeMap<BackendInstanceId, BackendRoundTelemetry>,
+) -> Option<String> {
+    let backend_names = backend_names_by_id(backends);
+    let mut parts = Vec::new();
+    for (backend_id, telemetry) in round_backend_telemetry {
+        if telemetry.dropped_events == 0
+            && telemetry.completed_assignments == 0
+            && telemetry.peak_active_lanes == 0
+            && telemetry.peak_pending_work == 0
+            && telemetry.memory_explicit_large_workers == 0
+            && telemetry.memory_explicit_large_1g_workers == 0
+            && telemetry.memory_transparent_huge_workers == 0
+            && telemetry.memory_regular_workers == 0
+            && telemetry.memory_heap_workers == 0
+            && telemetry.memory_explicit_large_bytes == 0
+            && telemetry.memory_explicit_large_1g_bytes == 0
+            && telemetry.memory_transparent_huge_bytes == 0
+            && telemetry.memory_regular_bytes == 0
+            && telemetry.memory_heap_bytes == 0
+            && telemetry.memory_allocation_failures == 0
+            && telemetry.peak_inflight_assignment_hashes == 0
+            && telemetry.peak_inflight_assignment_micros == 0
+            && telemetry.assignment_enqueue_timeouts == 0
+            && telemetry.assignment_execution_timeouts == 0
+            && telemetry.control_enqueue_timeouts == 0
+            && telemetry.control_execution_timeouts == 0
+            && telemetry.peak_assignment_timeout_strikes == 0
+            && telemetry.assignment_enqueue_latency_samples == 0
+            && telemetry.assignment_enqueue_latency_p95_micros == 0
+            && telemetry.assignment_enqueue_latency_max_micros == 0
+            && telemetry.assignment_execution_latency_samples == 0
+            && telemetry.assignment_execution_latency_p95_micros == 0
+            && telemetry.assignment_execution_latency_max_micros == 0
+            && telemetry.control_enqueue_latency_samples == 0
+            && telemetry.control_enqueue_latency_p95_micros == 0
+            && telemetry.control_enqueue_latency_max_micros == 0
+            && telemetry.control_execution_latency_samples == 0
+            && telemetry.control_execution_latency_p95_micros == 0
+            && telemetry.control_execution_latency_max_micros == 0
+        {
+            continue;
+        }
+        let backend_name = backend_names.get(backend_id).copied().unwrap_or("unknown");
+        parts.push(format!(
+            "{backend_name}#{backend_id}:active_peak={} pending_peak={} memory_workers=large:{}/large1g:{}/thp:{}/regular:{}/heap:{} memory_mib=large:{:.1}/large1g:{:.1}/thp:{:.1}/regular:{:.1}/heap:{:.1} memory_alloc_failures={} inflight_hashes_peak={} inflight_secs_peak={:.3} drops={} assignments={} assignment_hashes={} assignment_secs={:.3} assign_timeout_enq={} assign_timeout_exec={} control_timeout_enq={} control_timeout_exec={} assign_timeout_strike_peak={} assign_enq_lat_samples={} assign_enq_lat_p95_us={} assign_enq_lat_max_us={} assign_exec_lat_samples={} assign_exec_lat_p95_us={} assign_exec_lat_max_us={} control_enq_lat_samples={} control_enq_lat_p95_us={} control_enq_lat_max_us={} control_exec_lat_samples={} control_exec_lat_p95_us={} control_exec_lat_max_us={}",
+            telemetry.peak_active_lanes,
+            telemetry.peak_pending_work,
+            telemetry.memory_explicit_large_workers,
+            telemetry.memory_explicit_large_1g_workers,
+            telemetry.memory_transparent_huge_workers,
+            telemetry.memory_regular_workers,
+            telemetry.memory_heap_workers,
+            telemetry.memory_explicit_large_bytes as f64 / (1024.0 * 1024.0),
+            telemetry.memory_explicit_large_1g_bytes as f64 / (1024.0 * 1024.0),
+            telemetry.memory_transparent_huge_bytes as f64 / (1024.0 * 1024.0),
+            telemetry.memory_regular_bytes as f64 / (1024.0 * 1024.0),
+            telemetry.memory_heap_bytes as f64 / (1024.0 * 1024.0),
+            telemetry.memory_allocation_failures,
+            telemetry.peak_inflight_assignment_hashes,
+            telemetry.peak_inflight_assignment_micros as f64 / 1_000_000.0,
+            telemetry.dropped_events,
+            telemetry.completed_assignments,
+            telemetry.completed_assignment_hashes,
+            telemetry.completed_assignment_micros as f64 / 1_000_000.0,
+            telemetry.assignment_enqueue_timeouts,
+            telemetry.assignment_execution_timeouts,
+            telemetry.control_enqueue_timeouts,
+            telemetry.control_execution_timeouts,
+            telemetry.peak_assignment_timeout_strikes,
+            telemetry.assignment_enqueue_latency_samples,
+            telemetry.assignment_enqueue_latency_p95_micros,
+            telemetry.assignment_enqueue_latency_max_micros,
+            telemetry.assignment_execution_latency_samples,
+            telemetry.assignment_execution_latency_p95_micros,
+            telemetry.assignment_execution_latency_max_micros,
+            telemetry.control_enqueue_latency_samples,
+            telemetry.control_enqueue_latency_p95_micros,
+            telemetry.control_enqueue_latency_max_micros,
+            telemetry.control_execution_latency_samples,
+            telemetry.control_execution_latency_p95_micros,
+            telemetry.control_execution_latency_max_micros,
+        ));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+fn total_lanes(backends: &[BackendSlot]) -> u64 {
+    backends.iter().map(|slot| slot.lanes).sum::<u64>().max(1)
+}
+
+fn next_work_id(next_id: &mut u64) -> u64 {
+    if *next_id == 0 || *next_id > WORK_ID_MAX {
+        *next_id = 1;
+    }
+    let id = *next_id;
+    *next_id = if id >= WORK_ID_MAX { 1 } else { id + 1 };
+    id
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::backend::{NonceChunk, WorkAssignment, WorkTemplate};
+    use anyhow::anyhow;
+    use blocknet_pow_spec::POW_HEADER_BASE_LEN;
+    use crossbeam_channel::Sender;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct MockState {
+        start_calls: AtomicUsize,
+        fail_start: AtomicBool,
+        fail_next_assign: AtomicBool,
+        panic_next_assign: AtomicBool,
+        assign_calls: AtomicUsize,
+        assign_batch_calls: AtomicUsize,
+        last_batch_len: AtomicUsize,
+        stop_calls: AtomicUsize,
+        last_chunk: Mutex<Option<NonceChunk>>,
+        last_pause_on_solution: Mutex<Option<bool>>,
+        chunks: Mutex<Vec<NonceChunk>>,
+    }
+
+    struct MockBackend {
+        start_gate: Option<(Sender<()>, Receiver<()>)>,
+        start_os_error: Option<i32>,
+        shutdown_on_start: Option<Arc<AtomicBool>>,
+        name: &'static str,
+        lanes: usize,
+        state: Arc<MockState>,
+        preferred_iters_per_lane: Option<u64>,
+        preferred_allocation_iters_per_lane: Option<u64>,
+        preferred_hash_poll_interval: Option<Duration>,
+        max_inflight_assignments: u32,
+        preferred_worker_queue_depth: Option<u32>,
+        supports_assignment_batching: bool,
+        assign_delay: Option<Duration>,
+        deadline_support: crate::backend::DeadlineSupport,
+        assignment_semantics: crate::backend::AssignmentSemantics,
+        execution_model: crate::backend::BackendExecutionModel,
+        supports_true_nonblocking: bool,
+        supports_blake2b: bool,
+    }
+
+    impl MockBackend {
+        fn new(name: &'static str, lanes: usize, state: Arc<MockState>) -> Self {
+            Self {
+                start_gate: None,
+                start_os_error: None,
+                shutdown_on_start: None,
+                name,
+                lanes,
+                state,
+                preferred_iters_per_lane: None,
+                preferred_allocation_iters_per_lane: None,
+                preferred_hash_poll_interval: None,
+                max_inflight_assignments: 1,
+                preferred_worker_queue_depth: None,
+                supports_assignment_batching: false,
+                assign_delay: None,
+                deadline_support: crate::backend::DeadlineSupport::Cooperative,
+                assignment_semantics: crate::backend::AssignmentSemantics::Replace,
+                execution_model: crate::backend::BackendExecutionModel::Blocking,
+                supports_true_nonblocking: false,
+                supports_blake2b: false,
+            }
+        }
+
+        fn with_blake2b(mut self) -> Self {
+            self.supports_blake2b = true;
+            self
+        }
+
+        fn with_preferred_iters_per_lane(mut self, preferred_iters_per_lane: u64) -> Self {
+            let preferred = preferred_iters_per_lane.max(1);
+            self.preferred_iters_per_lane = Some(preferred);
+            self.preferred_allocation_iters_per_lane = Some(preferred);
+            self
+        }
+
+        fn with_preferred_dispatch_iters_per_lane(mut self, preferred_iters_per_lane: u64) -> Self {
+            self.preferred_iters_per_lane = Some(preferred_iters_per_lane.max(1));
+            self
+        }
+
+        fn with_preferred_allocation_iters_per_lane(
+            mut self,
+            preferred_iters_per_lane: u64,
+        ) -> Self {
+            self.preferred_allocation_iters_per_lane = Some(preferred_iters_per_lane.max(1));
+            self
+        }
+
+        fn with_preferred_hash_poll_interval(mut self, interval: Duration) -> Self {
+            self.preferred_hash_poll_interval = Some(interval);
+            self
+        }
+
+        fn with_max_inflight_assignments(mut self, max_inflight_assignments: u32) -> Self {
+            self.max_inflight_assignments = max_inflight_assignments.max(1);
+            self.supports_assignment_batching = self.max_inflight_assignments > 1;
+            self
+        }
+
+        fn with_preferred_worker_queue_depth(mut self, preferred_worker_queue_depth: u32) -> Self {
+            self.preferred_worker_queue_depth = Some(preferred_worker_queue_depth.max(1));
+            self
+        }
+
+        fn with_assign_delay(mut self, assign_delay: Duration) -> Self {
+            self.assign_delay = Some(assign_delay);
+            self
+        }
+
+        fn with_deadline_support(
+            mut self,
+            deadline_support: crate::backend::DeadlineSupport,
+        ) -> Self {
+            self.deadline_support = deadline_support;
+            self
+        }
+
+        fn with_assignment_semantics(
+            mut self,
+            assignment_semantics: crate::backend::AssignmentSemantics,
+        ) -> Self {
+            self.assignment_semantics = assignment_semantics;
+            self
+        }
+
+        fn with_execution_model(
+            mut self,
+            execution_model: crate::backend::BackendExecutionModel,
+        ) -> Self {
+            self.execution_model = execution_model;
+            self
+        }
+
+        fn with_true_nonblocking_support(mut self, enabled: bool) -> Self {
+            self.supports_true_nonblocking = enabled;
+            self
+        }
+    }
+
+    impl PowBackend for MockBackend {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn supports_pow(&self, pow: crate::backend::PowAlgorithm) -> bool {
+            pow == crate::backend::PowAlgorithm::Argon2id || self.supports_blake2b
+        }
+
+        fn lanes(&self) -> usize {
+            self.lanes
+        }
+
+        fn set_instance_id(&self, _id: BackendInstanceId) {}
+
+        fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
+
+        fn start(&self) -> Result<()> {
+            self.state.start_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some((entered, release)) = &self.start_gate {
+                entered.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            if let Some(shutdown) = &self.shutdown_on_start {
+                shutdown.store(true, Ordering::Relaxed);
+            }
+            if let Some(code) = self.start_os_error {
+                return Err(std::io::Error::from_raw_os_error(code).into());
+            }
+            if self.state.fail_start.load(Ordering::Acquire) {
+                return Err(anyhow!("injected start failure"));
+            }
+            Ok(())
+        }
+
+        fn stop(&self) {
+            self.state.stop_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn assign_work(&self, work: WorkAssignment) -> Result<()> {
+            if let Some(delay) = self.assign_delay {
+                std::thread::sleep(delay);
+            }
+            self.state.assign_calls.fetch_add(1, Ordering::Relaxed);
+            if self.state.panic_next_assign.swap(false, Ordering::AcqRel) {
+                panic!("injected assign panic");
+            }
+            if self.state.fail_next_assign.swap(false, Ordering::AcqRel) {
+                return Err(anyhow!("injected assign failure"));
+            }
+            self.state
+                .chunks
+                .lock()
+                .expect("mock chunk history lock should not be poisoned")
+                .push(work.nonce_chunk);
+            *self
+                .state
+                .last_pause_on_solution
+                .lock()
+                .expect("mock pause_on_solution lock should not be poisoned") =
+                Some(work.template.pause_on_solution);
+            *self
+                .state
+                .last_chunk
+                .lock()
+                .expect("mock chunk lock should not be poisoned") = Some(work.nonce_chunk);
+            Ok(())
+        }
+
+        fn assign_work_batch(&self, work: &[WorkAssignment]) -> Result<()> {
+            self.state
+                .assign_batch_calls
+                .fetch_add(1, Ordering::Relaxed);
+            self.state
+                .last_batch_len
+                .store(work.len(), Ordering::Relaxed);
+            for assignment in work {
+                self.assign_work(assignment.clone())?;
+            }
+            Ok(())
+        }
+
+        fn cancel_work(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn fence(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn supports_assignment_batching(&self) -> bool {
+            self.supports_assignment_batching
+        }
+
+        fn supports_true_nonblocking(&self) -> bool {
+            self.supports_true_nonblocking
+        }
+
+        fn capabilities(&self) -> crate::backend::BackendCapabilities {
+            crate::backend::BackendCapabilities {
+                preferred_iters_per_lane: self.preferred_iters_per_lane,
+                preferred_allocation_iters_per_lane: self.preferred_allocation_iters_per_lane,
+                preferred_hash_poll_interval: self.preferred_hash_poll_interval,
+                preferred_assignment_timeout: None,
+                preferred_control_timeout: None,
+                preferred_assignment_timeout_strikes: None,
+                preferred_worker_queue_depth: self.preferred_worker_queue_depth,
+                max_inflight_assignments: self.max_inflight_assignments.max(1),
+                deadline_support: self.deadline_support,
+                assignment_semantics: self.assignment_semantics,
+                execution_model: self.execution_model,
+                nonblocking_poll_min: None,
+                nonblocking_poll_max: None,
+            }
+        }
+    }
+
+    fn slot(id: BackendInstanceId, lanes: u64, backend: Arc<dyn PowBackend>) -> BackendSlot {
+        let mut capabilities = normalize_backend_capabilities(
+            backend.capabilities(),
+            backend.supports_assignment_batching(),
+        );
+        if capabilities.execution_model == BackendExecutionModel::Nonblocking
+            && !backend.supports_true_nonblocking()
+        {
+            capabilities.execution_model = BackendExecutionModel::Blocking;
+        }
+        BackendSlot {
+            id,
+            backend,
+            lanes,
+            runtime_policy: BackendRuntimePolicy::default(),
+            capabilities,
+        }
+    }
+
+    #[test]
+    fn provisional_faraday_pow_needs_the_opt_in_only_for_direct_mining() {
+        use std::ffi::OsStr;
+        let on = Some(OsStr::new("1"));
+        let off = Some(OsStr::new("0"));
+        assert!(provisional_pow_allowed_in(MiningMode::Pool, None));
+        assert!(provisional_pow_allowed_in(MiningMode::Pool, on));
+        assert!(!provisional_pow_allowed_in(MiningMode::Pool, off));
+        assert!(!provisional_pow_allowed_in(MiningMode::Daemon, None));
+        assert!(provisional_pow_allowed_in(MiningMode::Daemon, on));
+        assert!(!provisional_pow_allowed_in(MiningMode::Daemon, off));
+        if std::env::var_os(PROVISIONAL_FARADAY_POW_ENV).is_none()
+            && !blocknet_pow_spec::BLAKE2B_POW_PARAMS_FINAL
+        {
+            assert!(!mines_blake2b_in(MiningMode::Daemon));
+            assert!(mines_blake2b_in(MiningMode::Pool));
+        }
+    }
+
+    #[test]
+    fn gpu_backends_start_in_background_and_pending_gpus_track_by_kind() {
+        assert!(starts_in_background(BackendKind::Nvidia));
+        assert!(starts_in_background(BackendKind::Amd));
+        assert!(!starts_in_background(BackendKind::Cpu));
+        assert!(!starts_in_background(BackendKind::Metal));
+        let mut pending = vec!["amd", "nvidia", "amd"];
+        assert_eq!(
+            mining::pending_gpu_counts(&pending),
+            vec![("amd", 2), ("nvidia", 1)]
+        );
+        remove_pending_gpu(&mut pending, "amd");
+        remove_pending_gpu(&mut pending, "metal");
+        assert_eq!(pending, vec!["nvidia", "amd"]);
+    }
+
+    #[test]
+    fn cancelled_amd_start_holds_the_next_start_until_it_has_stopped() {
+        let old_state = Arc::new(MockState::default());
+        let new_state = Arc::new(MockState::default());
+        let (entered_tx, entered_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let mut old = MockBackend::new("amd", 1, old_state.clone());
+        old.start_gate = Some((entered_tx, release_rx));
+        let old: Arc<dyn PowBackend> = Arc::new(old);
+        let new: Arc<dyn PowBackend> = Arc::new(MockBackend::new("amd", 1, new_state.clone()));
+
+        let old_shutdown = Arc::new(AtomicBool::new(false));
+        let cancelled = {
+            let shutdown = old_shutdown.clone();
+            std::thread::spawn(move || start_backend_interruptibly(&old, 1, &shutdown))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first start entered");
+        old_shutdown.store(true, Ordering::Relaxed);
+        assert!(cancelled
+            .join()
+            .unwrap()
+            .expect_err("start cancelled")
+            .is::<StartupCancelled>());
+
+        let next = std::thread::spawn(move || {
+            start_backend_interruptibly(&new, 2, &AtomicBool::new(false))
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            new_state.start_calls.load(Ordering::Relaxed),
+            0,
+            "the next start must wait for the cancelled one"
+        );
+        release_tx.send(()).unwrap();
+        next.join().unwrap().expect("next start");
+        assert_eq!(new_state.start_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            old_state.stop_calls.load(Ordering::Relaxed),
+            1,
+            "the cancelled start must have stopped before the next one ran"
+        );
+    }
+
+    #[test]
+    fn a_pending_gpu_carries_the_run_when_cpu_failed_to_start() {
+        let (tx, rx) = bounded(1);
+        let state = Arc::new(MockState::default());
+        tx.send(slot(1, 1, Arc::new(MockBackend::new("amd", 1, state))))
+            .unwrap();
+        let joined = wait_for_gpu_after_failed_start(&rx, &AtomicBool::new(false))
+            .expect("the pending GPU joins");
+        assert_eq!(joined.backend.name(), "amd");
+
+        drop(tx);
+        let error = wait_for_gpu_after_failed_start(&rx, &AtomicBool::new(false))
+            .err()
+            .expect("no GPU can start");
+        assert!(format!("{error:#}").contains("all GPU backends failed to start"));
+    }
+
+    #[test]
+    fn pending_backend_slot_label_uses_per_type_numbering() {
+        let existing_nvidia = slot(
+            2,
+            1,
+            Arc::new(MockBackend::new(
+                "nvidia",
+                1,
+                Arc::new(MockState::default()),
+            )),
+        );
+        let pending_nvidia = slot(
+            3,
+            1,
+            Arc::new(MockBackend::new(
+                "nvidia",
+                1,
+                Arc::new(MockState::default()),
+            )),
+        );
+
+        assert_eq!(
+            pending_backend_slot_label(
+                &[slot(
+                    1,
+                    1,
+                    Arc::new(MockBackend::new("cpu", 1, Arc::new(MockState::default()))),
+                )],
+                &pending_nvidia
+            ),
+            "nvidia#1"
+        );
+        assert_eq!(
+            pending_backend_slot_label(
+                &[
+                    slot(
+                        1,
+                        1,
+                        Arc::new(MockBackend::new("cpu", 1, Arc::new(MockState::default()))),
+                    ),
+                    existing_nvidia,
+                ],
+                &pending_nvidia
+            ),
+            "nvidia#2"
+        );
+    }
+
+    fn wait_for_stop_call(state: &MockState, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if state.stop_calls.load(Ordering::Relaxed) > 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_stop_counter(counter: &AtomicUsize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if counter.load(Ordering::Relaxed) > 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn shortname_is_pinned_for_pool_and_daemon_runs() {
+        use crate::shortname::tests::{mock_resolver, ADDRESS};
+        for mode in [MiningMode::Pool, MiningMode::Daemon] {
+            let mut cfg = test_config();
+            cfg.mode = mode;
+            cfg.mining_address = Some("$Alice".into());
+            let (resolver, task) = mock_resolver(ADDRESS);
+            let resolved = resolve_mining_config(&cfg, &resolver).unwrap();
+            task.join().unwrap();
+            assert_eq!(resolved.mining_address.as_deref(), Some(ADDRESS));
+            assert_eq!(cfg.mining_address.as_deref(), Some("$Alice"));
+            // Reconnects keep the address even when the resolver is down.
+            assert_eq!(
+                resolve_mining_config(&resolved, &resolver)
+                    .unwrap()
+                    .mining_address,
+                resolved.mining_address
+            );
+        }
+    }
+
+    #[test]
+    fn shortname_to_an_exchange_address_needs_a_memo() {
+        use crate::shortname::tests::mock_resolver;
+        const EXCHANGE: &str = "ZJZqGfDPCVg78CRH5Z33CtHafg911Dp5Bauf1Dnxg5jgXx7Whqsvqka96FCV8W6QZXNDKzJefkFU6bwDEGBewqPrTWjij";
+        for (memo, ok) in [(None, false), (Some("ID001"), true)] {
+            let mut cfg = test_config();
+            cfg.mode = MiningMode::Pool;
+            cfg.mining_address = Some("solo:$Alice".into());
+            cfg.payout_memo = memo.map(str::to_string);
+            let (resolver, task) = mock_resolver(EXCHANGE);
+            let resolved = resolve_mining_config(&cfg, &resolver);
+            task.join().unwrap();
+            assert_eq!(resolved.is_ok(), ok);
+        }
+    }
+
+    #[test]
+    fn solo_prefix_is_kept_for_pools_and_dropped_for_daemons() {
+        use crate::shortname::tests::{mock_resolver, ADDRESS};
+        for (mode, expected) in [
+            (MiningMode::Pool, format!("solo:{ADDRESS}")),
+            (MiningMode::Daemon, ADDRESS.to_string()),
+        ] {
+            let mut cfg = test_config();
+            cfg.mode = mode;
+            cfg.mining_address = Some("Solo:$Alice".into());
+            let (resolver, task) = mock_resolver(ADDRESS);
+            let resolved = resolve_mining_config(&cfg, &resolver).unwrap();
+            task.join().unwrap();
+            assert_eq!(resolved.mining_address.as_deref(), Some(expected.as_str()));
+            assert_eq!(cfg.mining_address.as_deref(), Some("Solo:$Alice"));
+        }
+    }
+
+    pub(crate) fn test_config() -> Config {
+        Config {
+            hardware_telemetry: None,
+            mode: MiningMode::Daemon,
+            pool_url: None,
+            pool_worker: None,
+            pool_proxy: None,
+            proxy_listen: None,
+            dev_fee_pool_worker: "seine-devfee-test".to_string(),
+            api_url: "http://127.0.0.1:8332".to_string(),
+            token: Some("test-token".to_string()),
+            token_cookie_path: None,
+            daemon_discovery_source: None,
+            daemon_manager_config_path: None,
+            daemon_resolved_data_dir: None,
+            daemon_expected_cookie_path: None,
+            wallet_password: None,
+            wallet_password_file: None,
+            mining_address: None,
+            payout_memo: None,
+            backend_specs: vec![BackendSpec {
+                kind: BackendKind::Cpu,
+                device_index: None,
+                cpu_threads: Some(1),
+                cpu_affinity: Some(crate::config::CpuAffinityMode::Off),
+                assign_timeout_override: None,
+                control_timeout_override: None,
+                assign_timeout_strikes_override: None,
+            }],
+            threads: 1,
+            cpu_threads_explicit: None,
+            auto_update: false,
+            cpu_side_cache_blocks: 0,
+            cpu_skip_store_permille: 0,
+            cpu_auto_threads_cap: 1,
+            cpu_manual_memory_check: false,
+            cpu_autotune_worker_slots: None,
+            cpu_memory_reserve_percent: None,
+            cpu_affinity: crate::config::CpuAffinityMode::Off,
+            cpu_page_mode: crate::config::CpuPageMode::Auto,
+            cpu_profile: crate::config::CpuPerformanceProfile::Balanced,
+            refresh_interval: Duration::from_secs(20),
+            request_timeout: Duration::from_secs(10),
+            events_stream_timeout: Duration::from_secs(10),
+            events_idle_timeout: Duration::from_secs(90),
+            stats_interval: Duration::from_secs(10),
+            backend_event_capacity: 1024,
+            hash_poll_interval: Duration::from_millis(200),
+            cpu_hash_batch_size: 64,
+            cpu_control_check_interval_hashes: 1,
+            cpu_hash_flush_interval: Duration::from_millis(50),
+            cpu_event_dispatch_capacity: 256,
+            cpu_autotune_threads: false,
+            cpu_autotune_min_threads: 1,
+            cpu_autotune_max_threads: None,
+            cpu_autotune_secs: 2,
+            cpu_autotune_config_path: std::path::PathBuf::from("./data/seine.cpu-autotune.json"),
+            nvidia_autotune_secs: 2,
+            nvidia_autotune_samples: 2,
+            nvidia_autotune_config_path: std::path::PathBuf::from(
+                "./data/seine.nvidia-autotune.json",
+            ),
+            nvidia_max_rregcount: None,
+            nvidia_max_lanes: None,
+            nvidia_dispatch_iters_per_lane: None,
+            nvidia_allocation_iters_per_lane: None,
+            nvidia_hashes_per_launch_per_lane: 2,
+            nvidia_hashes_per_launch_per_lane_was_set: false,
+            nvidia_fused_target_check: false,
+            nvidia_adaptive_launch_depth: true,
+            nvidia_enforce_template_stop: false,
+            amd_devices: Vec::new(),
+            amd_max_lanes: None,
+            metal_max_lanes: None,
+            metal_hashes_per_launch_per_lane: 2,
+            metal_blake2b_only: false,
+            backend_assign_timeout: Duration::from_millis(1_000),
+            backend_assign_timeout_strikes: 3,
+            backend_control_timeout: Duration::from_millis(60_000),
+            allow_best_effort_deadlines: false,
+            prefetch_wait: Duration::from_millis(250),
+            tip_listener_join_wait: Duration::from_millis(250),
+            submit_join_wait: Duration::from_millis(2_000),
+            strict_round_accounting: false,
+            start_nonce: 0,
+            nonce_iters_per_lane: 1 << 20,
+            work_allocation: WorkAllocation::Adaptive,
+            sub_round_rebalance_interval: None,
+            sse_enabled: true,
+            update_check_enabled: false,
+            refresh_on_same_height: false,
+            ui_mode: crate::config::UiMode::Plain,
+            data_dir: std::path::PathBuf::from("./data"),
+            user_config_path: std::path::PathBuf::from("./data/seine.config.json"),
+            user_config_created: false,
+            api_server_enabled: false,
+            service_mode: false,
+            api_bind: "127.0.0.1:9977".to_string(),
+            api_allow_unsafe_bind: false,
+            api_cors: String::new(),
+            api_token: None,
+            api_cookie_path: std::path::PathBuf::from("./data/control-api.cookie"),
+            allow_wallet_prompt: true,
+            bench: false,
+            bench_kind: crate::config::BenchKind::Backend,
+            bench_pow: crate::config::BenchPow::Argon2id,
+            bench_cpu_kernel: None,
+            bench_secs: 20,
+            bench_rounds: 3,
+            bench_warmup_rounds: 0,
+            bench_output: None,
+            bench_baseline: None,
+            bench_fail_below_pct: None,
+            bench_baseline_policy: crate::config::BenchBaselinePolicy::Strict,
+            nvidia_hint: None,
+            startup_notices: Vec::new(),
+            startup_details: Vec::new(),
+        }
+    }
+
+    fn autotune_measurements(values: &[(usize, f64)]) -> BTreeMap<usize, CpuAutotuneMeasurement> {
+        values
+            .iter()
+            .map(|(threads, hps)| {
+                (
+                    *threads,
+                    CpuAutotuneMeasurement {
+                        hashes: 0,
+                        elapsed_secs: 0.0,
+                        wall_secs: 0.0,
+                        hps: *hps,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cpu_autotune_fingerprint_includes_runtime_and_build_identity() {
+        let fingerprint = cpu_autotune_host_fingerprint();
+        assert!(!fingerprint.os.is_empty());
+        assert!(!fingerprint.runtime_environment.is_empty());
+        assert!(fingerprint.build_fingerprint.contains("source="));
+        assert!(fingerprint.build_fingerprint.contains("rustc="));
+    }
+
+    #[test]
+    fn cpu_autotune_cache_is_separated_by_page_mode() {
+        let mut cfg = test_config();
+        let record = CpuAutotuneRecord {
+            schema_version: CPU_AUTOTUNE_RECORD_SCHEMA_VERSION,
+            profile: cpu_profile_label(cfg.cpu_profile).to_string(),
+            affinity: cpu_affinity_label(cfg.cpu_affinity).to_string(),
+            page_mode: cfg.cpu_page_mode.as_str().to_string(),
+            cpu_instances: 1,
+            min_threads: 1,
+            max_threads: 4,
+            selected_threads: 2,
+            measured_hps: 1.0,
+            autotune_secs: 6,
+            host_fingerprint: CpuAutotuneHostFingerprint::default(),
+            timestamp_unix_secs: 0,
+            measurements: BTreeMap::new(),
+            memory_limited: false,
+            mining_measurement: false,
+            search: None,
+        };
+
+        assert!(cpu_autotune_record_matches_config(
+            &record, &cfg, 1, 1, 4, 6
+        ));
+        cfg.cpu_page_mode = CpuPageMode::Regular;
+        assert!(!cpu_autotune_record_matches_config(
+            &record, &cfg, 1, 1, 4, 6
+        ));
+    }
+
+    #[test]
+    fn round_backend_telemetry_line_reports_1g_backing_separately() {
+        let mut telemetry_map = BTreeMap::new();
+        telemetry_map.insert(
+            7u64,
+            BackendRoundTelemetry {
+                memory_explicit_large_1g_workers: 9,
+                memory_explicit_large_1g_bytes: 9 * 2 * 1024 * 1024 * 1024,
+                ..BackendRoundTelemetry::default()
+            },
+        );
+
+        let line =
+            format_round_backend_telemetry(&[], &telemetry_map).expect("telemetry line expected");
+        assert!(line.contains("memory_workers=large:0/large1g:9/thp:0/regular:0/heap:0"));
+        assert!(line.contains("memory_mib=large:0.0/large1g:18432.0/thp:0.0/regular:0.0/heap:0.0"));
+    }
+
+    #[test]
+    fn autotune_refinement_candidates_focus_peak_window_for_throughput() {
+        let measurements = autotune_measurements(&[(9, 3.0), (10, 3.2)]);
+        let candidates = cpu_autotune_refinement_candidates(1, 20, 10, false, &measurements);
+        assert_eq!(candidates, vec![8, 11, 12]);
+    }
+
+    #[test]
+    fn autotune_refinement_candidates_include_low_anchor_for_non_throughput() {
+        let measurements = autotune_measurements(&[(9, 3.0), (10, 3.2)]);
+        let candidates = cpu_autotune_refinement_candidates(1, 20, 10, true, &measurements);
+        assert_eq!(candidates, vec![1, 8, 11, 12]);
+    }
+
+    #[test]
+    fn autotune_next_sample_chunk_secs_shortens_tail_chunk() {
+        assert_eq!(cpu_autotune_next_sample_chunk_secs(6, 0, 0, 0.0), 6);
+        assert_eq!(cpu_autotune_next_sample_chunk_secs(6, 6, 15, 6.0), 2);
+        assert_eq!(cpu_autotune_next_sample_chunk_secs(6, 29, 19, 8.0), 1);
+    }
+
+    #[test]
+    fn autotune_confirmation_window_is_longer_and_bounded() {
+        assert_eq!(cpu_autotune_confirmation_window_secs(1), 6);
+        assert_eq!(cpu_autotune_confirmation_window_secs(6), 12);
+        assert_eq!(cpu_autotune_confirmation_window_secs(20), 30);
+        assert_eq!(cpu_autotune_confirmation_window_secs(30), 30);
+    }
+
+    #[test]
+    fn autotune_balanced_confirmation_runs_peak_first() {
+        let measurements = autotune_measurements(&[(13, 27.3), (14, 27.45)]);
+        let selection = CpuAutotuneSelection {
+            selected_threads: 13,
+            selected_hps: 27.3,
+            peak_threads: 14,
+            peak_hps: 27.45,
+            peak_floor_frac: CPU_AUTOTUNE_BALANCED_PEAK_FLOOR_FRAC,
+        };
+        assert_eq!(
+            cpu_autotune_confirmation_threads(
+                CpuPerformanceProfile::Balanced,
+                selection,
+                &measurements
+            ),
+            vec![14, 13]
+        );
+        assert_eq!(
+            cpu_autotune_confirmation_threads(
+                CpuPerformanceProfile::Throughput,
+                selection,
+                &measurements
+            ),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn autotune_balanced_confirmation_catches_close_runner_up_after_peak_swap() {
+        let measurements = autotune_measurements(&[(12, 27.9), (13, 29.1), (14, 28.83)]);
+        let selection =
+            select_cpu_autotune_candidate(CpuPerformanceProfile::Balanced, &measurements)
+                .expect("selection should exist");
+        assert_eq!(selection.selected_threads, 13);
+        assert_eq!(selection.peak_threads, 13);
+        assert_eq!(
+            cpu_autotune_confirmation_threads(
+                CpuPerformanceProfile::Balanced,
+                selection,
+                &measurements
+            ),
+            vec![14, 13]
+        );
+    }
+
+    #[test]
+    fn autotune_balanced_skips_confirmation_for_clear_peak() {
+        let measurements = autotune_measurements(&[(12, 26.0), (13, 27.0), (14, 29.0)]);
+        let selection =
+            select_cpu_autotune_candidate(CpuPerformanceProfile::Balanced, &measurements)
+                .expect("selection should exist");
+        assert_eq!(
+            cpu_autotune_confirmation_threads(
+                CpuPerformanceProfile::Balanced,
+                selection,
+                &measurements
+            ),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn autotune_confirmation_scores_hashing_time_without_lifecycle_bias() {
+        let combined = merge_cpu_autotune_measurements(
+            CpuAutotuneMeasurement {
+                hashes: 100,
+                elapsed_secs: 4.0,
+                wall_secs: 8.0,
+                hps: 25.0,
+            },
+            CpuAutotuneMeasurement {
+                hashes: 300,
+                elapsed_secs: 10.0,
+                wall_secs: 18.0,
+                hps: 30.0,
+            },
+        );
+        assert_eq!(combined.hashes, 400);
+        assert_eq!(combined.elapsed_secs, 14.0);
+        assert_eq!(combined.wall_secs, 26.0);
+        assert!((combined.hps - (400.0 / 14.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn autotune_memory_limit_error_detection_matches_common_messages() {
+        assert!(cpu_autotune_is_memory_limit_error(&anyhow!(
+            "thread spawn failed: Cannot allocate memory"
+        )));
+        assert!(!cpu_autotune_is_memory_limit_error(&anyhow!(
+            "rpc request timeout"
+        )));
+    }
+
+    #[test]
+    fn autotune_selection_throughput_prefers_peak_and_lower_tie_threads() {
+        let selection = select_cpu_autotune_candidate(
+            CpuPerformanceProfile::Throughput,
+            &autotune_measurements(&[(3, 3.0), (4, 3.0), (5, 2.9)]),
+        )
+        .expect("selection should exist");
+
+        assert_eq!(selection.peak_threads, 3);
+        assert_eq!(selection.selected_threads, 3);
+        assert_eq!(selection.peak_floor_frac, 1.0);
+    }
+
+    #[test]
+    fn autotune_selection_balanced_keeps_peak_even_when_lower_count_is_close() {
+        let selection = select_cpu_autotune_candidate(
+            CpuPerformanceProfile::Balanced,
+            &autotune_measurements(&[(3, 3.0), (4, 3.28), (22, 3.3)]),
+        )
+        .expect("selection should exist");
+
+        assert_eq!(selection.peak_threads, 22);
+        assert_eq!(selection.selected_threads, 22);
+        assert!((selection.peak_floor_frac - CPU_AUTOTUNE_BALANCED_PEAK_FLOOR_FRAC).abs() < 1e-9);
+    }
+
+    #[test]
+    fn autotune_selection_balanced_uses_fewer_workers_only_for_equal_peak() {
+        let selection = select_cpu_autotune_candidate(
+            CpuPerformanceProfile::Balanced,
+            &autotune_measurements(&[(3, 3.0), (4, 3.0), (5, 2.9)]),
+        )
+        .expect("selection should exist");
+
+        assert_eq!(selection.selected_threads, 3);
+        assert_eq!(selection.selected_hps, 3.0);
+    }
+
+    #[test]
+    fn autotune_selection_efficiency_uses_stronger_bias_floor() {
+        let selection = select_cpu_autotune_candidate(
+            CpuPerformanceProfile::Efficiency,
+            &autotune_measurements(&[(2, 2.1), (3, 2.3), (10, 3.0)]),
+        )
+        .expect("selection should exist");
+
+        // 75% of peak (3.0) is 2.25, so 3 threads is the first candidate that qualifies.
+        assert_eq!(selection.peak_threads, 10);
+        assert_eq!(selection.selected_threads, 3);
+        assert!((selection.peak_floor_frac - CPU_AUTOTUNE_EFFICIENCY_PEAK_FLOOR_FRAC).abs() < 1e-9);
+    }
+
+    #[test]
+    fn next_work_id_wraps_within_valid_range() {
+        let mut id = WORK_ID_MAX;
+        assert_eq!(next_work_id(&mut id), WORK_ID_MAX);
+        assert_eq!(next_work_id(&mut id), 1);
+    }
+
+    #[test]
+    fn total_lanes_never_zero() {
+        assert_eq!(total_lanes(&[]), 1);
+    }
+
+    #[test]
+    fn header_base_len_matches_pow_spec() {
+        assert_eq!(POW_HEADER_BASE_LEN, 92);
+    }
+
+    #[test]
+    fn backend_capabilities_for_start_rejects_inconsistent_nonblocking_contract() {
+        let backend: Arc<dyn PowBackend> = Arc::new(
+            MockBackend::new("mock", 1, Arc::new(MockState::default()))
+                .with_execution_model(crate::backend::BackendExecutionModel::Nonblocking)
+                .with_true_nonblocking_support(false),
+        );
+
+        let result = backend_capabilities_for_start(backend.as_ref(), "mock", 77);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn backend_capabilities_downgrades_nonblocking_without_runtime_support() {
+        let backend: Arc<dyn PowBackend> = Arc::new(
+            MockBackend::new("mock", 1, Arc::new(MockState::default()))
+                .with_execution_model(crate::backend::BackendExecutionModel::Nonblocking)
+                .with_true_nonblocking_support(false),
+        );
+        let slot = slot(88, 1, backend);
+
+        let capabilities = backend_capabilities(&slot);
+        assert_eq!(
+            capabilities.execution_model,
+            crate::backend::BackendExecutionModel::Blocking
+        );
+    }
+
+    #[test]
+    fn backend_capabilities_preserves_nonblocking_when_runtime_supports_it() {
+        let backend: Arc<dyn PowBackend> = Arc::new(
+            MockBackend::new("mock", 1, Arc::new(MockState::default()))
+                .with_execution_model(crate::backend::BackendExecutionModel::Nonblocking)
+                .with_true_nonblocking_support(true),
+        );
+        let slot = slot(89, 1, backend);
+
+        let capabilities = backend_capabilities(&slot);
+        assert_eq!(
+            capabilities.execution_model,
+            crate::backend::BackendExecutionModel::Nonblocking
+        );
+    }
+
+    #[test]
+    fn remove_backend_by_id_only_removes_target_instance() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let first_state = Arc::new(MockState::default());
+        let second_state = Arc::new(MockState::default());
+
+        let mut backends = vec![
+            slot(
+                11,
+                1,
+                Arc::new(MockBackend::new("nvidia", 1, Arc::clone(&first_state))),
+            ),
+            slot(
+                22,
+                1,
+                Arc::new(MockBackend::new("nvidia", 1, Arc::clone(&second_state))),
+            ),
+        ];
+        assert!(remove_backend_by_id(&mut backends, 22, &backend_executor));
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].id, 11);
+        assert_eq!(first_state.stop_calls.load(Ordering::Relaxed), 0);
+        assert!(
+            wait_for_stop_call(&second_state, Duration::from_millis(250)),
+            "removed backend should be stopped asynchronously"
+        );
+    }
+
+    #[test]
+    fn blake2b_nonce_counts_ignore_argon2_sized_allocation_hints() {
+        let state = Arc::new(MockState::default());
+        let backends = vec![slot(
+            1,
+            2,
+            Arc::new(
+                MockBackend::new("nvidia", 2, Arc::clone(&state))
+                    .with_preferred_allocation_iters_per_lane(4),
+            ),
+        )];
+        let argon2 = work_allocator::compute_backend_nonce_counts(
+            &backends,
+            10,
+            None,
+            crate::backend::PowAlgorithm::Argon2id,
+        );
+        let blake2b = work_allocator::compute_backend_nonce_counts(
+            &backends,
+            10,
+            None,
+            crate::backend::PowAlgorithm::Blake2b512,
+        );
+        assert_eq!(argon2, vec![8]);
+        assert_eq!(blake2b, vec![20]);
+    }
+
+    #[test]
+    fn blake2b_work_skips_backends_without_support() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let supported = Arc::new(MockState::default());
+        let unsupported = Arc::new(MockState::default());
+        let options = |pow| DistributeWorkOptions {
+            epoch: 1,
+            work_id: 1,
+            header_base: Arc::from(vec![7u8; 156]),
+            pow,
+            target: [0xFF; 32],
+            dynamic_share_target: None,
+            pause_on_solution: false,
+            reservation: NonceReservation {
+                start_nonce: 0,
+                max_iters_per_lane: 10,
+                reserved_span: 20,
+            },
+            stop_at: Instant::now() + Duration::from_secs(1),
+            backend_weights: None,
+            strict_reservation: false,
+        };
+        let mut backends = vec![
+            slot(
+                1,
+                1,
+                Arc::new(MockBackend::new("nvidia", 1, Arc::clone(&supported)).with_blake2b()),
+            ),
+            slot(
+                2,
+                1,
+                Arc::new(MockBackend::new("amd", 1, Arc::clone(&unsupported))),
+            ),
+        ];
+        distribute_work(
+            &mut backends,
+            options(crate::backend::PowAlgorithm::Blake2b512),
+            &backend_executor,
+        )
+        .expect("the BLAKE2b backend keeps mining");
+        // The other backend waits for work it can hash instead of being quarantined.
+        assert_eq!(backends.len(), 2);
+        assert_eq!(supported.assign_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(unsupported.assign_calls.load(Ordering::Relaxed), 0);
+        assert!(
+            !wait_for_stop_call(&unsupported, Duration::from_millis(100)),
+            "the idle backend must keep running"
+        );
+        distribute_work(
+            &mut backends,
+            options(crate::backend::PowAlgorithm::Argon2id),
+            &backend_executor,
+        )
+        .expect("both backends hash Argon2");
+        assert_eq!(unsupported.assign_calls.load(Ordering::Relaxed), 1);
+
+        let only_unsupported = Arc::new(MockState::default());
+        let mut backends = vec![slot(
+            3,
+            1,
+            Arc::new(MockBackend::new("metal", 1, Arc::clone(&only_unsupported))),
+        )];
+        let err = distribute_work(
+            &mut backends,
+            options(crate::backend::PowAlgorithm::Blake2b512),
+            &backend_executor,
+        )
+        .expect_err("no backend can mine BLAKE2b");
+        assert!(format!("{err:#}").contains("Blake2b512"));
+    }
+
+    #[test]
+    fn distribute_work_quarantines_assignment_failures_and_reassigns_lanes() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let first_state = Arc::new(MockState::default());
+        let failed_state = Arc::new(MockState::default());
+        let third_state = Arc::new(MockState::default());
+        failed_state.fail_next_assign.store(true, Ordering::Relaxed);
+
+        let mut backends = vec![
+            slot(
+                1,
+                2,
+                Arc::new(MockBackend::new("cpu", 2, Arc::clone(&first_state))),
+            ),
+            slot(
+                2,
+                1,
+                Arc::new(MockBackend::new("nvidia", 1, Arc::clone(&failed_state))),
+            ),
+            slot(
+                3,
+                1,
+                Arc::new(MockBackend::new("nvidia", 1, Arc::clone(&third_state))),
+            ),
+        ];
+        let distribution = distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 1,
+                work_id: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                pow: crate::backend::PowAlgorithm::Argon2id,
+                target: [0xFF; 32],
+                dynamic_share_target: None,
+                pause_on_solution: true,
+                reservation: NonceReservation {
+                    start_nonce: 100,
+                    max_iters_per_lane: 10,
+                    reserved_span: 40,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                backend_weights: None,
+                strict_reservation: false,
+            },
+            &backend_executor,
+        )
+        .expect("distribution should continue after quarantining failing backend");
+        assert_eq!(distribution.additional_span_consumed, 30);
+
+        assert_eq!(backends.len(), 2);
+        assert_eq!(backends[0].id, 1);
+        assert_eq!(backends[1].id, 3);
+
+        let first_chunk = first_state
+            .last_chunk
+            .lock()
+            .expect("first chunk lock should not be poisoned")
+            .expect("first backend should receive work");
+        let third_chunk = third_state
+            .last_chunk
+            .lock()
+            .expect("third chunk lock should not be poisoned")
+            .expect("third backend should receive work");
+
+        // Retry after assignment failure moves to a fresh nonce reservation window.
+        assert_eq!(first_chunk.start_nonce, 140);
+        assert_eq!(first_chunk.nonce_count, 20);
+        assert_eq!(third_chunk.start_nonce, 160);
+        assert_eq!(third_chunk.nonce_count, 10);
+        assert!(
+            wait_for_stop_call(&failed_state, Duration::from_millis(250)),
+            "failing backend should be quarantined"
+        );
+    }
+
+    #[test]
+    fn distribute_work_uses_backend_inflight_batching_hint() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let state = Arc::new(MockState::default());
+        let mut backends = vec![slot(
+            7,
+            1,
+            Arc::new(
+                MockBackend::new("nvidia", 1, Arc::clone(&state))
+                    .with_preferred_allocation_iters_per_lane(12)
+                    .with_preferred_dispatch_iters_per_lane(3)
+                    .with_max_inflight_assignments(4),
+            ),
+        )];
+
+        let distribution = distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 1,
+                work_id: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                pow: crate::backend::PowAlgorithm::Argon2id,
+                target: [0xFF; 32],
+                dynamic_share_target: None,
+                pause_on_solution: true,
+                reservation: NonceReservation {
+                    start_nonce: 200,
+                    max_iters_per_lane: 12,
+                    reserved_span: 12,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                backend_weights: None,
+                strict_reservation: false,
+            },
+            &backend_executor,
+        )
+        .expect("distribution should succeed");
+
+        assert_eq!(distribution.additional_span_consumed, 0);
+        assert_eq!(state.assign_batch_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(state.last_batch_len.load(Ordering::Relaxed), 4);
+
+        let chunks = state
+            .chunks
+            .lock()
+            .expect("chunk history lock should not be poisoned")
+            .clone();
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks[0].start_nonce, 200);
+        assert_eq!(chunks[0].nonce_count, 3);
+        assert_eq!(chunks[1].start_nonce, 203);
+        assert_eq!(chunks[1].nonce_count, 3);
+        assert_eq!(chunks[2].start_nonce, 206);
+        assert_eq!(chunks[2].nonce_count, 3);
+        assert_eq!(chunks[3].start_nonce, 209);
+        assert_eq!(chunks[3].nonce_count, 3);
+    }
+
+    #[test]
+    fn distribute_work_non_strict_allows_lane_rounding_overflow() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let state = Arc::new(MockState::default());
+        let mut backends = vec![slot(
+            42,
+            14,
+            Arc::new(
+                MockBackend::new("nvidia", 14, Arc::clone(&state))
+                    .with_preferred_allocation_iters_per_lane(1 << 21),
+            ),
+        )];
+
+        let distribution = distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 1,
+                work_id: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                pow: crate::backend::PowAlgorithm::Argon2id,
+                target: [0xFF; 32],
+                dynamic_share_target: None,
+                pause_on_solution: true,
+                reservation: NonceReservation {
+                    start_nonce: 1_000,
+                    max_iters_per_lane: 10,
+                    reserved_span: 138,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                backend_weights: None,
+                strict_reservation: false,
+            },
+            &backend_executor,
+        )
+        .expect("distribution should succeed");
+
+        assert!(
+            distribution.additional_span_consumed > 0
+                && distribution.additional_span_consumed <= 13,
+            "expected lane-rounding overflow in non-strict mode, got {}",
+            distribution.additional_span_consumed
+        );
+    }
+
+    #[test]
+    fn distribute_work_strict_reservation_prevents_window_overflow() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let state = Arc::new(MockState::default());
+        let mut backends = vec![slot(
+            42,
+            14,
+            Arc::new(
+                MockBackend::new("nvidia", 14, Arc::clone(&state))
+                    .with_preferred_allocation_iters_per_lane(1 << 21),
+            ),
+        )];
+
+        let distribution = distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 1,
+                work_id: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                pow: crate::backend::PowAlgorithm::Argon2id,
+                target: [0xFF; 32],
+                dynamic_share_target: None,
+                pause_on_solution: true,
+                reservation: NonceReservation {
+                    start_nonce: 1_000,
+                    max_iters_per_lane: 10,
+                    reserved_span: 138,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                backend_weights: None,
+                strict_reservation: true,
+            },
+            &backend_executor,
+        )
+        .expect("distribution should succeed");
+
+        assert_eq!(
+            distribution.additional_span_consumed, 0,
+            "strict reservation must not consume nonce span outside the assignment window"
+        );
+        let chunk = state
+            .last_chunk
+            .lock()
+            .expect("chunk lock should not be poisoned")
+            .expect("backend should receive strict-reservation work");
+        assert_eq!(chunk.start_nonce, 1_000);
+        assert_eq!(chunk.nonce_count, 138);
+    }
+
+    #[test]
+    fn distribute_work_propagates_pause_on_solution_flag() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let state = Arc::new(MockState::default());
+        let mut backends = vec![slot(
+            7,
+            1,
+            Arc::new(MockBackend::new("cpu", 1, Arc::clone(&state))),
+        )];
+
+        distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 1,
+                work_id: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                pow: crate::backend::PowAlgorithm::Argon2id,
+                target: [0xFF; 32],
+                dynamic_share_target: None,
+                pause_on_solution: false,
+                reservation: NonceReservation {
+                    start_nonce: 64,
+                    max_iters_per_lane: 8,
+                    reserved_span: 16,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                backend_weights: None,
+                strict_reservation: true,
+            },
+            &backend_executor,
+        )
+        .expect("distribution should succeed");
+
+        assert_eq!(
+            *state
+                .last_pause_on_solution
+                .lock()
+                .expect("mock pause_on_solution lock should not be poisoned"),
+            Some(false),
+            "pool-style work should keep hashing after solution events"
+        );
+    }
+
+    #[test]
+    fn backend_chunk_profiles_uses_effective_worker_queue_depth() {
+        let backends = vec![slot(
+            77,
+            1,
+            Arc::new(
+                MockBackend::new("nvidia", 1, Arc::new(MockState::default()))
+                    .with_preferred_worker_queue_depth(10_000)
+                    .with_assignment_semantics(crate::backend::AssignmentSemantics::Replace),
+            ),
+        )];
+
+        let profiles = backend_chunk_profiles(&backends, 1 << 20);
+        assert!(
+            profiles.contains("worker_q=64"),
+            "expected clamped queue depth in profile output, got: {profiles}"
+        );
+    }
+
+    #[test]
+    fn distribute_work_timeout_cleanup_stops_backend_after_repeated_timeouts() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let slow_state = Arc::new(MockState::default());
+        let mut backends = vec![slot(
+            9,
+            1,
+            Arc::new(
+                MockBackend::new("cpu", 1, Arc::clone(&slow_state))
+                    .with_assign_delay(Duration::from_millis(50)),
+            ),
+        )];
+        backends[0].runtime_policy.assignment_timeout = Duration::from_millis(5);
+
+        let first_round = distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 1,
+                work_id: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                pow: crate::backend::PowAlgorithm::Argon2id,
+                target: [0xFF; 32],
+                dynamic_share_target: None,
+                pause_on_solution: true,
+                reservation: NonceReservation {
+                    start_nonce: 10,
+                    max_iters_per_lane: 1,
+                    reserved_span: 1,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                backend_weights: None,
+                strict_reservation: false,
+            },
+            &backend_executor,
+        )
+        .expect("first timeout window should keep backend active");
+        assert!(first_round.additional_span_consumed >= 1);
+
+        std::thread::sleep(Duration::from_millis(60));
+
+        let err = distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 2,
+                work_id: 2,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                pow: crate::backend::PowAlgorithm::Argon2id,
+                target: [0xFF; 32],
+                dynamic_share_target: None,
+                pause_on_solution: true,
+                reservation: NonceReservation {
+                    start_nonce: 20,
+                    max_iters_per_lane: 1,
+                    reserved_span: 1,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                backend_weights: None,
+                strict_reservation: false,
+            },
+            &backend_executor,
+        )
+        .expect_err("repeated timeout strikes should quarantine the only backend");
+        assert!(format!("{err:#}").contains("all mining backends are unavailable"));
+
+        assert!(
+            wait_for_stop_call(&slow_state, Duration::from_millis(250)),
+            "timed-out backend should be stopped once quarantined"
+        );
+    }
+
+    #[test]
+    fn distribute_work_timeout_without_quarantine_retries_once_then_keeps_backend_active() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let slow_state = Arc::new(MockState::default());
+        let mut backends = vec![slot(
+            9,
+            1,
+            Arc::new(
+                MockBackend::new("cpu", 1, Arc::clone(&slow_state))
+                    .with_assign_delay(Duration::from_millis(50)),
+            ),
+        )];
+        backends[0].runtime_policy.assignment_timeout = Duration::from_millis(5);
+
+        let distribution = distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 1,
+                work_id: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                pow: crate::backend::PowAlgorithm::Argon2id,
+                target: [0xFF; 32],
+                dynamic_share_target: None,
+                pause_on_solution: true,
+                reservation: NonceReservation {
+                    start_nonce: 10,
+                    max_iters_per_lane: 1,
+                    reserved_span: 1,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                backend_weights: None,
+                strict_reservation: false,
+            },
+            &backend_executor,
+        )
+        .expect("non-quarantined timeout should keep backend active");
+
+        assert!(distribution.additional_span_consumed >= 1);
+        assert_eq!(backends.len(), 1);
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(
+            slow_state.assign_calls.load(Ordering::Relaxed) <= 2,
+            "timeout path should not spin unbounded retries in one distribution call"
+        );
+    }
+
+    #[test]
+    fn distribute_work_timeout_quarantines_append_semantics_backend_immediately() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let slow_state = Arc::new(MockState::default());
+        let mut backends = vec![slot(
+            12,
+            1,
+            Arc::new(
+                MockBackend::new("nvidia", 1, Arc::clone(&slow_state))
+                    .with_assign_delay(Duration::from_millis(50))
+                    .with_assignment_semantics(crate::backend::AssignmentSemantics::Append),
+            ),
+        )];
+        backends[0].runtime_policy.assignment_timeout = Duration::from_millis(5);
+
+        let err = distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 1,
+                work_id: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                pow: crate::backend::PowAlgorithm::Argon2id,
+                target: [0xFF; 32],
+                dynamic_share_target: None,
+                pause_on_solution: true,
+                reservation: NonceReservation {
+                    start_nonce: 10,
+                    max_iters_per_lane: 1,
+                    reserved_span: 1,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                backend_weights: None,
+                strict_reservation: false,
+            },
+            &backend_executor,
+        )
+        .expect_err("append semantics backend should be quarantined after first timeout");
+        assert!(format!("{err:#}").contains("all mining backends are unavailable"));
+
+        assert!(
+            wait_for_stop_call(&slow_state, Duration::from_millis(250)),
+            "timed-out append backend should be stopped once late dispatch completes"
+        );
+    }
+
+    #[test]
+    fn distribute_work_quarantines_assignment_panics_and_reassigns_lanes() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let first_state = Arc::new(MockState::default());
+        let panic_state = Arc::new(MockState::default());
+        let third_state = Arc::new(MockState::default());
+        panic_state.panic_next_assign.store(true, Ordering::Relaxed);
+
+        let mut backends = vec![
+            slot(
+                1,
+                2,
+                Arc::new(MockBackend::new("cpu", 2, Arc::clone(&first_state))),
+            ),
+            slot(
+                2,
+                1,
+                Arc::new(MockBackend::new("nvidia", 1, Arc::clone(&panic_state))),
+            ),
+            slot(
+                3,
+                1,
+                Arc::new(MockBackend::new("nvidia", 1, Arc::clone(&third_state))),
+            ),
+        ];
+
+        let distribution = distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 1,
+                work_id: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                pow: crate::backend::PowAlgorithm::Argon2id,
+                target: [0xFF; 32],
+                dynamic_share_target: None,
+                pause_on_solution: true,
+                reservation: NonceReservation {
+                    start_nonce: 100,
+                    max_iters_per_lane: 10,
+                    reserved_span: 40,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                backend_weights: None,
+                strict_reservation: false,
+            },
+            &backend_executor,
+        )
+        .expect("distribution should continue after quarantining panicing backend");
+
+        assert_eq!(distribution.additional_span_consumed, 30);
+        assert_eq!(backends.len(), 2);
+        assert_eq!(backends[0].id, 1);
+        assert_eq!(backends[1].id, 3);
+        assert!(
+            wait_for_stop_call(&panic_state, Duration::from_millis(250)),
+            "panicking backend should be quarantined"
+        );
+    }
+
+    fn startup_test_spec() -> BackendSpec {
+        BackendSpec {
+            kind: BackendKind::Cpu,
+            device_index: None,
+            cpu_threads: Some(1),
+            cpu_affinity: Some(crate::config::CpuAffinityMode::Off),
+            assign_timeout_override: None,
+            control_timeout_override: None,
+            assign_timeout_strikes_override: None,
+        }
+    }
+
+    #[test]
+    fn startup_cancel_before_activation_starts_no_backend() {
+        let state = Arc::new(MockState::default());
+        let backend: Arc<dyn PowBackend> = Arc::new(MockBackend::new("cpu", 1, state.clone()));
+        let error = activate_backends(
+            vec![(startup_test_spec(), backend)],
+            16,
+            &test_config(),
+            &AtomicBool::new(true),
+            Vec::new(),
+        )
+        .err()
+        .expect("cancelled activation");
+        assert!(error.is::<StartupCancelled>());
+        assert_eq!(state.start_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn startup_cancel_during_native_init_stops_ready_and_late_backends() {
+        let healthy = Arc::new(MockState::default());
+        let blocked = Arc::new(MockState::default());
+        let (entered_tx, entered_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let mut backend = MockBackend::new("cpu", 1, blocked.clone());
+        backend.start_gate = Some((entered_tx, release_rx));
+        let instances: Vec<(BackendSpec, Arc<dyn PowBackend>)> = vec![
+            (
+                startup_test_spec(),
+                Arc::new(MockBackend::new("cpu", 1, healthy.clone())),
+            ),
+            (startup_test_spec(), Arc::new(backend)),
+        ];
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = shutdown.clone();
+        let worker = std::thread::spawn(move || {
+            activate_backends(instances, 16, &test_config(), &worker_shutdown, Vec::new())
+                .map(|(active, _)| active.len())
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("startup entered");
+        let start = Instant::now();
+        shutdown.store(true, Ordering::Relaxed);
+        let error = worker.join().unwrap().expect_err("startup cancelled");
+        assert!(error.is::<StartupCancelled>());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(healthy.stop_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            blocked.stop_calls.load(Ordering::Relaxed),
+            0,
+            "must not call stop concurrently with native startup"
+        );
+        release_tx.send(()).unwrap();
+        assert!(
+            wait_for_stop_call(&blocked, Duration::from_secs(2)),
+            "a backend finishing after cancellation must be stopped"
+        );
+    }
+
+    #[test]
+    fn startup_failure_preserves_os_error_even_with_concurrent_shutdown() {
+        let state = Arc::new(MockState::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut backend = MockBackend::new("cpu", 1, state.clone());
+        backend.start_os_error = Some(12);
+        backend.shutdown_on_start = Some(shutdown.clone());
+        let error = activate_single_backend(
+            startup_test_spec(),
+            Arc::new(backend),
+            1,
+            16,
+            &test_config(),
+            &shutdown,
+        )
+        .err()
+        .expect("real startup error");
+        assert!(!error.is::<StartupCancelled>());
+        assert_eq!(backend_start_failure_detail(&error).os_error, Some(12));
+        assert!(format!("{error:#}").contains("cpu#1 unavailable"));
+        assert!(normalize_startup_cancellation(Err(error)).is_err());
+        assert_eq!(state.stop_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn startup_cancel_exits_run_successfully_before_address_resolution() {
+        run(&test_config(), Arc::new(AtomicBool::new(true)))
+            .expect("requested stop is a successful exit");
+        let contextual = anyhow::Error::new(StartupCancelled).context("backend init");
+        assert!(normalize_startup_cancellation(Err(contextual)).is_ok());
+        assert!(normalize_startup_cancellation(Err(anyhow!("interrupted by user"))).is_err());
+    }
+
+    #[test]
+    fn startup_wait_cancels_while_deferred_sender_is_still_alive() {
+        let (_sender, receiver) = bounded::<()>(1);
+        let start = Instant::now();
+        let error = wait_for_startup(&receiver, &AtomicBool::new(true), "failed")
+            .expect_err("shutdown must not wait for sender disconnect");
+        assert!(error.is::<StartupCancelled>());
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn startup_wait_distinguishes_failed_and_cancelled_disconnects() {
+        let (sender, receiver) = bounded::<()>(1);
+        drop(sender);
+        let error = wait_for_startup(&receiver, &AtomicBool::new(false), "all backends failed")
+            .expect_err("real startup failure");
+        assert!(!error.is::<StartupCancelled>());
+        assert_eq!(error.to_string(), "all backends failed");
+        assert!(
+            wait_for_startup(&receiver, &AtomicBool::new(true), "all backends failed")
+                .unwrap_err()
+                .is::<StartupCancelled>()
+        );
+    }
+
+    #[test]
+    fn activate_backends_stops_backend_when_start_fails() {
+        let failed_state = Arc::new(MockState::default());
+        let healthy_state = Arc::new(MockState::default());
+        failed_state.fail_start.store(true, Ordering::Relaxed);
+
+        let cfg = test_config();
+        let backend_spec = BackendSpec {
+            kind: BackendKind::Cpu,
+            device_index: None,
+            cpu_threads: Some(1),
+            cpu_affinity: Some(crate::config::CpuAffinityMode::Off),
+            assign_timeout_override: None,
+            control_timeout_override: None,
+            assign_timeout_strikes_override: None,
+        };
+        let instances: Vec<(BackendSpec, Arc<dyn PowBackend>)> = vec![
+            (
+                backend_spec,
+                Arc::new(MockBackend::new("cpu", 1, Arc::clone(&failed_state))),
+            ),
+            (
+                backend_spec,
+                Arc::new(MockBackend::new("cpu", 1, Arc::clone(&healthy_state))),
+            ),
+        ];
+
+        let no_shutdown = AtomicBool::new(false);
+        let (active, _events) = activate_backends(instances, 16, &cfg, &no_shutdown, Vec::new())
+            .expect("activation should continue with the healthy backend");
+
+        assert_eq!(active.len(), 1);
+        assert!(
+            wait_for_stop_call(&failed_state, Duration::from_millis(250)),
+            "failing backend should be stopped after restart quarantine"
+        );
+        assert_eq!(healthy_state.stop_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn start_backend_slots_quarantines_failed_restart() {
+        let failed_state = Arc::new(MockState::default());
+        let healthy_state = Arc::new(MockState::default());
+        failed_state.fail_start.store(true, Ordering::Relaxed);
+
+        let mut backends = vec![
+            slot(
+                1,
+                1,
+                Arc::new(MockBackend::new("cpu", 1, Arc::clone(&failed_state))),
+            ),
+            slot(
+                2,
+                1,
+                Arc::new(MockBackend::new("cpu", 1, Arc::clone(&healthy_state))),
+            ),
+        ];
+
+        let backend_executor = backend_executor::BackendExecutor::new();
+        start_backend_slots(&mut backends, &backend_executor, Duration::from_secs(1))
+            .expect("restart should continue with healthy backend");
+
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].id, 2);
+        assert!(
+            wait_for_stop_call(&failed_state, Duration::from_millis(250)),
+            "failing backend should be stopped after restart quarantine"
+        );
+        assert_eq!(healthy_state.stop_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn nonce_counts_static_match_lane_quota() {
+        let state_a = Arc::new(MockState::default());
+        let state_b = Arc::new(MockState::default());
+        let backends = vec![
+            slot(
+                1,
+                2,
+                Arc::new(MockBackend::new("cpu", 2, Arc::clone(&state_a))),
+            ),
+            slot(
+                2,
+                1,
+                Arc::new(MockBackend::new("cpu", 1, Arc::clone(&state_b))),
+            ),
+        ];
+
+        let counts = compute_backend_nonce_counts(&backends, 10, None);
+        assert_eq!(counts, vec![20, 10]);
+    }
+
+    #[test]
+    fn nonce_counts_static_cap_backend_preferred_iters_to_lane_budget() {
+        let state_a = Arc::new(MockState::default());
+        let state_b = Arc::new(MockState::default());
+        let backends = vec![
+            slot(
+                1,
+                2,
+                Arc::new(
+                    MockBackend::new("cpu", 2, Arc::clone(&state_a))
+                        .with_preferred_iters_per_lane(4),
+                ),
+            ),
+            slot(
+                2,
+                1,
+                Arc::new(
+                    MockBackend::new("nvidia", 1, Arc::clone(&state_b))
+                        .with_preferred_iters_per_lane(16),
+                ),
+            ),
+        ];
+
+        let counts = compute_backend_nonce_counts(&backends, 10, None);
+        assert_eq!(counts, vec![8, 10]);
+    }
+
+    #[test]
+    fn nonce_counts_adaptive_follow_weights_without_overlap() {
+        let state_a = Arc::new(MockState::default());
+        let state_b = Arc::new(MockState::default());
+        let backends = vec![
+            slot(
+                10,
+                2,
+                Arc::new(MockBackend::new("cpu", 2, Arc::clone(&state_a))),
+            ),
+            slot(
+                20,
+                2,
+                Arc::new(MockBackend::new("cpu", 2, Arc::clone(&state_b))),
+            ),
+        ];
+        let mut weights = BTreeMap::new();
+        weights.insert(10, 9.0);
+        weights.insert(20, 1.0);
+
+        let counts = compute_backend_nonce_counts(&backends, 10, Some(&weights));
+        assert_eq!(counts.iter().copied().sum::<u64>(), 40);
+        assert!(counts[0] > counts[1]);
+        assert!(counts[0] >= 2);
+        assert!(counts[1] >= 2);
+    }
+
+    #[test]
+    fn nonce_counts_adaptive_boosts_new_backend_exploration_share() {
+        let state_a = Arc::new(MockState::default());
+        let state_b = Arc::new(MockState::default());
+        let backends = vec![
+            slot(
+                10,
+                1,
+                Arc::new(MockBackend::new("cpu", 1, Arc::clone(&state_a))),
+            ),
+            slot(
+                20,
+                1,
+                Arc::new(MockBackend::new("cpu", 1, Arc::clone(&state_b))),
+            ),
+        ];
+        let mut weights = BTreeMap::new();
+        weights.insert(10, 1_000_000.0);
+
+        let counts = compute_backend_nonce_counts(&backends, 100, Some(&weights));
+        assert_eq!(counts.iter().copied().sum::<u64>(), 200);
+        assert!(
+            counts[1] > 2,
+            "new backend should receive exploration work beyond lane minimum: {:?}",
+            counts
+        );
+    }
+
+    #[test]
+    fn effective_hash_poll_interval_uses_backend_hint() {
+        let state_a = Arc::new(MockState::default());
+        let state_b = Arc::new(MockState::default());
+        let backends = vec![
+            slot(
+                1,
+                1,
+                Arc::new(
+                    MockBackend::new("cpu", 1, Arc::clone(&state_a))
+                        .with_preferred_hash_poll_interval(Duration::from_millis(50)),
+                ),
+            ),
+            slot(
+                2,
+                1,
+                Arc::new(MockBackend::new("cpu", 1, Arc::clone(&state_b))),
+            ),
+        ];
+
+        let effective = effective_hash_poll_interval(&backends, Duration::from_millis(200));
+        assert_eq!(effective, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn collect_round_backend_samples_keeps_runtime_telemetry_until_backend_is_due() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let state_a = Arc::new(MockState::default());
+        let state_b = Arc::new(MockState::default());
+        let backend_a: Arc<dyn PowBackend> = Arc::new(
+            MockBackend::new("cpu-a", 1, Arc::clone(&state_a))
+                .with_assign_delay(Duration::from_millis(40)),
+        );
+        let backend_b: Arc<dyn PowBackend> = Arc::new(
+            MockBackend::new("cpu-b", 1, Arc::clone(&state_b))
+                .with_assign_delay(Duration::from_millis(40)),
+        );
+        let backends = vec![
+            slot(1, 1, Arc::clone(&backend_a)),
+            slot(2, 1, Arc::clone(&backend_b)),
+        ];
+
+        let make_work = || WorkAssignment {
+            template: Arc::new(WorkTemplate {
+                work_id: 1,
+                epoch: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                pow: crate::backend::PowAlgorithm::Argon2id,
+                target: [0xFF; 32],
+                dynamic_share_target: None,
+                pause_on_solution: true,
+                stop_at: Instant::now() + Duration::from_secs(1),
+            }),
+            nonce_chunk: NonceChunk {
+                start_nonce: 0,
+                nonce_count: 1,
+            },
+        };
+
+        let outcomes = backend_executor.dispatch_backend_tasks(vec![
+            backend_executor::BackendTask {
+                idx: 0,
+                backend_id: 1,
+                backend: "cpu-a",
+                backend_handle: Arc::clone(&backend_a),
+                kind: backend_executor::BackendTaskKind::Assign(make_work()),
+                timeout: Duration::from_millis(5),
+            },
+            backend_executor::BackendTask {
+                idx: 1,
+                backend_id: 2,
+                backend: "cpu-b",
+                backend_handle: Arc::clone(&backend_b),
+                kind: backend_executor::BackendTaskKind::Assign(make_work()),
+                timeout: Duration::from_millis(5),
+            },
+        ]);
+        assert!(matches!(
+            outcomes[0],
+            Some(backend_executor::BackendTaskDispatchResult::TimedOut(
+                backend_executor::BackendTaskTimeoutKind::Execution
+            ))
+        ));
+        assert!(matches!(
+            outcomes[1],
+            Some(backend_executor::BackendTaskDispatchResult::TimedOut(
+                backend_executor::BackendTaskTimeoutKind::Execution
+            ))
+        ));
+
+        let poll_interval = Duration::from_millis(200);
+        let mut poll_state = hash_poll::build_backend_poll_state(&backends, poll_interval);
+        poll_state.insert(
+            1,
+            (poll_interval, Instant::now() - Duration::from_millis(1)),
+        );
+        poll_state.insert(2, (poll_interval, Instant::now() + Duration::from_secs(30)));
+
+        let mut round_backend_hashes = BTreeMap::new();
+        let mut round_backend_telemetry = BTreeMap::new();
+        let _ = collect_round_backend_samples(
+            &backends,
+            &backend_executor,
+            poll_interval,
+            &mut poll_state,
+            &mut round_backend_hashes,
+            &mut round_backend_telemetry,
+        );
+        assert_eq!(
+            round_backend_telemetry
+                .get(&1)
+                .map(|telemetry| telemetry.assignment_execution_timeouts),
+            Some(1)
+        );
+        assert!(
+            !round_backend_telemetry.contains_key(&2),
+            "backend 2 should not be merged until it is due for polling"
+        );
+
+        poll_state.insert(
+            2,
+            (poll_interval, Instant::now() - Duration::from_millis(1)),
+        );
+        let _ = collect_round_backend_samples(
+            &backends,
+            &backend_executor,
+            poll_interval,
+            &mut poll_state,
+            &mut round_backend_hashes,
+            &mut round_backend_telemetry,
+        );
+        assert_eq!(
+            round_backend_telemetry
+                .get(&2)
+                .map(|telemetry| telemetry.assignment_execution_timeouts),
+            Some(1),
+            "runtime telemetry for non-due backends must remain until they are sampled"
+        );
+    }
+
+    #[test]
+    fn deadline_policy_rejects_best_effort_when_not_allowed() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let state = Arc::new(MockState::default());
+        let mut backends = vec![slot(
+            1,
+            1,
+            Arc::new(
+                MockBackend::new("nvidia", 1, Arc::clone(&state))
+                    .with_deadline_support(crate::backend::DeadlineSupport::BestEffort),
+            ),
+        )];
+
+        let err =
+            enforce_deadline_policy(&mut backends, false, RuntimeMode::Mining, &backend_executor)
+                .expect_err("best-effort backend should be rejected by default");
+        assert!(format!("{err:#}").contains("--allow-best-effort-deadlines"));
+    }
+
+    #[test]
+    fn deadline_policy_quarantines_best_effort_and_keeps_cooperative_backends() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let best_effort_state = Arc::new(MockState::default());
+        let cooperative_state = Arc::new(MockState::default());
+        let mut backends = vec![
+            slot(
+                1,
+                1,
+                Arc::new(
+                    MockBackend::new("nvidia", 1, Arc::clone(&best_effort_state))
+                        .with_deadline_support(crate::backend::DeadlineSupport::BestEffort),
+                ),
+            ),
+            slot(
+                2,
+                1,
+                Arc::new(
+                    MockBackend::new("cpu", 1, Arc::clone(&cooperative_state))
+                        .with_deadline_support(crate::backend::DeadlineSupport::Cooperative),
+                ),
+            ),
+        ];
+
+        enforce_deadline_policy(&mut backends, false, RuntimeMode::Mining, &backend_executor)
+            .expect("cooperative backend should remain available");
+
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].id, 2);
+        assert!(
+            wait_for_stop_call(&best_effort_state, Duration::from_millis(250)),
+            "best-effort backend should be quarantined asynchronously"
+        );
+        assert_eq!(cooperative_state.stop_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[derive(Default)]
+    struct QuiesceTrace {
+        events: Mutex<Vec<String>>,
+    }
+
+    struct QuiesceMockBackend {
+        name: &'static str,
+        trace: Arc<QuiesceTrace>,
+    }
+
+    impl QuiesceMockBackend {
+        fn new(name: &'static str, trace: Arc<QuiesceTrace>) -> Self {
+            Self { name, trace }
+        }
+
+        fn record(&self, action: &str) {
+            if let Ok(mut events) = self.trace.events.lock() {
+                events.push(format!("{action}:{}", self.name));
+            }
+        }
+    }
+
+    impl PowBackend for QuiesceMockBackend {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn lanes(&self) -> usize {
+            1
+        }
+
+        fn set_instance_id(&self, _id: BackendInstanceId) {}
+
+        fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
+
+        fn start(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&self) {}
+
+        fn assign_work(&self, _work: WorkAssignment) -> Result<()> {
+            Ok(())
+        }
+
+        fn cancel_work(&self) -> Result<()> {
+            self.record("cancel");
+            Ok(())
+        }
+
+        fn fence(&self) -> Result<()> {
+            self.record("fence");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn quiesce_cancels_all_backends_before_fencing_any_backend() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let trace = Arc::new(QuiesceTrace::default());
+        let mut backends = vec![
+            slot(
+                1,
+                1,
+                Arc::new(QuiesceMockBackend::new("cpu-a", Arc::clone(&trace))),
+            ),
+            slot(
+                2,
+                1,
+                Arc::new(QuiesceMockBackend::new("cpu-b", Arc::clone(&trace))),
+            ),
+        ];
+
+        quiesce_backend_slots(&mut backends, RuntimeMode::Mining, &backend_executor)
+            .expect("quiesce should succeed");
+
+        let events = trace
+            .events
+            .lock()
+            .expect("trace lock should not be poisoned")
+            .clone();
+        let cancel_count = events
+            .iter()
+            .filter(|entry| entry.starts_with("cancel:"))
+            .count();
+        let fence_count = events
+            .iter()
+            .filter(|entry| entry.starts_with("fence:"))
+            .count();
+        assert!(cancel_count >= 2);
+        assert_eq!(fence_count, 2);
+        assert_eq!(events.len(), cancel_count + fence_count);
+
+        let first_fence_idx = events
+            .iter()
+            .position(|entry| entry.starts_with("fence:"))
+            .expect("fence events should exist");
+        assert!(
+            events
+                .iter()
+                .take(first_fence_idx)
+                .all(|entry| entry.starts_with("cancel:")),
+            "all pre-fence actions should be cancels: {events:?}"
+        );
+    }
+
+    struct ControlFailBackend {
+        name: &'static str,
+        fail_cancel: bool,
+        fail_fence: bool,
+        stop_calls: Arc<AtomicUsize>,
+    }
+
+    impl ControlFailBackend {
+        fn new(
+            name: &'static str,
+            fail_cancel: bool,
+            fail_fence: bool,
+            stop_calls: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                name,
+                fail_cancel,
+                fail_fence,
+                stop_calls,
+            }
+        }
+    }
+
+    impl PowBackend for ControlFailBackend {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn lanes(&self) -> usize {
+            1
+        }
+
+        fn set_instance_id(&self, _id: BackendInstanceId) {}
+
+        fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
+
+        fn start(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&self) {
+            self.stop_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn assign_work(&self, _work: WorkAssignment) -> Result<()> {
+            Ok(())
+        }
+
+        fn cancel_work(&self) -> Result<()> {
+            if self.fail_cancel {
+                Err(anyhow!("injected cancel failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn fence(&self) -> Result<()> {
+            if self.fail_fence {
+                Err(anyhow!("injected fence failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct ControlPanicBackend {
+        name: &'static str,
+        panic_cancel: bool,
+        panic_fence: bool,
+        stop_calls: Arc<AtomicUsize>,
+    }
+
+    impl ControlPanicBackend {
+        fn new(
+            name: &'static str,
+            panic_cancel: bool,
+            panic_fence: bool,
+            stop_calls: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                name,
+                panic_cancel,
+                panic_fence,
+                stop_calls,
+            }
+        }
+    }
+
+    impl PowBackend for ControlPanicBackend {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn lanes(&self) -> usize {
+            1
+        }
+
+        fn set_instance_id(&self, _id: BackendInstanceId) {}
+
+        fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
+
+        fn start(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&self) {
+            self.stop_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn assign_work(&self, _work: WorkAssignment) -> Result<()> {
+            Ok(())
+        }
+
+        fn cancel_work(&self) -> Result<()> {
+            if self.panic_cancel {
+                panic!("injected cancel panic")
+            } else {
+                Ok(())
+            }
+        }
+
+        fn fence(&self) -> Result<()> {
+            if self.panic_fence {
+                panic!("injected fence panic")
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn quiesce_quarantines_only_failing_backend() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let fail_stop_calls = Arc::new(AtomicUsize::new(0));
+        let ok_stop_calls = Arc::new(AtomicUsize::new(0));
+        let mut backends = vec![
+            slot(
+                1,
+                1,
+                Arc::new(ControlFailBackend::new(
+                    "cpu-a",
+                    false,
+                    true,
+                    Arc::clone(&fail_stop_calls),
+                )),
+            ),
+            slot(
+                2,
+                1,
+                Arc::new(ControlFailBackend::new(
+                    "cpu-b",
+                    false,
+                    false,
+                    Arc::clone(&ok_stop_calls),
+                )),
+            ),
+        ];
+
+        let action = quiesce_backend_slots(&mut backends, RuntimeMode::Mining, &backend_executor)
+            .expect("quiesce should quarantine only the failing backend");
+
+        assert_eq!(action, RuntimeBackendEventAction::TopologyChanged);
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].id, 2);
+        assert!(
+            wait_for_stop_counter(&fail_stop_calls, Duration::from_millis(250)),
+            "failing backend should be stopped asynchronously"
+        );
+        assert_eq!(ok_stop_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn quiesce_quarantines_backend_when_control_panics() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let panic_stop_calls = Arc::new(AtomicUsize::new(0));
+        let ok_stop_calls = Arc::new(AtomicUsize::new(0));
+        let mut backends = vec![
+            slot(
+                1,
+                1,
+                Arc::new(ControlPanicBackend::new(
+                    "cpu-a",
+                    false,
+                    true,
+                    Arc::clone(&panic_stop_calls),
+                )),
+            ),
+            slot(
+                2,
+                1,
+                Arc::new(ControlPanicBackend::new(
+                    "cpu-b",
+                    false,
+                    false,
+                    Arc::clone(&ok_stop_calls),
+                )),
+            ),
+        ];
+
+        let action = quiesce_backend_slots(&mut backends, RuntimeMode::Mining, &backend_executor)
+            .expect("quiesce should quarantine panicing backend");
+
+        assert_eq!(action, RuntimeBackendEventAction::TopologyChanged);
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].id, 2);
+        assert!(
+            wait_for_stop_counter(&panic_stop_calls, Duration::from_millis(250)),
+            "panicing backend should be stopped asynchronously"
+        );
+        assert_eq!(ok_stop_calls.load(Ordering::Relaxed), 0);
+    }
+}

@@ -1,0 +1,62 @@
+---
+title: 'Blocknet giữ riêng tư mặc định cho thanh toán thông thường thế nào?'
+description: 'Tìm hiểu quyền riêng tư của thanh toán Blocknet: chữ ký vòng, khóa một lần, số tiền ẩn, ghi chú mã hóa và những thay đổi được đề xuất trong Faraday.'
+tags: ['Blocknet', 'Riêng tư', 'Thanh toán']
+faq:
+  - q: 'Quyền riêng tư có tự động khi tôi trả bằng Blocknet không?'
+    a: 'Có. Ví đã phát hành tạo thanh toán thông thường với chữ ký vòng, khóa đầu ra một lần, số tiền ẩn và ghi chú mã hóa. Bạn không chọn chế độ riêng tư tách biệt. Cấu trúc công khai vẫn tồn tại, và người gửi lẫn người nhận biết chi tiết của mình. Đây là chi tiêu thông thường; tạo thưởng khối có quy tắc riêng.'
+  - q: 'Vì sao đầu vào Blocknet có 16 thành viên vòng?'
+    a: 'Đầu vào thường dùng một đầu ra thật và 15 mồi nhử trên chuỗi. Chữ ký chứng minh quyền mà không chỉ ra thành viên thật. Đồng thuận cố định kích thước 16, nên người dùng không chọn kích thước khác cho từng khoản trả. Mồi nhử không góp tiền của chủ sở hữu, và ảnh khóa giúp phát hiện chi tiêu lặp.'
+  - q: 'Faraday đã thay thế hệ thống riêng tư hiện tại chưa?'
+    a: 'Chưa. Faraday vẫn là đề xuất nâng cấp. Giải thích chính thức ngày 27 tháng 10 mô tả bằng chứng chi tiêu dựa trên hàm băm trên tập coin Faraday và cơ chế ML-KEM riêng để nhận thanh toán. Tập tăng khi coin vào định dạng mới. Quy tắc đã phát hành vẫn là tham chiếu đến khi nâng cấp tương ứng được kích hoạt.'
+sourceHash: '64f1034d2ebb'
+translation: draft
+---
+
+Trả tiền cho ai đó không nên buộc bạn công khai lịch sử chi tiêu cho mọi người đọc blockchain. Blocknet áp dụng cơ chế riêng tư trong thanh toán thông thường của ví. Hướng dẫn giải thích bảo vệ tự động, cách mạng vẫn kiểm tra thanh toán và vai trò bản ghi của bạn. Hành vi hiện tại dựa trên core v0.22.0 đã phát hành; phần Faraday mô tả đề xuất.
+
+## Riêng tư mặc định nghĩa là gì với thanh toán Blocknet?
+
+<Answer>
+Thanh toán thường dùng chữ ký vòng cho đầu vào được chi, khóa một lần cho người nhận, cam kết và bằng chứng phạm vi cho số tiền. Ghi chú được mã hóa, Dandelion++ giảm lộ nguồn mạng. Ví áp dụng các lớp mà không cần công tắc riêng, trong khi cấu trúc công khai và bản ghi của các bên vẫn còn.
+</Answer>
+
+## Bảo vệ mặc định áp dụng cho tiền chi ra thế nào?
+
+Khi nhập người nhận và số tiền, ví tạo thanh toán theo định dạng riêng tư thông thường. Bạn không phải chọn giữa chuyển công khai và được bảo vệ. Vì vậy riêng tư là một phần của dùng BNT làm tiền: trả cho cá nhân hoặc doanh nghiệp có cùng bảo vệ cốt lõi như khoản trả thông thường khác. Quyết định bật riêng tư cũng không trở thành lựa chọn làm giao dịch nổi bật.
+
+Mỗi đầu vào thường dùng vòng CLSAG gồm 16 đầu ra: một đầu ra thật bạn sở hữu và 15 mồi nhử từ chuỗi. [Quy tắc xác thực đã phát hành](https://github.com/blocknetprivacy/core/blob/5a0a5b510c1dce46f4eeb12c33a291052e44e7b3/transaction.go#L1013) bắt buộc kích thước này và các thành viên là đầu ra thật trên chuỗi. Chữ ký chứng minh quyền chi mà không chỉ ra thành viên cung cấp tiền. Mồi nhử đưa ra nguồn khả dĩ cho chứng minh; không tài trợ thanh toán. Ảnh khóa cho phép phát hiện chi tiêu lặp. [Hướng dẫn chữ ký vòng](/vi/blog/ring-signatures-explained/) giải thích cơ chế.
+
+[![Ba bảo vệ trong thanh toán Blocknet thường: 1, vòng 16 nguồn có thể; 2, khóa đầu ra một lần của người nhận; 3, cam kết số tiền ẩn.](/assets/blog/blocknet-privacy-default.svg)](/assets/blog/blocknet-privacy-default.svg)
+
+Sơ đồ nhóm ba bảo vệ: **1** quyền trong các thành viên vòng, **2** đầu ra nhận và **3** số tiền ẩn. Không thành viên nào được đánh dấu là nguồn thật. Đây là minh họa khái niệm, không phải giao dịch đang diễn ra.
+
+## Người nhận và ghi chú được bảo vệ thế nào?
+
+Địa chỉ nhận cho phép người trả tạo đầu ra cho bạn. Ví dẫn xuất khóa đầu ra một lần thay vì đặt địa chỉ quen thuộc bên cạnh mỗi thanh toán trên chuỗi. Ví dùng thông tin xem riêng tư để nhận diện đầu ra đến. Bạn có thể dùng lại địa chỉ nhận trong khi thanh toán dùng khóa đầu ra riêng. [Hướng dẫn địa chỉ ẩn](/vi/blog/stealth-addresses-explained/) giải thích quan hệ này.
+
+[Tên Blocknet ID công khai](/vi/blog/blocknet-id-pay-by-name/) giúp tìm đích nhận dễ dàng. Ai đó có thể liên hệ tên đã đăng với bạn, nhưng thanh toán thông thường đến đó vẫn dùng cùng cách tạo đầu ra. Công bố tên nhận không công bố khóa xem riêng tư của ví.
+
+Bạn có thể đính kèm mã hóa đơn hoặc ghi chú ngắn. Ví mã hóa ghi chú bằng bí mật chung cho đầu ra đó. Trường ghi chú chiếm 128 byte, hỗ trợ tối đa 124 byte văn bản; nội dung ngắn hoặc rỗng được đệm ngẫu nhiên trước mã hóa. Kích thước cố định không thông báo độ dài ghi chú. Người gửi và nhận có thể biết nội dung; thông tin xác minh hoặc xem chủ động chia sẻ cũng có thể tiết lộ. [Hướng dẫn ghi chú](/vi/blog/blocknet-encrypted-memos/) trình bày cách viết và đọc.
+
+## Mạng kiểm tra số tiền ẩn bằng cách nào?
+
+Đầu ra thanh toán thường chứa cam kết Pedersen thay vì công bố số tiền đọc được. Qua cam kết và bằng chứng, nút kiểm tra giao dịch cân bằng, gồm cả phí công khai. Bằng chứng phạm vi Bulletproofs xác lập số tiền đầu ra nằm trong khoảng cho phép. Các kiểm tra cùng xác thực chuyển tiền mà không đưa số tiền thanh toán vào bản ghi công khai thông thường.
+
+Ví vẫn hiển thị số tiền nhận. [Hướng dẫn bằng chứng phạm vi](/vi/blog/bulletproofs-explained/) giải thích mật mã, còn [diễn giải giao dịch](/vi/blog/blocknet-transaction-explained/) theo dõi đầu vào đã chọn, đầu ra người nhận và tiền thừa. Tiền thừa dùng đầu ra mới thuộc ví gửi; riêng tư không bỏ nhu cầu tính phần đã chi và trả lại.
+
+Bản ghi công khai giữ mã băm, cấu trúc đầu vào và đầu ra, phí và trạng thái khối sau khi đưa vào. Thanh toán riêng tư vì thế vẫn xác minh được. Giải thích này nói về chi tiêu thông thường: giao dịch coinbase đặc biệt tạo thưởng khối không có đầu vào chi tiêu và theo quy tắc riêng. Phân biệt giúp “riêng tư mặc định” gắn với đúng hành vi được mô tả.
+
+## Điều gì xảy ra ngoài giao dịch công khai?
+
+[Dandelion++](/vi/blog/dandelion-plus-plus-explained/) xử lý chuyển tiếp mạng. Giao dịch mới đi qua đường thân trước khi phát rộng, giảm liên hệ trực tiếp giữa nguồn và các nút ngang hàng thông báo rộng rãi. Đây là lớp bổ sung bên cạnh mật mã giao dịch. Nó không hứa che địa chỉ IP trong mọi tình huống mạng.
+
+Các bên cũng có bản ghi. Người gửi biết đích và số tiền đã nhập; người nhận nhận diện khoản đến. Hóa đơn, trò chuyện hoặc ảnh màn hình chia sẻ có thể nối chi tiết với người hay đơn hàng. Thông tin bên ngoài đó khác với dữ liệu định dạng giao dịch công bố. [Hướng dẫn mức độ hiển thị thanh toán](/vi/blog/blocknet-payment-visibility/) so sánh truy cập công khai, người gửi, người nhận và quyền xem được cấp, gồm bằng chứng chủ động chia sẻ. Khi dùng làm tiền, tách rõ: mạng xác thực chuyển tiền, mỗi bên giữ chi tiết cần cho kế toán riêng.
+
+## Đề xuất nâng cấp Faraday sẽ thay đổi gì?
+
+[Giải thích chính thức ngày 27 tháng 10](https://blocknetcrypto.com/blog/2026-10-27-how-blocknet-privacy-survives-quantum-computers/) mô tả Faraday là thiết kế còn xây dựng và kiểm thử. Faraday sẽ thay bằng chứng chi hiện tại bằng chứng minh dựa trên hàm băm phủ toàn bộ tập coin Faraday. Tập tăng khi coin vào định dạng mới; không có nghĩa mọi đầu ra lịch sử đã nằm trong đó. Đề xuất Faraday dùng ML-KEM cho nhận và phát hiện thanh toán, công việc khác với chứng minh chi tiêu.
+
+[Hướng dẫn riêng tư Faraday](/vi/blog/blocknet-faraday-privacy/) giải thích các cơ chế dự kiến. Thiết kế và lịch có thể đổi; hành vi ví hiện tại nên căn cứ quy tắc đã phát hành đến khi nâng cấp tương ứng. Hiện nay riêng tư mặc định nghĩa là định dạng thường bảo vệ chi tiết nhạy cảm mà không chọn chế độ thêm. [Blocknet và tính thay thế](/vi/blog/blocknet-fungibility/) giải thích quan hệ với đơn vị hoán đổi được; các bước gửi vẫn ở [hướng dẫn thanh toán](/vi/blog/send-receive-blocknet/).
+
+<CTA target="seine" title="Đào Blocknet với seine" text="Dùng seine cùng bntpool.com để đào Blocknet và nhận thanh toán vào ví riêng của bạn." />

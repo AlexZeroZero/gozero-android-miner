@@ -1,0 +1,127 @@
+---
+title: 挖 Blocknet 用什么硬件最好
+description: "用实测结果比较 Blocknet 挖矿硬件：EPYC 9355P 使用默认设置达到 97.1 H/s。查看准确的 RAM、线程数和基准测试证据，了解各项结果的测量配置。"
+tags: [硬件, 算力, 挖矿指南, Argon2id, NVIDIA]
+faq:
+  - q: '游戏电脑能挖 Blocknet 吗？'
+    a: '可以。在 Windows 和 Linux 上，seine 会同时使用电脑的处理器和每张 NVIDIA 显卡挖矿，算力会叠加。它根据你的内存确定线程数，因此一台 32 GB 内存的游戏电脑最多能运行约 14 个线程，并在挖矿过程中自动为处理器和每张显卡调优。'
+  - q: '32 GB 内存能运行多少个 Blocknet 挖矿线程？'
+    a: '约 14 个。每个线程每次哈希都需要一块 2 GiB 的内存，所以 32 GB 理论上能容纳 16 块。seine 会预留 5% (默认最多 1 GiB) 的内存，并为操作系统留出空间，因此 32 GB 的机器约能运行 14 个线程。seine 启动时会自动算好这些。'
+  - q: 'seine 挖 Blocknet 时会使用哪些显卡？'
+    a: 'seine 通过 Windows 和 Linux 下载版使用 NVIDIA 显卡挖矿，并把检测到的每块显卡与处理器一起使用。你只需要 NVIDIA 驱动。首次启动会为每块显卡调优并记住结果。'
+  - q: '为什么内存带宽对挖 Blocknet 很重要？'
+    a: '每次 Blocknet 哈希都要写满一整块 2 GiB 的内存，并从其中各处读回数据，远远超出任何处理器缓存的容量。因此算力取决于内存系统搬运数据的速度。内存带宽更高、内存足够运行更多线程的机器挖得最快。'
+sourceHash: 9f6e4878e6b1
+translation: draft
+---
+
+本指南介绍哪些机器用 seine 挖 Blocknet 最快、你的内存能支持多少个线程，以及能达到多少算力，帮助你挑选硬件，或评估手上已有的电脑。
+
+[估算你的 BNT 奖励](https://bntpool.com/blog/zh-hans/estimate-blocknet-mining-rewards/#mining-calculator)
+
+## 挖 Blocknet 用什么硬件最好？
+
+<Answer>
+这些测量中最快的配置是达到 97.1 H/s 的 AMD EPYC 9355P：64 个挖矿线程、192 GiB RAM，在 Linux 上使用 seine 的默认设置。Blocknet 挖矿受益于内存带宽，以及足够为每个线程提供 2 GiB 的 RAM。NVIDIA 显卡可以在 CPU 之外叠加自身哈希率。
+</Answer>
+
+Blocknet 的工作量证明是 Argon2id，每次哈希使用一块 2 GiB 的内存。这让它成为[内存密集型](/zh-hans/blog/argon2id-proof-of-work-explained/)算法：算力既取决于核心数，也同样取决于内存带宽和延迟，以及内存中能同时容纳多少个 2 GiB 内存块。下表中排名靠前的机器，共同点就是强大的内存系统。
+
+## 新增物理服务器测量：EPYC 9355P
+
+2026年10月28日，一颗 32 核心／64 线程、配备 192 GiB RAM 的 EPYC 9355P 使用 seine 的默认设置挖矿 15 分钟：不加任何参数，线程数、CPU 计算内核和内存页均自动选择。挖矿速度为 **97.1 H/s**。
+
+## RTX 5090 在我们的测试中有多快？
+
+测量于2026年10月31日：仅使用 RTX 5090，原生 Windows 11、610.88 驱动和公开开发版本。稳定挖矿速率已扣除矿工软件费用，不包含 CPU 的工作量。
+
+| 模式 | 平均 H/s |
+|---|---|
+| 仅 RTX 5090 | 13.8 |
+
+## 云服务器与 Mac 实测比较
+
+这些云服务器和 Mac 结果采用下文所述的机器与设置。挖矿内存指各线程内存块占用的空间：线程数 × 2 GiB。
+
+| 硬件 | 具体芯片 | 线程数 | 算力 | 挖矿内存 |
+|---|---|---|---|---|
+| AMD EPYC · Zen 5 | EPYC 9R45 服务器 | 32 | 50.5 H/s | 64 GiB |
+| Arm 服务器 | AWS Graviton4 | 32 | 39.3 H/s | 64 GiB |
+| AMD EPYC · Zen 4 | EPYC 9R14 服务器 | 32 | 45.3 H/s | 64 GiB |
+| Apple M4 Max | 48 GB MacBook Pro | 16 | 30.9 H/s | 32 GiB |
+| Intel Xeon | Sapphire Rapids 8488C | 32 | 26.0 H/s | 64 GiB |
+
+EPYC 9R45 和 9R14 的云端结果使用32个线程及 transparent huge pages，测量的是不含启动的哈希计算时间。其他行保留各自的测量条件。
+
+所有已测处理器的结果及每一行的测试依据，见[性能页面](https://github.com/zpalmtree/seine/blob/master/docs/PERFORMANCE.md)。
+
+## 为什么内存带宽决定你的算力
+
+每次 Argon2id 哈希都会把整块 2 GiB 内存写满一遍，并在此过程中读回之前写入的部分。处理器的 L3 缓存以兆字节计：在这台 Zen 5 服务器上，每组八个核心共享 32 MiB，因此一次哈希要处理的内存是这块缓存的 64 倍。大部分工作都是内存读写。
+
+由此可以得出挑选硬件的三点：
+
+- **内存带宽与核心数同样重要。** 比较机器时，要像看重核心数一样看重内存系统。
+- **内存决定线程上限。** 每个线程都需要自己的 2 GiB 内存块，所以往往是内存先于核心数限制了线程数。
+- **同一颗芯片上，计算内核也很关键。** seine 会在挖矿时比较可用的 CPU 计算内核，并为你的机器选择合适的内核。
+
+## 每个挖矿线程需要多少内存？
+
+<Answer>
+每个挖矿线程约需 2 GB 内存，因为每次哈希都要写满属于它自己的一块 2 GiB 内存。用你的内存容量除以二，就是最多能放下的线程数，再为操作系统减去一点。seine 会替你算好，并预留 5% (默认最多 1 GiB) 的内存。
+</Answer>
+
+下面是常见内存容量的计算。“理论值”是内存 ÷ 2 GiB。最后一列减去了 seine 预留的 5% (默认最多 1 GiB) 和操作系统占用的约 2-3 GB，仅供粗略参考。4-12 GB 内存的笔记本电脑和旧电脑，请参阅[用旧电脑或笔记本电脑挖矿](/zh-hans/blog/mine-crypto-on-old-pc-or-laptop/)。
+
+| 内存 | 理论内存块数 | seine 大约能运行的线程数 |
+|---|---|---|
+| 16 GB | 8 | 6 |
+| 32 GB | 16 | 14 |
+| 64 GB | 32 | 30 |
+| 128 GB | 64 | 62 |
+
+seine 还会把线程数限制在处理器的逻辑核心数以内，所以实际上限取决于哪一项先用完。以一颗 16 核、32 个硬件线程的台式机处理器为例：配 32 GB 内存时约运行 14 个挖矿线程，配 64 GB 时约 30 个。要运行 32 个线程，光内存块就需要 64 GiB，还要留出余量，这就是 32 线程的 Zen 5 结果来自一台 128 GiB 机器的原因。
+
+如果你要为挖矿购买内存，请按想要的线程数来配：每个线程约 2 GB，再为系统加上几 GB。
+
+## 可以同时用 CPU 和 NVIDIA 显卡挖 Blocknet 吗？
+
+可以。在 Windows 和 Linux 上，seine 会同时使用每个 CPU 核心和检测到的每张 NVIDIA 显卡挖矿，算力会叠加。这无需任何参数，是默认行为。
+
+- **Windows：** 下载包已内置 CUDA 运行库，只需安装较新的 NVIDIA 驱动。
+- **Linux:** 有 NVIDIA 驱动就够了。
+- **首次启动：** seine 会为每张显卡调优计算内核参数并缓存结果，之后几秒内即可启动。
+
+在 [Apple 芯片的 Mac](/zh-hans/blog/mine-blocknet-on-mac/) 上，seine 默认使用 CPU 挖矿，这是在 M4 Max 上实测最快的方式。[NVIDIA 指南](/zh-hans/blog/mine-blocknet-nvidia-gpu/)介绍了多显卡矿机和相关要求。
+
+## seine 会自动调优哪些内容？
+
+日常挖矿时，运行 seine，粘贴地址或 `@name`，然后接受默认矿池 bntpool.com。[挖矿指南](/zh-hans/blog/how-to-mine-blocknet/)介绍了这些步骤。上方手动 EPYC 测量有其专用设置；自动挖矿则执行以下操作：
+
+- **确定线程数**：根据你的内存和核心数确定，然后用真实的挖矿任务比较不同线程数，保留最佳值。
+- **选择 CPU 计算内核**：例如 AVX2、AVX-512、Zen 5 EPYC 上的流式内核或 Arm 上的 SHA3，只有在两次确认有提升后才会切换。
+- **在大型服务器上分配线程**：在 Linux 上，它会把线程分散到各个 NUMA 节点和 L3 缓存组，在一台租用的 EPYC 8434P 上 24 线程时提升了 16.7%。详情见[服务器挖矿指南](/zh-hans/blog/mine-blocknet-on-servers/)。
+- **保护你的内存**：它会预留 5% (默认最多 1 GiB) 的内存，内存紧张时暂停部分线程，内存充裕后再恢复。
+- **记住有效的设置**：下次启动时直接从调优后的设置开始。
+
+这些都不会重新连接矿池，因此调优不会浪费挖矿时间。[自动调优指南](https://github.com/zpalmtree/seine/blob/master/docs/guides/autotuning.md)解释了每个步骤。
+
+在 Linux 和 WSL 上，还有一项值得做的可选设置：预留大页。在验证机上，2 MiB 大页带来约 4-6% 的提升，1 GiB 大页再多约 2%。[大页指南](/zh-hans/blog/huge-pages-blocknet-mining/)提供了相关命令，[大型服务器指南](https://github.com/zpalmtree/seine/blob/master/docs/guides/large-servers.md)介绍了 EPYC 和 Xeon 机器的设置。
+
+## 如何查看自己的算力？
+
+最快的方法是[下载 seine](/zh-hans/#download) 并开始挖矿：仪表盘片刻之后就会显示你的算力，你也可以在 [bntpool.com](https://bntpool.com) 上查询自己的地址，查看矿池记录的数据。读取数字之前，请给调优留出一点时间。
+
+如果想在不连接矿池的情况下测试处理器，可以运行 seine 的离线基准测试：
+
+```sh
+./seine --bench --bench-kind backend --backend cpu --bench-secs 20 --bench-rounds 3
+```
+
+它报告的是每秒完成的哈希数，与上表使用的指标相同，因此你可以把自己的机器与[公布的结果](/zh-hans/#performance)进行比较。
+
+<Note>
+这些结果针对 Blocknet 当前的 Argon2id 工作量证明。据 [blocknetcrypto.com](https://blocknetcrypto.com/#faraday) 介绍，Blocknet 计划在 2027-02-16 前后进行名为 Faraday 的网络升级，届时将采用更轻量的工作量证明。请保持 seine 为最新版本：它会在启动时以及每 12 小时检查一次新版本。
+</Note>
+
+<CTA target="seine" title="看看你的机器能挖多少" text="seine 在挖矿时根据你的硬件自动调优。下载它，看看你的算力。" />

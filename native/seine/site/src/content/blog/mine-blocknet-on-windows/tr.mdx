@@ -1,0 +1,82 @@
+---
+title: Windows’ta Blocknet madenciliği nasıl yapılır?
+description: 'Windows’ta seine ile Blocknet kazın. ZIP’i seçin, dosyaları çıkarın, adresinizi girin ve CPU ile NVIDIA birlikte çalışırken kabul edilen payları kontrol edin.'
+tags: [Madencilik rehberi, Windows, NVIDIA]
+faq:
+  - q: 'Windows’ta Blocknet madenciliği için CUDA Toolkit gerekli mi?'
+    a: 'Hayır. Windows sürümünün ZIP dosyası, seine için gereken NVIDIA çalışma zamanı kütüphanelerini içerir. Güncel bir NVIDIA sürücüsü yükleyin ve çıkardığınız dosyaları bir arada tutun. seine, desteklenen NVIDIA kartlarını CPU ile birlikte algılar ve otomatik olarak ayarlar. CPU madenciliği, NVIDIA kartı bulunmayan makinelerde de çalışır.'
+  - q: 'seine Windows madencilik ayarlarımı nereye kaydeder?'
+    a: 'seine varsayılan olarak ödeme adresini, havuzu ve rig adını, programı başlattığınız klasörün altındaki seine-data/seine.config.json dosyasına kaydeder. Bu ayarları yeniden kullanmak için aynı çıkarılmış klasörden çalıştırın. Gerektiğinde data-dir seçeneğiyle farklı bir dizin seçebilirsiniz.'
+  - q: 'Madenciliğe başlamadan önce Windows büyük bellek sayfaları gerekli mi?'
+    a: 'Hayır. seine büyük sayfaları otomatik olarak dener ve bunlar kullanılamıyorsa normal sayfaları kullanır. Varsayılan ayarlarla madenciliğe başlayabilirsiniz. İsteğe bağlı büyük sayfa kurulumu için madencilik hesabınıza Bellekteki sayfaları kilitle hakkını verin, ardından seine’ı yeniden başlatmadan önce oturumu kapatıp tekrar açın.'
+sourceHash: 1878d05f199d
+translation: draft
+---
+
+Bu rehber, Windows ZIP dosyasını indirmekten bntpool.com üzerinde kabul edilen paylara kadar size yol gösterir. Dosyaları çıkaracak, ödeme adresinizi girecek ve CPU’nuz ile desteklenen NVIDIA kartlarınızın madencilik yaptığını doğrulayacaksınız. Aşağıdaki komutlar PowerShell ve doğrudan Windows ortamını kullanır.
+
+## Windows’ta Blocknet madenciliğine nasıl başlanır?
+
+<Answer>
+`seine-windows-x86_64.zip` dosyasını indirin, arşivin tamamını çıkarın ve `seine.exe` dosyasını açın. Blocknet adresinizi veya kayıtlı `@name` adınızı girin, ardından havuz olarak `stratum+tcp://bntpool.com:3333` adresini kabul edin. seine, kullanılabilir CPU ve NVIDIA arka uçlarını seçer, iş parçacığı sayısını belleğe göre belirler ve madencilik sırasında ayarlamaya başlar.
+</Answer>
+
+Madenciyi açmadan önce herkese açık ödeme adresinizi hazır bulundurun. [Cüzdan rehberi](/tr/blog/blocknet-wallet-for-mining/) bu adresi nasıl edineceğinizi açıklar. Yalnızca alıcı adresini girin: madenci, cüzdanınızın kurtarma ifadesine veya harcama anahtarlarına ihtiyaç duymaz. Kayıtlı bir [Blocknet ID](/tr/blog/blocknet-id-pay-by-name/) de kullanılabilir; böylece uzun adres yerine `@name` yazabilirsiniz.
+
+## 1. adım: doğru sürümü indirin
+
+[İndirme bölümünü](/tr/#download) açın ve Windows x86_64 seçeneğini seçin. Arşivin adı `seine-windows-x86_64.zip` şeklindedir.
+
+![seine’ın resmi indirme tablosundaki Windows ZIP dosyası](/assets/blog/setup-download.webp)
+
+## 2. adım: çıkarın ve başlatın
+
+Dosya Gezgini’nde indirdiğiniz ZIP’e sağ tıklayın ve **Tümünü Ayıkla** seçeneğini seçin. Yazma izniniz olan bir klasör seçin, ardından çıkarılan klasörü açın. `seine.exe` ve beraberindeki DLL’leri bir arada tutun: Windows arşivi, madencinin kullandığı NVIDIA çalışma zamanı kütüphanelerini içerir.
+
+Çıkarılan klasördeki `seine.exe` dosyasına çift tıklayın. Terminal kullanmayı tercih ediyorsanız bu klasörde PowerShell’i açıp şu komutu çalıştırın:
+
+```powershell
+.\seine.exe
+```
+
+## 3. adım: cüzdan adresinizi girin
+
+Herkese açık Blocknet alma adresinizi veya kayıtlı `@name` adınızı yapıştırın, ardından `stratum+tcp://bntpool.com:3333` adresini kabul etmek için Enter’a basın. [Cüzdan rehberi](/tr/blog/blocknet-wallet-for-mining/) adresinizi nerede bulacağınızı gösterir. Seine, kurtarma ifadenizi veya harcama anahtarlarınızı istemez. Havuz işçisi adını otomatik atar.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="İlk açılıştaki adres ve havuz soruları. Örneği kendi adresiniz veya kayıtlı adınızla değiştirin." loading="lazy" />
+  </picture>
+  <figcaption>İlk açılıştaki adres ve havuz soruları. Örneği kendi adresiniz veya kayıtlı adınızla değiştirin.</figcaption>
+</figure>
+
+Seine iş parçacıklarını seçer ve otomatik ayar yapar. Sonraki açılışlarda `seine-data/seine.config.json` dosyasını yeniden kullanmak için aynı klasörden başlatın.
+
+## 4. adım: kabul edilen payları kontrol edin
+
+<Answer>
+seine panelinde bir hash gücü ve kabul edilen paylar göründüğünü kontrol edin, ardından bntpool.com üzerindeki My Stats sayfasında aynı ödeme adresini arayın. Panel, madencinin o anki çalışmasını gösterir; havuz ise gönderilen payları ve ödülleri kaydeder. Hızları karşılaştırmadan veya ayarları değiştirmeden önce otomatik ayarlamanın dengelenmesini bekleyin.
+</Answer>
+
+[Panel rehberi](/tr/blog/seine-dashboard-explained/), hash gücünü, madencilik durumunu ve havuz panellerini açıklar. Etkin bir hash gücü, yerel hash hesaplama faaliyeti olduğunu gösterir; kabul edilen bir pay, çalışmanın havuza ulaştığını doğrular. Bu rig’in paylarını ve bakiyesini takip etmek için [My Stats](https://bntpool.com/stats?lang=tr) sayfasını açın ve aynı adresi veya kısa adı girin.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="Örnek verilerle seine’ın gerçek paneli. Accepted sayacına bakın; bu sayılar performans ölçümü değildir." loading="lazy" />
+  </picture>
+  <figcaption>Örnek verilerle seine’ın gerçek paneli. Accepted sayacına bakın; bu sayılar performans ölçümü değildir.</figcaption>
+</figure>
+
+## Aynı bilgisayarda CPU ve NVIDIA madenciliği
+
+seine varsayılan olarak CPU’yu ve desteklenen NVIDIA kartlarını birlikte kullanır. Güncel bir NVIDIA sürücüsü yükleyin; Windows ZIP’i çalışma zamanı kütüphanelerini zaten içerdiği için CUDA Toolkit’i ayrıca yüklemeniz gerekmez. Madencinin klasörünü taşırken çıkarılmış DLL’leri çalıştırılabilir dosyanın yanında tutun.
+
+İlk başlatmada seine her GPU’yu ayarlar ve ayarlarını hatırlar. CPU ayarlaması da madencilik sırasında devam eder. [Donanım rehberi](/tr/blog/blocknet-mining-hardware-hashrate/), bellek boyutlandırmasını ve ölçülen sonuçları açıklar; [NVIDIA rehberi](https://github.com/zpalmtree/seine/blob/master/docs/guides/nvidia.md) ise birden fazla kartı ele alır. Düzgün biçimde durdurmak için panelde `q` veya terminalde `Ctrl+C` tuşlarına basın.
+
+<MinerSettings os="windows" />
+
+<CTA target="seine" title="Windows için seine’ı indirin" text="ZIP’i çıkarın, ödeme adresinizi girin ve otomatik CPU ve NVIDIA ayarlamasıyla bntpool.com üzerinde madenciliğe başlayın." />
+
+[İstatistiklerim](https://bntpool.com/stats?lang=tr) sayfasını açıp aynı adresi veya kayıtlı adı girerek işçinizi, paylarınızı ve bakiyenizi bulun.

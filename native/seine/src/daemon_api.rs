@@ -1,0 +1,817 @@
+use std::fmt;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, bail, Context, Result};
+use reqwest::blocking::{Client, RequestBuilder, Response};
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::types::{BlockTemplateResponse, SubmitBlockResponse};
+
+#[derive(Debug, Serialize)]
+struct CompactSubmitPayload<'a> {
+    template_id: &'a str,
+    nonce: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct WalletLoadPayload<'a> {
+    password: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WalletBalanceResponse {
+    pub spendable: u64,
+    pub pending: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WalletAddressResponse {
+    pub address: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BlockSummaryResponse {
+    pub timestamp: i64,
+}
+
+#[derive(Debug)]
+pub struct ApiStatusError {
+    endpoint: String,
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiStatusError {
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for ApiStatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} failed ({}): {}",
+            self.endpoint, self.status, self.message
+        )
+    }
+}
+
+impl std::error::Error for ApiStatusError {}
+
+#[derive(Clone)]
+pub struct ApiClient {
+    json_client: Client,
+    stream_client: Client,
+    base_url: String,
+    token: Arc<RwLock<String>>,
+}
+
+impl ApiClient {
+    pub fn new(
+        base_url: String,
+        token: String,
+        timeout: Duration,
+        events_stream_timeout: Duration,
+        events_idle_timeout: Duration,
+    ) -> Result<Self> {
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            bail!("API token is empty");
+        }
+
+        let json_client = Client::builder()
+            .timeout(timeout)
+            .build()
+            .context("failed to build HTTP JSON client")?;
+
+        // Dedicated SSE client with bounded stream session lifetime to guarantee reconnect/liveness.
+        let stream_client = Client::builder()
+            .connect_timeout(events_stream_timeout)
+            .timeout(events_idle_timeout)
+            .build()
+            .context("failed to build HTTP stream client")?;
+
+        Ok(Self {
+            json_client,
+            stream_client,
+            base_url,
+            token: Arc::new(RwLock::new(token)),
+        })
+    }
+
+    pub fn replace_token(&self, token: String) -> Result<bool> {
+        let trimmed = token.trim().to_string();
+        if trimmed.is_empty() {
+            bail!("replacement API token is empty");
+        }
+
+        let mut current = self
+            .token
+            .write()
+            .map_err(|_| anyhow!("API token lock poisoned"))?;
+        if *current == trimmed {
+            return Ok(false);
+        }
+        *current = trimmed;
+        Ok(true)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_block_template(&self, address: Option<&str>) -> Result<BlockTemplateResponse> {
+        let started_at = Instant::now();
+        let url = blocktemplate_url(&self.base_url, address);
+        let resp = self
+            .with_auth(self.json_client.get(url))?
+            .send()
+            .context("request to blocktemplate endpoint failed")?;
+
+        let template = decode_json_response(resp, "blocktemplate");
+        record_template_fetch(&template, started_at);
+        template
+    }
+
+    pub fn get_block_template_with_timeout(
+        &self,
+        timeout: Duration,
+        address: Option<&str>,
+    ) -> Result<BlockTemplateResponse> {
+        let started_at = Instant::now();
+        let timeout = timeout.max(Duration::from_millis(1));
+        let url = blocktemplate_url(&self.base_url, address);
+        let resp = self
+            .with_auth(self.json_client.get(url).timeout(timeout))?
+            .send()
+            .context("request to blocktemplate endpoint failed")?;
+
+        let template = decode_json_response(resp, "blocktemplate");
+        record_template_fetch(&template, started_at);
+        template
+    }
+
+    pub fn submit_block<T: Serialize>(
+        &self,
+        block: &T,
+        template_id: Option<&str>,
+        nonce: u64,
+        request_id: u64,
+    ) -> Result<SubmitBlockResponse> {
+        let url = format!("{}/api/mining/submitblock", self.base_url);
+        let request = self
+            .with_auth(self.json_client.post(url))?
+            .header("x-request-id", format!("seine-submit-{request_id}"));
+        let request = if let Some(template_id) = template_id {
+            request.json(&CompactSubmitPayload { template_id, nonce })
+        } else {
+            request.json(block)
+        };
+        let started_at = Instant::now();
+        let resp = request
+            .send()
+            .context("request to submitblock endpoint failed")?;
+
+        let response = decode_json_response(resp, "submitblock");
+        crate::miner::block_latency::record(
+            crate::miner::block_latency::SOLO_SUBMIT_RTT,
+            started_at.elapsed(),
+        );
+        response
+    }
+
+    pub fn load_wallet(&self, password: &str) -> Result<()> {
+        let url = format!("{}/api/wallet/load", self.base_url);
+        let payload = WalletLoadPayload { password };
+        let resp = self
+            .with_auth(self.json_client.post(url))?
+            .json(&payload)
+            .send()
+            .context("request to wallet/load endpoint failed")?;
+
+        let _: Value = decode_json_response(resp, "wallet/load")?;
+        Ok(())
+    }
+
+    pub fn get_wallet_balance(&self) -> Result<WalletBalanceResponse> {
+        let url = format!("{}/api/wallet/balance", self.base_url);
+        let resp = self
+            .with_auth(self.json_client.get(url))?
+            .send()
+            .context("request to wallet/balance endpoint failed")?;
+
+        decode_json_response(resp, "wallet/balance")
+    }
+
+    pub fn get_wallet_address(&self) -> Result<WalletAddressResponse> {
+        let url = format!("{}/api/wallet/address", self.base_url);
+        let resp = self
+            .with_auth(self.json_client.get(url))?
+            .send()
+            .context("request to wallet/address endpoint failed")?;
+
+        decode_json_response(resp, "wallet/address")
+    }
+
+    pub fn get_block_by_height(&self, height: u64) -> Result<BlockSummaryResponse> {
+        let url = format!("{}/api/block/{height}", self.base_url);
+        let resp = self
+            .with_auth(self.json_client.get(url))?
+            .send()
+            .context("request to block endpoint failed")?;
+
+        decode_json_response(resp, "block")
+    }
+
+    pub fn get_block_by_height_optional(
+        &self,
+        height: u64,
+    ) -> Result<Option<BlockSummaryResponse>> {
+        match self.get_block_by_height(height) {
+            Ok(block) => Ok(Some(block)),
+            Err(err) => {
+                if let Some(api_err) = err.downcast_ref::<ApiStatusError>() {
+                    if api_err.endpoint() == "block" && api_err.status() == StatusCode::NOT_FOUND {
+                        return Ok(None);
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
+    pub fn open_events_stream(&self) -> Result<Response> {
+        let url = format!("{}/api/events", self.base_url);
+        let resp = self
+            .with_auth(self.stream_client.get(url))?
+            .send()
+            .context("request to events endpoint failed")?;
+
+        if resp.status().is_success() {
+            Ok(resp)
+        } else {
+            Err(status_error_from_response(resp, "events"))
+        }
+    }
+
+    fn with_auth(&self, request: RequestBuilder) -> Result<RequestBuilder> {
+        let token = self
+            .token
+            .read()
+            .map_err(|_| anyhow!("API token lock poisoned"))?;
+        Ok(request.bearer_auth(&*token))
+    }
+}
+
+fn blocktemplate_url(base_url: &str, address: Option<&str>) -> String {
+    match address {
+        Some(addr) => format!("{base_url}/api/mining/blocktemplate?address={addr}"),
+        None => format!("{base_url}/api/mining/blocktemplate"),
+    }
+}
+
+pub fn is_no_wallet_loaded_error(err: &anyhow::Error) -> bool {
+    let Some(api_err) = err.downcast_ref::<ApiStatusError>() else {
+        return false;
+    };
+    api_err.status() == StatusCode::SERVICE_UNAVAILABLE
+        && api_err.message().trim() == "no wallet loaded"
+}
+
+pub fn is_wallet_already_loaded_error(err: &anyhow::Error) -> bool {
+    let Some(api_err) = err.downcast_ref::<ApiStatusError>() else {
+        return false;
+    };
+    api_err.endpoint() == "wallet/load"
+        && api_err.status() == StatusCode::CONFLICT
+        && api_err.message().trim() == "wallet already loaded"
+}
+
+pub fn is_wallet_wrong_password_error(err: &anyhow::Error) -> bool {
+    let Some(api_err) = err.downcast_ref::<ApiStatusError>() else {
+        return false;
+    };
+    api_err.endpoint() == "wallet/load" && is_wallet_wrong_password_message(api_err.message())
+}
+
+pub fn is_unauthorized_error(err: &anyhow::Error) -> bool {
+    let Some(api_err) = err.downcast_ref::<ApiStatusError>() else {
+        return false;
+    };
+    api_err.status() == StatusCode::UNAUTHORIZED
+}
+
+pub fn is_invalid_blocktemplate_address_error(err: &anyhow::Error) -> bool {
+    let Some(api_err) = err.downcast_ref::<ApiStatusError>() else {
+        return false;
+    };
+    api_err.endpoint() == "blocktemplate"
+        && api_err.status() == StatusCode::BAD_REQUEST
+        && api_err
+            .message()
+            .to_ascii_lowercase()
+            .contains("invalid address")
+}
+
+pub fn is_unknown_or_expired_template_error(err: &anyhow::Error) -> bool {
+    let Some(api_err) = err.downcast_ref::<ApiStatusError>() else {
+        return false;
+    };
+    let status = api_err.status();
+    api_err.endpoint() == "submitblock"
+        && (status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND)
+        && {
+            let message = api_err.message().trim().to_ascii_lowercase();
+            message.contains("unknown or expired template_id")
+                || message.contains("mining_template_expired")
+        }
+}
+
+pub fn is_retryable_api_error(err: &anyhow::Error) -> bool {
+    if let Some(api_err) = err.downcast_ref::<ApiStatusError>() {
+        let status = api_err.status();
+        return status == StatusCode::REQUEST_TIMEOUT
+            || status == StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error();
+    }
+
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|req_err| {
+                req_err.is_timeout() || req_err.is_connect() || req_err.is_request()
+            })
+    })
+}
+
+pub fn is_timeout_api_error(err: &anyhow::Error) -> bool {
+    if let Some(api_err) = err.downcast_ref::<ApiStatusError>() {
+        return api_err.status() == StatusCode::REQUEST_TIMEOUT;
+    }
+
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+    })
+}
+
+fn decode_json_response<T: serde::de::DeserializeOwned>(
+    resp: Response,
+    endpoint: &str,
+) -> Result<T> {
+    if resp.status().is_success() {
+        return resp
+            .json::<T>()
+            .with_context(|| format!("failed to decode {endpoint} response JSON"));
+    }
+
+    Err(status_error_from_response(resp, endpoint))
+}
+
+fn status_error_from_response(resp: Response, endpoint: &str) -> anyhow::Error {
+    let status = resp.status();
+    let body = resp.text().unwrap_or_default();
+    let message = parse_error_message(body);
+
+    anyhow!(ApiStatusError {
+        endpoint: endpoint.to_string(),
+        status,
+        message,
+    })
+}
+
+fn parse_error_message(body: String) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(&body) {
+        return value
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or(body);
+    }
+    body
+}
+
+fn is_wallet_wrong_password_message(message: &str) -> bool {
+    let message = message.trim().to_ascii_lowercase();
+    message.contains("wrong password")
+        || message.contains("incorrect password")
+        || message.contains("invalid password")
+        || message.contains("failed to decrypt wallet")
+        || message.contains("could not decrypt wallet")
+        || message.contains("message authentication failed")
+}
+
+fn record_template_fetch(template: &Result<BlockTemplateResponse>, started_at: Instant) {
+    if template.is_ok() {
+        crate::miner::block_latency::record(
+            crate::miner::block_latency::SOLO_TEMPLATE_FETCH,
+            started_at.elapsed(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::prelude::*;
+    use serde_json::json;
+
+    fn test_client(server: &MockServer) -> ApiClient {
+        let base = server.url("").trim_end_matches('/').to_string();
+        ApiClient::new(
+            base,
+            "testtoken".to_string(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .expect("test client should be created")
+    }
+
+    #[test]
+    fn get_block_template_success() {
+        let server = MockServer::start();
+        let expected_target =
+            "000000000000f424000000000000000000000000000000000000000000000000".to_string();
+        let expected_header = "11".repeat(92);
+
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/mining/blocktemplate")
+                .header("authorization", "Bearer testtoken");
+            then.status(200).json_body(json!({
+                "block": {"header": {"height": 123, "difficulty": 999, "nonce": 0}},
+                "target": expected_target,
+                "header_base": expected_header,
+                "template_id": "tmpl-lease",
+                "template_expires_at_unix_ms": 1_750_000_600_000_i64
+            }));
+        });
+
+        let client = test_client(&server);
+        let resp = client
+            .get_block_template(None)
+            .expect("block template request should succeed");
+        assert_eq!(resp.target.len(), 64);
+        assert_eq!(resp.header_base.len(), 184);
+        assert_eq!(resp.template_id.as_deref(), Some("tmpl-lease"));
+        assert_eq!(
+            resp.template_expires_at_unix_ms,
+            Some(1_750_000_600_000_i64)
+        );
+        mock.assert();
+    }
+
+    #[test]
+    fn submit_block_surfaces_json_error() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/mining/submitblock")
+                .header("authorization", "Bearer testtoken");
+            then.status(400).json_body(json!({"error": "invalid_pow"}));
+        });
+
+        let client = test_client(&server);
+        let err = client
+            .submit_block(&json!({"header": {"nonce": 1}}), None, 1, 1)
+            .expect_err("submit should fail");
+        assert!(format!("{err:#}").contains("invalid_pow"));
+        mock.assert();
+    }
+
+    #[test]
+    fn submit_block_compact_payload() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/mining/submitblock")
+                .header("authorization", "Bearer testtoken")
+                .json_body(json!({"template_id": "tmpl-1", "nonce": 7}));
+            then.status(200).json_body(json!({
+                "accepted": true,
+                "hash": "abcd",
+                "height": 1
+            }));
+        });
+
+        let client = test_client(&server);
+        let resp = client
+            .submit_block(&json!({"header": {"nonce": 999}}), Some("tmpl-1"), 7, 1)
+            .expect("compact submit should succeed");
+        assert!(resp.accepted);
+        mock.assert();
+    }
+
+    #[test]
+    fn no_wallet_loaded_error_is_classified() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/mining/blocktemplate")
+                .header("authorization", "Bearer testtoken");
+            then.status(503)
+                .json_body(json!({"error": "no wallet loaded"}));
+        });
+
+        let client = test_client(&server);
+        let err = client
+            .get_block_template(None)
+            .expect_err("blocktemplate request should fail");
+        assert!(is_no_wallet_loaded_error(&err));
+        mock.assert();
+    }
+
+    #[test]
+    fn wallet_address_no_wallet_loaded_error_is_classified() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/wallet/address")
+                .header("authorization", "Bearer testtoken");
+            then.status(503)
+                .json_body(json!({"error": "no wallet loaded"}));
+        });
+
+        let client = test_client(&server);
+        let err = client
+            .get_wallet_address()
+            .expect_err("wallet address request should fail");
+        assert!(is_no_wallet_loaded_error(&err));
+        mock.assert();
+    }
+
+    #[test]
+    fn wallet_already_loaded_error_is_classified() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/wallet/load")
+                .header("authorization", "Bearer testtoken");
+            then.status(409)
+                .json_body(json!({"error": "wallet already loaded"}));
+        });
+
+        let client = test_client(&server);
+        let err = client
+            .load_wallet("secret")
+            .expect_err("wallet load should fail");
+        assert!(is_wallet_already_loaded_error(&err));
+        mock.assert();
+    }
+
+    #[test]
+    fn wallet_wrong_password_error_is_classified() {
+        let err = anyhow!(ApiStatusError {
+            endpoint: "wallet/load".to_string(),
+            status: StatusCode::BAD_REQUEST,
+            message: "wrong password".to_string(),
+        });
+        assert!(is_wallet_wrong_password_error(&err));
+    }
+
+    #[test]
+    fn wallet_wrong_password_error_is_classified_from_decrypt_failure_message() {
+        let err = anyhow!(ApiStatusError {
+            endpoint: "wallet/load".to_string(),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message:
+                "failed to decrypt wallet (wrong password?): cipher: message authentication failed"
+                    .to_string(),
+        });
+        assert!(is_wallet_wrong_password_error(&err));
+    }
+
+    #[test]
+    fn wallet_wrong_password_error_rejects_non_password_failures() {
+        let wrong_endpoint = anyhow!(ApiStatusError {
+            endpoint: "submitblock".to_string(),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "wrong password".to_string(),
+        });
+        assert!(!is_wallet_wrong_password_error(&wrong_endpoint));
+
+        let wrong_message = anyhow!(ApiStatusError {
+            endpoint: "wallet/load".to_string(),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "database unavailable".to_string(),
+        });
+        assert!(!is_wallet_wrong_password_error(&wrong_message));
+    }
+
+    #[test]
+    fn load_wallet_success() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/wallet/load")
+                .header("authorization", "Bearer testtoken")
+                .json_body(json!({"password": "secret"}));
+            then.status(200).json_body(json!({"loaded": true}));
+        });
+
+        let client = test_client(&server);
+        client
+            .load_wallet("secret")
+            .expect("wallet load should succeed");
+        mock.assert();
+    }
+
+    #[test]
+    fn get_wallet_balance_success() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/wallet/balance")
+                .header("authorization", "Bearer testtoken");
+            then.status(200).json_body(json!({
+                "spendable": 1250000000u64,
+                "pending": 72325093035u64
+            }));
+        });
+
+        let client = test_client(&server);
+        let resp = client
+            .get_wallet_balance()
+            .expect("wallet balance request should succeed");
+        assert_eq!(resp.spendable, 1_250_000_000);
+        assert_eq!(resp.pending, 72_325_093_035);
+        mock.assert();
+    }
+
+    #[test]
+    fn get_wallet_address_success() {
+        let server = MockServer::start();
+        let expected = "B7YG69LBa6UM6wA8hYhYqNw2Toj7yMV8zQxC4Lcpj6v6QABz8c5VhM2r8K4dRrTfW9XQW3YfT4bQ5d4jG7Y9WWf3WvQ4k1";
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/wallet/address")
+                .header("authorization", "Bearer testtoken");
+            then.status(200).json_body(json!({
+                "address": expected,
+                "view_only": false
+            }));
+        });
+
+        let client = test_client(&server);
+        let resp = client
+            .get_wallet_address()
+            .expect("wallet address request should succeed");
+        assert_eq!(resp.address, expected);
+        mock.assert();
+    }
+
+    #[test]
+    fn get_block_by_height_success() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/block/42")
+                .header("authorization", "Bearer testtoken");
+            then.status(200).json_body(json!({
+                "height": 42,
+                "timestamp": 1_771_207_118i64,
+                "difficulty": 6000u64
+            }));
+        });
+
+        let client = test_client(&server);
+        let block = client
+            .get_block_by_height(42)
+            .expect("block request should succeed");
+        assert_eq!(block.timestamp, 1_771_207_118);
+        mock.assert();
+    }
+
+    #[test]
+    fn get_block_by_height_optional_returns_none_on_not_found() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/block/9")
+                .header("authorization", "Bearer testtoken");
+            then.status(404)
+                .json_body(json!({"error": "block not found"}));
+        });
+
+        let client = test_client(&server);
+        let block = client
+            .get_block_by_height_optional(9)
+            .expect("optional block request should succeed");
+        assert!(block.is_none());
+        mock.assert();
+    }
+
+    #[test]
+    fn retryable_api_error_classifies_retryable_status_codes() {
+        let retryable_statuses = [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+        ];
+        for status in retryable_statuses {
+            let err = anyhow!(ApiStatusError {
+                endpoint: "submitblock".to_string(),
+                status,
+                message: "retry".to_string(),
+            });
+            assert!(
+                is_retryable_api_error(&err),
+                "status {status} should be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn retryable_api_error_rejects_non_retryable_status_codes() {
+        let err = anyhow!(ApiStatusError {
+            endpoint: "submitblock".to_string(),
+            status: StatusCode::BAD_REQUEST,
+            message: "bad nonce".to_string(),
+        });
+        assert!(!is_retryable_api_error(&err));
+    }
+
+    #[test]
+    fn timeout_api_error_classifies_request_timeout_status() {
+        let err = anyhow!(ApiStatusError {
+            endpoint: "wallet/load".to_string(),
+            status: StatusCode::REQUEST_TIMEOUT,
+            message: "timeout".to_string(),
+        });
+        assert!(is_timeout_api_error(&err));
+    }
+
+    #[test]
+    fn timeout_api_error_rejects_non_timeout_status() {
+        let err = anyhow!(ApiStatusError {
+            endpoint: "wallet/load".to_string(),
+            status: StatusCode::BAD_GATEWAY,
+            message: "backend down".to_string(),
+        });
+        assert!(!is_timeout_api_error(&err));
+    }
+
+    #[test]
+    fn invalid_blocktemplate_address_error_is_classified() {
+        let err = anyhow!(ApiStatusError {
+            endpoint: "blocktemplate".to_string(),
+            status: StatusCode::BAD_REQUEST,
+            message: "invalid address".to_string(),
+        });
+        assert!(is_invalid_blocktemplate_address_error(&err));
+    }
+
+    #[test]
+    fn invalid_blocktemplate_address_error_rejects_other_failures() {
+        let wrong_status = anyhow!(ApiStatusError {
+            endpoint: "blocktemplate".to_string(),
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "invalid address".to_string(),
+        });
+        assert!(!is_invalid_blocktemplate_address_error(&wrong_status));
+
+        let wrong_message = anyhow!(ApiStatusError {
+            endpoint: "blocktemplate".to_string(),
+            status: StatusCode::BAD_REQUEST,
+            message: "bad request".to_string(),
+        });
+        assert!(!is_invalid_blocktemplate_address_error(&wrong_message));
+    }
+
+    #[test]
+    fn unknown_or_expired_template_error_is_classified() {
+        let legacy = anyhow!(ApiStatusError {
+            endpoint: "submitblock".to_string(),
+            status: StatusCode::BAD_REQUEST,
+            message: "unknown or expired template_id".to_string(),
+        });
+        assert!(is_unknown_or_expired_template_error(&legacy));
+
+        let coded = anyhow!(ApiStatusError {
+            endpoint: "submitblock".to_string(),
+            status: StatusCode::NOT_FOUND,
+            message: "mining_template_expired".to_string(),
+        });
+        assert!(is_unknown_or_expired_template_error(&coded));
+
+        let wrong_endpoint = anyhow!(ApiStatusError {
+            endpoint: "blocktemplate".to_string(),
+            status: StatusCode::BAD_REQUEST,
+            message: "unknown or expired template_id".to_string(),
+        });
+        assert!(!is_unknown_or_expired_template_error(&wrong_endpoint));
+    }
+}

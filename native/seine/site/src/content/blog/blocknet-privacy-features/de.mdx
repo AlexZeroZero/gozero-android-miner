@@ -1,0 +1,62 @@
+---
+title: 'Wie Blocknet gewöhnliche Zahlungen standardmäßig schützt'
+description: 'Erfahre, wie Blocknet Zahlungen mit Ringsignaturen, einmaligen Schlüsseln, verborgenen Beträgen und verschlüsselten Memos schützt und was Faraday plant.'
+tags: ['Blocknet', 'Privatsphäre', 'Zahlungen']
+faq:
+  - q: 'Ist Datenschutz beim Bezahlen mit Blocknet automatisch aktiv?'
+    a: 'Ja. Die veröffentlichte Wallet erstellt gewöhnliche Zahlungen mit Ringsignaturen, einmaligen Output-Schlüsseln, verborgenen Beträgen und verschlüsselten Memos. Du wählst keinen gesonderten privaten Zahlungsmodus. Die öffentliche Struktur bleibt bestehen, und Sender und Empfänger kennen ihre eigenen Zahlungsdaten. Das beschreibt normale Ausgaben; die Erzeugung von Blockbelohnungen folgt eigenen Transaktionsregeln.'
+  - q: 'Warum hat ein Blocknet-Input 16 Ringmitglieder?'
+    a: 'Ein normaler Input verwendet einen echten Output und 15 Köder aus der Blockchain. Die Ringsignatur beweist die Berechtigung, ohne das echte Mitglied zu nennen. Der Konsens legt die Ringgröße auf 16 fest; Nutzer wählen keine unterschiedlichen Größen pro Zahlung. Köder steuern kein Geld ihrer Eigentümer bei, und Schlüsselbilder helfen, wiederholtes Ausgeben zu erkennen.'
+  - q: 'Ersetzt Faraday bereits das heutige Datenschutzsystem?'
+    a: 'Nein. Faraday bleibt ein vorgeschlagenes Upgrade. Die offizielle Erklärung vom 27. Oktober beschreibt hashbasierte Ausgabebeweise über die Menge der Faraday-Coins sowie einen getrennten ML-KEM-Mechanismus für den Zahlungsempfang. Diese Menge würde mit dem Übergang von Coins in das neue Format wachsen. Bis zur Aktivierung des entsprechenden Upgrades gelten die heutigen veröffentlichten Zahlungsregeln.'
+sourceHash: '64f1034d2ebb'
+translation: draft
+---
+
+Jemanden zu bezahlen sollte nicht verlangen, deine Ausgabenhistorie allen Lesern einer Blockchain offenzulegen. Blocknet wendet seine Datenschutzmechanismen bei gewöhnlichen Wallet-Zahlungen an. Dieser Leitfaden erklärt den automatischen Schutz, die Zahlungsprüfung durch das Netzwerk und die Rolle deiner eigenen Aufzeichnungen. Das aktuelle Verhalten bezieht sich auf das veröffentlichte core v0.22.0; der Faraday-Abschnitt beschreibt einen Vorschlag.
+
+## Was bedeutet standardmäßig privat bei Blocknet-Zahlungen?
+
+<Answer>
+Gewöhnliche Blocknet-Zahlungen verwenden Ringsignaturen für ausgegebene Inputs, einmalige Empfängerschlüssel sowie Commitments mit Bereichsbeweisen für Beträge. Memos werden verschlüsselt, und Dandelion++ verringert die Offenlegung des Netzwerkursprungs. Die Wallet wendet diese Schichten ohne gesonderten Datenschutzschalter an; öffentliche Transaktionsstruktur und eigene Aufzeichnungen der Beteiligten bleiben bestehen.
+</Answer>
+
+## Wie schützt der Standard das ausgegebene Geld?
+
+Wenn du Empfänger und Betrag eingibst, erstellt die Wallet eine Zahlung im normalen privaten Format. Du musst nicht zwischen öffentlicher und geschützter Überweisung wählen. So gehört Datenschutz zur Nutzung von BNT als Währung: Zahlungen an Personen oder Unternehmen verwenden dieselben grundlegenden Schutzmechanismen wie andere gewöhnliche Zahlungen. Auch die Entscheidung, Datenschutz einzuschalten, wird dadurch nicht zu einem unterscheidenden Merkmal.
+
+Jeder normale Input verwendet einen CLSAG-Ring aus 16 Outputs: deinem echten Output und 15 Ködern aus der Blockchain. Die [veröffentlichten Validierungsregeln](https://github.com/blocknetprivacy/core/blob/5a0a5b510c1dce46f4eeb12c33a291052e44e7b3/transaction.go#L1013) erzwingen diese Größe und tatsächlich vorhandene On-Chain-Outputs als Ringmitglieder. Die Signatur beweist die Berechtigung, ohne die tatsächliche Quelle zu nennen. Köder liefern mögliche Quellen für den Beweis; sie finanzieren deine Zahlung nicht. Ein Schlüsselbild ermöglicht die Erkennung wiederholter Ausgaben. Der [Leitfaden zu Ringsignaturen](/de/blog/ring-signatures-explained/) erklärt den Mechanismus.
+
+[![Drei Schutzmechanismen einer gewöhnlichen Blocknet-Zahlung: 1, Ring mit 16 möglichen Quellen; 2, einmaliger Empfänger-Output-Schlüssel; 3, Commitment des verborgenen Betrags.](/assets/blog/blocknet-privacy-default.svg)](/assets/blog/blocknet-privacy-default.svg)
+
+Das Diagramm gruppiert drei Schutzmechanismen: **1** Berechtigung unter Ringmitgliedern, **2** Empfangsoutput und **3** dessen verborgener Betrag. Kein Ringmitglied ist als echte Quelle markiert. Die konzeptionelle Darstellung zeigt keine reale laufende Transaktion.
+
+## Wie werden Empfänger und Zahlungsnotiz geschützt?
+
+Deine Empfangsadresse erlaubt dem Zahler, einen Output für dich zu erstellen. Die Wallet leitet einen einmaligen Output-Schlüssel ab, statt die bekannte Empfangsadresse neben jede Zahlung auf der Blockchain zu setzen. Deine Wallet erkennt eingehende Outputs mithilfe privater Betrachtungsinformationen. Du kannst eine Empfangsadresse wiederverwenden, während Zahlungen eigene Output-Schlüssel erhalten. Der [Leitfaden zu Stealth-Adressen](/de/blog/stealth-addresses-explained/) erklärt diesen Zusammenhang.
+
+Ein öffentlicher [Blocknet-ID-Name](/de/blog/blocknet-id-pay-by-name/) vereinfacht das Finden des Empfangsziels. Jemand kann den veröffentlichten Namen mit dir verbinden, doch eine gewöhnliche Zahlung dorthin verwendet weiterhin dieselbe Output-Erstellung. Das Veröffentlichen eines Empfangsnamens veröffentlicht keine privaten Betrachtungsschlüssel der Wallet.
+
+Du kannst auch eine Rechnungsreferenz oder kurze Notiz anhängen. Die Wallet verschlüsselt das Memo mit einem gemeinsamen Geheimnis für diesen Output. Das Memo-Feld belegt 128 Byte und erlaubt bis zu 124 Byte Text; kürzere oder leere Inhalte erhalten vor der Verschlüsselung zufällige Auffüllung. Die feste Feldgröße verrät daher nicht die Notizlänge. Sender und Empfänger können die Notiz kennen; bewusst geteilte Prüf- oder Betrachtungsinformationen können sie ebenfalls offenlegen. Der [Memo-Leitfaden](/de/blog/blocknet-encrypted-memos/) behandelt Schreiben und Lesen.
+
+## Wie prüft das Netzwerk verborgene Beträge?
+
+Outputs gewöhnlicher Zahlungen enthalten Pedersen-Commitments statt lesbarer Beträge. Über Commitments und zugehörige Beweise prüfen Nodes, dass die Transaktion einschließlich ihrer öffentlichen Gebühr ausgeglichen ist. Bulletproofs-Bereichsbeweise zeigen, dass Output-Beträge im erlaubten Bereich liegen. Gemeinsam validieren die Prüfungen die Geldbewegung, während Zahlungsbeträge aus dem gewöhnlichen öffentlichen Datensatz herausbleiben.
+
+Deine Wallet kann den empfangenen Betrag trotzdem anzeigen. Der [Leitfaden zu Bereichsbeweisen](/de/blog/bulletproofs-explained/) erklärt die Kryptografie, während der [Transaktionsablauf](/de/blog/blocknet-transaction-explained/) ausgewählte Inputs, Empfänger-Outputs und Wechselgeld verfolgt. Wechselgeld verwendet neue Outputs der sendenden Wallet; Datenschutz beseitigt nicht die Notwendigkeit, Ausgaben und Rückflüsse zu verbuchen.
+
+Öffentliche Daten behalten Transaktionshash, Input- und Output-Struktur, Gebühr und nach Aufnahme den Blockstatus. Eine private Zahlung bleibt somit überprüfbar. Diese Erklärung betrifft gewöhnliche Ausgaben: Die besondere Coinbase-Transaktion zur Erzeugung einer Blockbelohnung hat keine Ausgaben-Inputs und folgt eigenen Validierungsregeln. Diese Unterscheidung bindet „standardmäßig privat“ an das beschriebene Zahlungsverhalten.
+
+## Was geschieht außerhalb der öffentlichen Transaktion?
+
+[Dandelion++](/de/blog/dandelion-plus-plus-explained/) behandelt die Weiterleitung im Netzwerk. Eine neue Transaktion durchläuft zunächst einen Stammweg, bevor sie breit verbreitet wird. Das verringert die direkte Verbindung zwischen Ursprung und den Peers, die sie weithin bekannt machen. Diese Schicht ergänzt die Transaktionskryptografie. Sie verspricht nicht, eine IP-Adresse in jeder Netzwerksituation zu verbergen.
+
+Auch die Beteiligten führen Aufzeichnungen. Der Sender kennt eingegebenes Ziel und Betrag; der Empfänger erkennt seinen Eingang. Rechnungen, Gespräche oder geteilte Screenshots können diese Daten mit einer Person oder Bestellung verbinden. Solche externen Informationen unterscheiden sich von dem, was das Transaktionsformat veröffentlicht. Der [Leitfaden zur Zahlungssichtbarkeit](/de/blog/blocknet-payment-visibility/) vergleicht öffentliche, Sender-, Empfänger- und gewährte Betrachtungszugriffe einschließlich bewusst geteilter Zahlungsnachweise. Bei gewöhnlicher Währungsnutzung gilt: Das Netzwerk validiert die Übertragung, während jeder Beteiligte die für seine Buchhaltung nötigen Angaben behält.
+
+## Was würde das vorgeschlagene Faraday-Upgrade ändern?
+
+Die [offizielle Erklärung vom 27. Oktober](https://blocknetcrypto.com/blog/2026-10-27-how-blocknet-privacy-survives-quantum-computers/) beschreibt Faraday als noch in Entwicklung und Tests befindlichen Entwurf. Faraday würde den heutigen Ausgabebeweis durch hashbasierte Beweise über die gesamte Menge der Faraday-Coins ersetzen. Diese Menge würde mit Coins im neuen Format wachsen; nicht jeder historische Output ist bereits darin enthalten. Der Faraday-Vorschlag würde ML-KEM zum Empfang und Erkennen von Zahlungen nutzen, getrennt vom Nachweis einer Ausgabe.
+
+Der [Faraday-Datenschutzleitfaden](/de/blog/blocknet-faraday-privacy/) erklärt diese geplanten Mechanismen. Entwurf und Zeitplan können sich ändern; bis zum entsprechenden Upgrade bestimmen die veröffentlichten Regeln das aktuelle Wallet-Verhalten. Heute bedeutet standardmäßiger Datenschutz, dass gewöhnliche Zahlungen sensible Angaben ohne zusätzliche Moduswahl schützen. [Blocknet und Fungibilität](/de/blog/blocknet-fungibility/) erklärt den Zusammenhang mit austauschbaren Einheiten; praktische Sendeschritte stehen im [Zahlungsleitfaden](/de/blog/send-receive-blocknet/).
+
+<CTA target="seine" title="Blocknet mit seine minen" text="Nutze seine mit bntpool.com, um Blocknet zu minen und Zahlungen in deiner eigenen Wallet zu erhalten." />

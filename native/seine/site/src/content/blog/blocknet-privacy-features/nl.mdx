@@ -1,0 +1,62 @@
+---
+title: 'Hoe Blocknet gewone betalingen standaard privé maakt'
+description: 'Lees hoe Blocknet betalingen beschermt met ringhandtekeningen, eenmalige sleutels, verborgen bedragen en versleutelde memo’s, en wat Faraday voorstelt.'
+tags: ['Blocknet', 'Privacy', 'Betalingen']
+faq:
+  - q: 'Werkt privacy automatisch wanneer ik met Blocknet betaal?'
+    a: 'Ja. De uitgebrachte wallet maakt gewone betalingen met ringhandtekeningen, eenmalige outputsleutels, verborgen bedragen en versleutelde memo’s. Je kiest geen aparte privémodus. De openbare structuur blijft bestaan en verzender en ontvanger kennen hun eigen gegevens. Dit beschrijft normale bestedingen; het maken van blokbeloningen volgt eigen transactieregels.'
+  - q: 'Waarom heeft een Blocknet-input 16 ringleden?'
+    a: 'Een normale input gebruikt één echte output en 15 afleiders uit de keten. De handtekening bewijst toestemming zonder het echte lid aan te wijzen. Consensus legt de grootte vast op 16; gebruikers kiezen geen andere grootte per betaling. Afleiders dragen geen geld van hun eigenaren bij, en sleutelbeelden helpen herhaalde bestedingen te herkennen.'
+  - q: 'Vervangt Faraday het huidige privacysysteem al?'
+    a: 'Nee. Faraday blijft een voorgestelde upgrade. De officiële uitleg van 27 oktober beschrijft hashgebaseerde bestedingsbewijzen over de verzameling Faraday-coins en een apart ML-KEM-mechanisme voor ontvangst. De verzameling zou groeien als coins het nieuwe formaat ingaan. De huidige uitgebrachte regels blijven het uitgangspunt tot de toepasselijke upgrade actief wordt.'
+sourceHash: '64f1034d2ebb'
+translation: draft
+---
+
+Iemand betalen zou niet vereisen dat je uitgavengeschiedenis wordt gepubliceerd voor iedere blockchainlezer. Blocknet past zijn privacymechanismen toe als onderdeel van gewone walletbetalingen. Deze gids legt automatische bescherming, netwerkcontroles en je eigen administratie uit. Het huidige gedrag verwijst naar het uitgebrachte core v0.22.0; het Faraday-deel beschrijft een voorstel.
+
+## Wat betekent standaard privé bij een Blocknet-betaling?
+
+<Answer>
+Gewone betalingen gebruiken ringhandtekeningen voor bestede inputs, eenmalige ontvangerssleutels en toezeggingen met bereikbewijzen voor bedragen. Memo’s zijn versleuteld en Dandelion++ vermindert blootstelling van de netwerkherkomst. De wallet past dit zonder aparte privacyschakelaar toe, terwijl de openbare structuur en eigen administratie van deelnemers blijven bestaan.
+</Answer>
+
+## Hoe beschermt de standaard het geld dat je besteedt?
+
+Als je ontvanger en bedrag invoert, bouwt de wallet een betaling in het normale privéformaat. Je hoeft niet te kiezen tussen openbare en beschermde overdracht. Privacy hoort zo bij BNT als valuta: betalen aan een persoon of bedrijf gebruikt dezelfde basisbescherming als andere gewone betalingen. Ook wordt het inschakelen van privacy geen onderscheidende keuze.
+
+Elke normale input gebruikt een CLSAG-ring van 16 outputs: jouw echte output en 15 afleiders uit de keten. De [uitgebrachte validatieregels](https://github.com/blocknetprivacy/core/blob/5a0a5b510c1dce46f4eeb12c33a291052e44e7b3/transaction.go#L1013) vereisen die grootte en echte on-chain outputs als leden. De handtekening bewijst toestemming zonder het leverende lid aan te wijzen. Afleiders bieden mogelijke bronnen voor het bewijs; ze financieren de betaling niet. Een sleutelbeeld laat het netwerk herhaald besteden herkennen. De [gids voor ringhandtekeningen](/nl/blog/ring-signatures-explained/) legt het mechanisme uit.
+
+[![Drie beschermingen in een gewone Blocknet-betaling: 1, ring met 16 mogelijke bronnen; 2, eenmalige outputsleutel van de ontvanger; 3, toezegging van een verborgen bedrag.](/assets/blog/blocknet-privacy-default.svg)](/assets/blog/blocknet-privacy-default.svg)
+
+Het diagram groepeert drie beschermingen: **1** toestemming tussen ringleden, **2** de ontvangen output en **3** het verborgen bedrag. Geen lid is als echte bron gemarkeerd. Dit is een conceptueel beeld, geen live transactie.
+
+## Hoe worden ontvanger en notitie beschermd?
+
+Je ontvangstadres laat de betaler een output voor je maken. De wallet leidt een eenmalige outputsleutel af in plaats van het bekende adres naast iedere betaling op de keten te plaatsen. Je wallet herkent inkomende outputs met privé-inzagegegevens. Je kunt het adres hergebruiken terwijl betalingen eigen outputsleutels krijgen. De [gids voor stealth-adressen](/nl/blog/stealth-addresses-explained/) legt het verband uit.
+
+Een openbare [Blocknet-ID-naam](/nl/blog/blocknet-id-pay-by-name/) maakt het makkelijk de bestemming te vinden. Iemand kan de gepubliceerde naam met jou verbinden, maar een gewone betaling naar dat doel gebruikt dezelfde outputopbouw. Een ontvangstnaam publiceren maakt geen privé-inzagesleutels openbaar.
+
+Je kunt ook een factuurreferentie of korte notitie toevoegen. De wallet versleutelt de memo met een gedeeld geheim voor die output. Het veld is 128 bytes en ondersteunt maximaal 124 bytes tekst; korte of lege inhoud krijgt vóór versleuteling willekeurige opvulling. De vaste veldgrootte onthult dus niet de notitielengte. Verzender en ontvanger kunnen de notitie kennen; bewust gedeelde verificatie- of inzagegegevens kunnen haar ook onthullen. De [memogids](/nl/blog/blocknet-encrypted-memos/) behandelt schrijven en lezen.
+
+## Hoe controleert het netwerk verborgen bedragen?
+
+Gewone outputs dragen Pedersen-toezeggingen in plaats van leesbare bedragen. Via die toezeggingen en bewijzen controleren nodes of de transactie in balans is, inclusief de openbare kosten. Bulletproofs-bereikbewijzen tonen dat outputbedragen binnen het toegestane bereik liggen. Samen valideren deze controles de geldbeweging zonder betalingsbedragen in het gewone openbare register te zetten.
+
+Je wallet kan het ontvangen bedrag nog steeds tonen. De [gids voor bereikbewijzen](/nl/blog/bulletproofs-explained/) legt cryptografie uit; de [uitleg van een transactie](/nl/blog/blocknet-transaction-explained/) volgt geselecteerde inputs, ontvangersoutputs en wisselgeld. Wisselgeld gebruikt nieuwe outputs van de verzendende wallet; privacy neemt de noodzaak van uitgaven en teruggave administreren niet weg.
+
+Openbare gegevens behouden hash, input- en outputstructuur, kosten en na opname de blokstatus. Een privébetaling blijft dus controleerbaar. Deze uitleg gaat over gewone bestedingen: de speciale coinbase-transactie die een blokbeloning maakt heeft geen bestedingsinputs en volgt aparte validatie. Dat onderscheid koppelt “standaard privé” aan het beschreven betaalgedrag.
+
+## Wat gebeurt er buiten de openbare transactie?
+
+[Dandelion++](/nl/blog/dandelion-plus-plus-explained/) behandelt netwerkdoorgifte. Een nieuwe transactie loopt eerst langs een stengel vóór brede verspreiding, waardoor de directe band tussen oorsprong en breed aankondigende peers afneemt. Het is een extra laag naast transactiecryptografie. Het belooft geen IP-adres in elke netwerksituatie te verbergen.
+
+Deelnemers hebben ook administratie. De verzender kent ingevoerd doel en bedrag; de ontvanger herkent de ontvangst. Een factuur, gesprek of gedeelde screenshot kan die gegevens met een persoon of bestelling verbinden. Dat is buiteninformatie, los van wat het formaat publiceert. De [gids voor betalingszichtbaarheid](/nl/blog/blocknet-payment-visibility/) vergelijkt openbare toegang, verzender, ontvanger en verleende inzage, inclusief bewust gedeelde betalingsbewijzen. Houd bij gewoon valutagebruik het onderscheid vast: het netwerk valideert de overdracht en iedere deelnemer bewaart details voor de eigen boekhouding.
+
+## Wat zou de voorgestelde Faraday-upgrade veranderen?
+
+De [officiële uitleg van 27 oktober](https://blocknetcrypto.com/blog/2026-10-27-how-blocknet-privacy-survives-quantum-computers/) beschrijft Faraday als een ontwerp dat nog wordt gebouwd en getest. Faraday zou het huidige bestedingsbewijs vervangen door hashgebaseerde bewijzen over alle Faraday-coins. Die verzameling zou groeien als coins het nieuwe formaat ingaan; niet iedere historische output zit er al in. Het voorstel zou ML-KEM gebruiken voor ontvangst en betalingsdetectie, een andere taak dan een besteding bewijzen.
+
+De [Faraday-privacygids](/nl/blog/blocknet-faraday-privacy/) legt die plannen uit. Ontwerp en planning kunnen veranderen; lees huidig walletgedrag uit de uitgebrachte regels tot de toepasselijke upgrade. Vandaag betekent standaardprivacy dat gewone betalingen gevoelige gegevens beschermen zonder extra modus. [Blocknet en fungibiliteit](/nl/blog/blocknet-fungibility/) legt het verband met uitwisselbare eenheden uit; praktische stappen staan in de [betalingsgids](/nl/blog/send-receive-blocknet/).
+
+<CTA target="seine" title="Mine Blocknet met seine" text="Gebruik seine met bntpool.com om Blocknet te minen en betalingen in je eigen wallet te ontvangen." />

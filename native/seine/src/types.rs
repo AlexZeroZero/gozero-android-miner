@@ -1,0 +1,205 @@
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BlockTemplateResponse {
+    pub block: TemplateBlock,
+    pub target: String,
+    pub header_base: String,
+    #[serde(default)]
+    pub template_id: Option<String>,
+    #[serde(default)]
+    pub template_expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TemplateBlock {
+    pub header: TemplateHeader,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TemplateHeader {
+    #[serde(default)]
+    pub nonce: Option<u64>,
+    #[serde(default, rename = "Nonce")]
+    pub nonce_upper: Option<u64>,
+    #[serde(default)]
+    pub height: Option<u64>,
+    #[serde(default, rename = "Height")]
+    pub height_upper: Option<u64>,
+    #[serde(default)]
+    pub difficulty: Option<u64>,
+    #[serde(default, rename = "Difficulty")]
+    pub difficulty_upper: Option<u64>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SubmitBlockResponse {
+    pub accepted: bool,
+    #[allow(dead_code)]
+    pub hash: Option<String>,
+    pub height: Option<u64>,
+}
+
+pub fn decode_hex(input: &str, field_name: &str) -> Result<Vec<u8>> {
+    let clean = input.trim();
+    if clean.is_empty() {
+        bail!("{field_name} is empty");
+    }
+    hex::decode(clean).with_context(|| format!("failed to decode {field_name} hex"))
+}
+
+pub fn parse_target(target_hex: &str) -> Result<[u8; 32]> {
+    let clean = target_hex.trim();
+    if clean.len() != 64 {
+        bail!(
+            "target must be 32 bytes (64 hex chars), got {} chars",
+            clean.len()
+        );
+    }
+    let mut target = [0u8; 32];
+    hex::decode_to_slice(clean, &mut target).context("failed to decode target hex")?;
+    Ok(target)
+}
+
+pub fn difficulty_to_target(difficulty: u64) -> [u8; 32] {
+    if difficulty == 0 {
+        return [0u8; 32];
+    }
+
+    let numerator = [u64::MAX; 4];
+    let mut quotient = [0u64; 4];
+    let mut rem = 0u64;
+
+    for (i, limb) in numerator.into_iter().enumerate() {
+        let high = rem as u128;
+        let low = limb as u128;
+        let dividend = (high << 64) | low;
+        quotient[i] = (dividend / difficulty as u128) as u64;
+        rem = (dividend % difficulty as u128) as u64;
+    }
+
+    let mut target = [0u8; 32];
+    for (i, word) in quotient.into_iter().enumerate() {
+        target[i * 8..(i + 1) * 8].copy_from_slice(&word.to_be_bytes());
+    }
+    target
+}
+
+pub fn hash_meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
+    hash <= target
+}
+
+pub fn set_block_nonce(block: &mut TemplateBlock, nonce: u64) {
+    if block.header.nonce.is_some() || block.header.nonce_upper.is_none() {
+        block.header.nonce = Some(nonce);
+        block.header.nonce_upper = None;
+    } else {
+        block.header.nonce_upper = Some(nonce);
+        block.header.nonce = None;
+    }
+}
+
+pub fn template_height(block: &TemplateBlock) -> Option<u64> {
+    block.header.height.or(block.header.height_upper)
+}
+
+pub fn template_difficulty(block: &TemplateBlock) -> Option<u64> {
+    block.header.difficulty.or(block.header.difficulty_upper)
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn gpu_scale_difficulty_targets_match_integer_reference_vectors() {
+        // Independently generated as Python: ((1 << 256) - 1) // difficulty.
+        // Includes non-powers of two, values beyond JS exact integers, and u64::MAX.
+        for (difficulty, expected) in [
+            (
+                3,
+                "5555555555555555555555555555555555555555555555555555555555555555",
+            ),
+            (
+                1_000_000_000_000,
+                "000000000119799812dea11197f27f0f6e885c8ba7eb31f476caf7411a863387",
+            ),
+            (
+                9_007_199_254_740_993,
+                "00000000000007ffffffffffffc0000000000001fffffffffffff00000000000",
+            ),
+            (
+                u64::MAX,
+                "0000000000000001000000000000000100000000000000010000000000000001",
+            ),
+        ] {
+            assert_eq!(hex::encode(difficulty_to_target(difficulty)), expected);
+        }
+    }
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn hash_meets_target_big_endian_compare() {
+        let hash = [
+            0x00u8, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF,
+        ];
+        let target = [
+            0x00u8, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(hash_meets_target(&hash, &target));
+    }
+
+    #[test]
+    fn set_block_nonce_supports_lower_and_upper_keys() {
+        let mut lower: TemplateBlock = serde_json::from_value(json!({
+            "header": {"nonce": 0u64},
+            "txns": []
+        }))
+        .expect("lower block should deserialize");
+        set_block_nonce(&mut lower, 42);
+        let out = serde_json::to_value(lower).expect("lower block should serialize");
+        assert_eq!(out["header"]["nonce"].as_u64(), Some(42));
+
+        let mut upper: TemplateBlock = serde_json::from_value(json!({
+            "header": {"Nonce": 0u64},
+            "txns": []
+        }))
+        .expect("upper block should deserialize");
+        set_block_nonce(&mut upper, 9);
+        let out = serde_json::to_value(upper).expect("upper block should serialize");
+        assert_eq!(out["header"]["Nonce"].as_u64(), Some(9));
+    }
+
+    #[test]
+    fn parse_target_requires_32_bytes() {
+        let err = parse_target("00ff").expect_err("short target should fail");
+        assert!(format!("{err:#}").contains("target must be 32 bytes"));
+    }
+
+    #[test]
+    fn difficulty_to_target_orders_monotonically() {
+        let t1 = difficulty_to_target(1);
+        let t2 = difficulty_to_target(2);
+        let t4 = difficulty_to_target(4);
+
+        assert!(t1 > t2);
+        assert!(t2 > t4);
+    }
+
+    #[test]
+    fn template_block_requires_header() {
+        let err = serde_json::from_value::<TemplateBlock>(json!({"not_header": {}}))
+            .expect_err("missing header should fail");
+        assert!(err.to_string().contains("missing field `header`"));
+    }
+}

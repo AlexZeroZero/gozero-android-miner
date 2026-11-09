@@ -1,0 +1,145 @@
+---
+title: 'seine 设置：线程、CPU、GPU 和矿池'
+description: '在 seine 中关闭 CPU 或 GPU 挖矿、设置线程数、选择显卡、让设置每次启动都生效，并更改地址或矿池的操作方法。'
+tags: ['挖矿指南', '配置', 'seine']
+faq:
+  - q: '如何在 seine 中关闭 CPU 挖矿？'
+    a: '启动 seine 时把 backend 选项设为你的显卡类型，即 nvidia 或 amd。如果电脑同时有两种显卡，就用逗号分隔，两个都写上。这样 seine 只使用显卡挖矿，把处理器留给其他工作。'
+  - q: '如何在 seine 中关闭 GPU 挖矿？'
+    a: '启动 seine 时把 backend 选项设为 cpu。这样 seine 只使用处理器挖矿，把所有显卡留给游戏和其他应用。去掉该选项后，seine 会再次同时使用处理器和显卡挖矿。'
+  - q: '应该使用多少个 CPU 线程？'
+    a: 'seine 会自动选择线程数，所以只有想给其他工作留出余量时才需要设置。每个线程大约使用 2 GB 内存。在仪表盘中按减号键，直到电脑用起来合适，然后使用这个数字。'
+  - q: 'seine 把设置保存在哪里？'
+    a: 'seine 把你的地址、矿池和矿工名保存在启动它的文件夹内的 seine-data/seine.config.json 中。线程和 backend 选项不会保存在那里，所以如果想让它们每次启动都生效，请把它们写进一个小的启动文件。'
+sourceHash: b5ca5a9a16d8
+translation: draft
+---
+
+seine 不需要任何设置就能良好运行。本指南介绍你最可能想做的修改：关闭 CPU 或 GPU 挖矿、使用更少的线程、选择显卡，以及更改地址或矿池。
+
+## 如何更改 seine 的设置？
+
+<Answer>
+关闭 seine，在它的文件夹中打开终端，然后在命令中加上设置并重新启动，例如 `./seine --threads 4`。在 Windows 上，请使用 PowerShell 和 `.\seine.exe --threads 4`。seine 会保留你已保存的地址和矿池，所以只需输入想要更改的内容。
+</Answer>
+
+- **Windows：**在文件资源管理器中打开 seine 文件夹，在地址栏输入 `powershell` 并按 Enter。
+- **macOS 和 Linux：**打开终端，用 `cd` 进入 seine 文件夹。
+
+下面的示例使用 `./seine`。在 Windows 上请改为输入 `.\seine.exe`。
+
+## 如何关闭 CPU 或 GPU 挖矿？
+
+seine 默认使用 CPU 和每一块受支持的显卡挖矿。`--backend` 设置用来选择使用哪些设备：
+
+| 你想要的效果 | 添加 |
+|---|---|
+| 只用 CPU，关闭 GPU | `--backend cpu` |
+| 只用 NVIDIA GPU，关闭 CPU | `--backend nvidia` |
+| 只用 AMD GPU，关闭 CPU | `--backend amd` |
+| 使用 NVIDIA 和 AMD GPU，关闭 CPU | `--backend nvidia,amd` |
+
+例如，要使用 NVIDIA 显卡挖矿并让 CPU 空闲：
+
+```sh
+./seine --backend nvidia
+```
+
+[仪表盘](/zh-hans/blog/seine-dashboard-explained/)中的 Devices 面板会为每个正在挖矿的设备显示一行。
+
+## 如何使用更少的 CPU 线程？
+
+加上 `--threads` 和你想要的数字：
+
+```sh
+./seine --threads 4
+```
+
+每个线程大约使用 2 GB 内存，所以 4 个线程大约使用 8 GB。在你去掉该设置之前，seine 会一直使用这个数字。
+
+要找到合适的数字，请正常启动 seine，在仪表盘中按 `-` 减少一个线程，或按 `+` 增加一个线程。更改需要片刻生效，仪表盘会显示新的线程数。等电脑用起来合适时停下，然后把这个数字用于 `--threads`，因为这些按键只在你关闭 seine 之前有效。
+
+如果想让 seine 自己选择较轻的线程数，请改用：
+
+```sh
+./seine --cpu-profile efficiency
+```
+
+[桌面电脑指南](/zh-hans/blog/mine-while-using-pc/)介绍了更多在使用电脑的同时挖矿的方法。
+
+## 如何只选择一块显卡？
+
+加上显卡的编号。第一块显卡是 `0`：
+
+```sh
+./seine --backend cpu,nvidia --nvidia-devices 0
+```
+
+这会使用 CPU 和第一块 NVIDIA 显卡挖矿。两块显卡请用 `--nvidia-devices 0,1`，要关闭 CPU，就去掉 `cpu,`。AMD 显卡的用法相同：
+
+```sh
+./seine --backend cpu,amd --amd-devices 0
+```
+
+要给其他应用留出显存，请使用 `--nvidia-max-lanes 2` 或 `--amd-max-lanes 2`。每条通道（lane）大约使用 2 GB 显存。除非你自己加上 `--backend amd`，否则集成的 Radeon 显卡保持关闭。
+
+## 如何让设置每次启动都生效？
+
+seine 会自动保存你的地址、矿池和矿工名。`--threads` 和 `--backend` 这类设置只对当次运行有效，所以请把它们写进一个小的启动文件，并运行这个文件，而不是直接运行 seine。
+
+在 Windows 上，打开记事本，输入下面的几行并换成你自己的设置，然后把文件保存到 seine 文件夹中，文件名为 `start-mining.bat`，并把**保存类型**设为**所有文件**：
+
+```bat
+seine.exe --backend cpu --threads 4
+pause
+```
+
+双击 `start-mining.bat` 开始挖矿。`pause` 这一行会在 seine 停止后保持窗口打开，方便你阅读它的最后一条消息。
+
+在 macOS 或 Linux 上，把下面的几行保存到 seine 文件夹中，文件名为 `start-mining.sh`：
+
+```sh
+#!/bin/sh
+cd "$(dirname "$0")"
+./seine --backend cpu --threads 4
+```
+
+运行一次 `chmod +x start-mining.sh`，之后用 `./start-mining.sh` 开始挖矿。自动更新会用同样的设置重启 seine。要在每次登录 Windows 时开始挖矿，请参考[自动启动指南](/zh-hans/blog/start-miner-automatically-windows/)。
+
+## 如何更改地址、矿池或矿工名？
+
+关闭 seine，用文本编辑器打开 `seine-data/seine.config.json`。这个文件夹位于你启动 seine 的文件夹之内。修改需要的值并保存文件：
+
+```json
+{
+  "schema_version": 1,
+  "mode": "pool",
+  "address": "@yourname",
+  "pool_url": "stratum+tcp://bntpool.com:3333",
+  "pool_worker": "desktop-01"
+}
+```
+
+其他行保持原样。保留引号和逗号，并且不要把恢复短语或私钥写进这个文件。
+
+如果只想在某一次运行中使用不同的值，请把它加到命令里。已保存的文件不会改变：
+
+```sh
+./seine --pool-worker desktop-02
+```
+
+另外两个设置是 `--address` 和 `--pool-url`。[更改地址指南](https://bntpool.com/blog/zh-hans/change-mining-wallet-address/)说明了更改地址后矿池如何计入你的工作量。
+
+## 设置不生效怎么办？
+
+| 你看到的内容 | 该怎么做 |
+|---|---|
+| `--nvidia-devices requires selecting nvidia in --backend` | 在 backend 中加上 `nvidia`：`--backend cpu,nvidia`。`amd` 同理。 |
+| `configured CPU lanes need` 更多内存 | 给 `--threads` 使用更小的数字，大约每 2 GB 可用内存对应一个线程。 |
+| `all GPU backends failed to start` | 为你的显卡安装最新驱动。[AMD 指南](https://github.com/zpalmtree/seine/blob/master/docs/guides/amd.md)列出了 AMD 显卡在 Linux 上需要什么。 |
+| seine 再次询问你的地址 | 从之前的同一个文件夹启动 seine，或用 `--data-dir` 指定文件夹。 |
+| 你的设置恢复成了自动 | 从你的启动文件启动 seine。`-` 和 `+` 键只在你关闭 seine 之前有效。 |
+
+[参数参考](https://github.com/zpalmtree/seine/blob/master/docs/MINER_FLAGS.md)列出了每一项设置。
+
+<CTA target="seine" title="获取最新版 seine" text="下载 seine，先启动一次，再只添加你想更改的设置。" />

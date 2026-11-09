@@ -1,0 +1,145 @@
+---
+title: 'seine-instellingen wijzigen: threads, CPU, GPU en pool'
+description: 'Zet CPU- of GPU-mining uit in seine, stel het aantal threads in, kies een videokaart, bewaar je instellingen voor elke start en wijzig je adres of pool.'
+tags: ['Mininghandleiding', 'Configuratie', 'seine']
+faq:
+  - q: 'Hoe zet ik CPU-mining uit in seine?'
+    a: 'Start seine met de optie backend ingesteld op je videokaart, nvidia of amd. Gebruik beide, gescheiden door een komma, als de computer beide soorten kaarten heeft. Seine mint dan alleen op de videokaarten en laat de processor vrij voor ander werk.'
+  - q: 'Hoe zet ik GPU-mining uit in seine?'
+    a: 'Start seine met de optie backend ingesteld op cpu. Seine mint dan alleen op de processor en laat alle videokaarten vrij voor games en andere apps. Haal de optie weg om weer op processor en videokaarten samen te minen.'
+  - q: 'Hoeveel CPU-threads moet ik gebruiken?'
+    a: 'Seine kiest het aantal threads voor je, dus je hoeft het alleen in te stellen als je ruimte wilt laten voor ander werk. Elke thread gebruikt ongeveer 2 GB RAM. Druk in het dashboard op de min-toets tot je computer prettig aanvoelt en gebruik dan dat aantal.'
+  - q: 'Waar bewaart seine zijn instellingen?'
+    a: 'Seine bewaart je adres, pool en workernaam in seine-data/seine.config.json, in de map waaruit je het start. Thread- en backendopties worden daar niet bewaard, zet ze dus in een klein startbestand als je ze bij elke start wilt.'
+sourceHash: b5ca5a9a16d8
+translation: draft
+---
+
+Seine werkt prima zonder instellingen. Deze handleiding behandelt de wijzigingen die je het vaakst wilt: CPU- of GPU-mining uitzetten, minder threads gebruiken, een videokaart kiezen en je adres of pool wijzigen.
+
+## Hoe wijzig je een seine-instelling?
+
+<Answer>
+Sluit seine, open een terminal in de map ervan en start het opnieuw met de instelling toegevoegd aan het commando, bijvoorbeeld `./seine --threads 4`. Gebruik op Windows PowerShell en `.\seine.exe --threads 4`. Seine bewaart je opgeslagen adres en pool, dus je typt alleen wat je wilt wijzigen.
+</Answer>
+
+- **Windows:** open de seine-map in Verkenner, typ `powershell` in de adresbalk en druk op Enter.
+- **macOS en Linux:** open Terminal en ga met `cd` naar de seine-map.
+
+De voorbeelden hieronder gebruiken `./seine`. Typ op Windows in plaats daarvan `.\seine.exe`.
+
+## Hoe zet je CPU- of GPU-mining uit?
+
+Standaard mint seine op je CPU en op elke ondersteunde videokaart. De instelling `--backend` kiest welke je gebruikt:
+
+| Wat je wilt | Voeg dit toe |
+|---|---|
+| Alleen CPU, GPU uit | `--backend cpu` |
+| Alleen NVIDIA-GPU, CPU uit | `--backend nvidia` |
+| Alleen AMD-GPU, CPU uit | `--backend amd` |
+| NVIDIA- en AMD-GPU’s, CPU uit | `--backend nvidia,amd` |
+
+Om bijvoorbeeld op een NVIDIA-kaart te minen en de CPU vrij te laten:
+
+```sh
+./seine --backend nvidia
+```
+
+Het paneel Devices in het [dashboard](/nl/blog/seine-dashboard-explained/) toont een rij voor elk apparaat dat mint.
+
+## Hoe gebruik je minder CPU-threads?
+
+Voeg `--threads` toe met het gewenste aantal:
+
+```sh
+./seine --threads 4
+```
+
+Elke thread gebruikt ongeveer 2 GB RAM, dus 4 threads gebruiken ongeveer 8 GB. Seine blijft op dat aantal tot je de instelling weghaalt.
+
+Om een goed aantal te vinden, start je seine gewoon en druk je in het dashboard op `-` om een thread weg te halen of op `+` om er een toe te voegen. De wijziging duurt even en het dashboard toont het nieuwe aantal. Stop als je computer prettig aanvoelt en gebruik dat aantal met `--threads`, want de toetsen werken alleen tot je seine sluit.
+
+Als je seine zelf een lichter aantal threads wilt laten kiezen, gebruik dan dit:
+
+```sh
+./seine --cpu-profile efficiency
+```
+
+De [desktophandleiding](/nl/blog/mine-while-using-pc/) vertelt meer over minen terwijl je je computer gebruikt.
+
+## Hoe kies je één videokaart?
+
+Voeg het nummer van de kaart toe. De eerste kaart is `0`:
+
+```sh
+./seine --backend cpu,nvidia --nvidia-devices 0
+```
+
+Dit mint op de CPU en de eerste NVIDIA-kaart. Gebruik `--nvidia-devices 0,1` voor twee kaarten en laat `cpu,` weg om de CPU uit te zetten. AMD-kaarten werken op dezelfde manier:
+
+```sh
+./seine --backend cpu,amd --amd-devices 0
+```
+
+Om videogeheugen vrij te laten voor andere apps gebruik je `--nvidia-max-lanes 2` of `--amd-max-lanes 2`. Elke lane gebruikt ongeveer 2 GB videogeheugen. Geïntegreerde Radeon-graphics blijven uit, tenzij je zelf `--backend amd` toevoegt.
+
+## Hoe bewaar je je instellingen voor elke start?
+
+Seine bewaart je adres, pool en workernaam zelf. Instellingen zoals `--threads` en `--backend` gelden alleen voor die ene run, dus zet ze in een klein startbestand en open dat bestand in plaats van seine.
+
+Open op Windows Kladblok, typ deze regels met je eigen instellingen en sla het bestand op in de seine-map als `start-mining.bat`, met **Opslaan als type** ingesteld op **Alle bestanden**:
+
+```bat
+seine.exe --backend cpu --threads 4
+pause
+```
+
+Dubbelklik op `start-mining.bat` om te beginnen met minen. De regel `pause` houdt het venster open als seine stopt, zodat je het laatste bericht kunt lezen.
+
+Sla op macOS of Linux deze regels op in de seine-map als `start-mining.sh`:
+
+```sh
+#!/bin/sh
+cd "$(dirname "$0")"
+./seine --backend cpu --threads 4
+```
+
+Voer eenmalig `chmod +x start-mining.sh` uit en begin dan met minen via `./start-mining.sh`. Automatische updates starten seine opnieuw met dezelfde instellingen. Om te beginnen met minen telkens als je je aanmeldt bij Windows, volg je de [handleiding voor automatisch starten](/nl/blog/start-miner-automatically-windows/).
+
+## Hoe wijzig je je adres, pool of workernaam?
+
+Sluit seine en open `seine-data/seine.config.json` in een teksteditor. De map staat in de map waaruit je seine start. Wijzig de waarde die je nodig hebt en sla het bestand op:
+
+```json
+{
+  "schema_version": 1,
+  "mode": "pool",
+  "address": "@yourname",
+  "pool_url": "stratum+tcp://bntpool.com:3333",
+  "pool_worker": "desktop-01"
+}
+```
+
+Laat de andere regels zoals ze zijn. Houd de aanhalingstekens en komma’s en zet je herstelzin of privésleutels niet in dit bestand.
+
+Om voor één run een andere waarde te gebruiken, voeg je die toe aan het commando. Het opgeslagen bestand blijft hetzelfde:
+
+```sh
+./seine --pool-worker desktop-02
+```
+
+De andere twee instellingen zijn `--address` en `--pool-url`. De [handleiding voor adreswijziging](https://bntpool.com/blog/nl/change-mining-wallet-address/) legt uit hoe de pool je werk bijschrijft nadat je je adres hebt gewijzigd.
+
+## Wat als een instelling niet werkt?
+
+| Wat je ziet | Wat je kunt doen |
+|---|---|
+| `--nvidia-devices requires selecting nvidia in --backend` | Voeg `nvidia` toe aan de backend: `--backend cpu,nvidia`. Hetzelfde geldt voor `amd`. |
+| `configured CPU lanes need` meer RAM | Gebruik een lager getal met `--threads`, ongeveer één thread per 2 GB vrij RAM. |
+| `all GPU backends failed to start` | Installeer de huidige driver voor je kaart. De [AMD-handleiding](https://github.com/zpalmtree/seine/blob/master/docs/guides/amd.md) vermeldt wat AMD-kaarten onder Linux nodig hebben. |
+| Seine vraagt weer om je adres | Start seine vanuit dezelfde map als eerder, of stel de map in met `--data-dir`. |
+| Je instellingen zijn weer automatisch | Start seine vanuit je startbestand. De toetsen `-` en `+` werken alleen tot je seine sluit. |
+
+De [optiereferentie](https://github.com/zpalmtree/seine/blob/master/docs/MINER_FLAGS.md) somt elke instelling op.
+
+<CTA target="seine" title="Download de huidige seine-versie" text="Download seine, start het één keer en voeg dan alleen de instellingen toe die je wilt wijzigen." />

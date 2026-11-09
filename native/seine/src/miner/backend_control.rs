@@ -1,0 +1,501 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{bail, Result};
+use crossbeam_channel::Receiver;
+use seine_telemetry::{
+    DiagnosticCode, DiagnosticKind, DiagnosticOperation, FailureDetail, FailureReason,
+};
+
+use crate::backend::{BackendEvent, BackendInstanceId};
+
+use super::backend_executor::{
+    self, BackendTask, BackendTaskDispatchResult, BackendTaskKind, BackendTaskTimeoutKind,
+};
+use super::ui::{error, info, warn};
+use super::{
+    backend_names, remove_backend_by_id, BackendSlot, RuntimeBackendEventAction, RuntimeMode,
+};
+
+type BackendFailureMap = BTreeMap<BackendInstanceId, (&'static str, Vec<String>)>;
+
+pub(super) fn cancel_backend_slots(
+    backends: &mut Vec<BackendSlot>,
+    mode: RuntimeMode,
+    backend_executor: &backend_executor::BackendExecutor,
+) -> Result<RuntimeBackendEventAction> {
+    control_backend_slots(backends, mode, false, backend_executor)
+}
+
+pub(super) fn quiesce_backend_slots(
+    backends: &mut Vec<BackendSlot>,
+    mode: RuntimeMode,
+    backend_executor: &backend_executor::BackendExecutor,
+) -> Result<RuntimeBackendEventAction> {
+    control_backend_slots(backends, mode, true, backend_executor)
+}
+
+pub(super) fn handle_runtime_backend_event(
+    event: BackendEvent,
+    epoch: u64,
+    backends: &mut Vec<BackendSlot>,
+    mode: RuntimeMode,
+    backend_executor: &backend_executor::BackendExecutor,
+) -> Result<(
+    RuntimeBackendEventAction,
+    Option<crate::backend::MiningSolution>,
+)> {
+    match event {
+        BackendEvent::Solution(solution) => {
+            let backend_active = backends.iter().any(|slot| slot.id == solution.backend_id);
+            match mode {
+                RuntimeMode::Mining => {
+                    if !backend_active {
+                        warn(
+                            "BACKEND",
+                            format!(
+                                "received late solution from unavailable backend {}#{} (epoch={} nonce={})",
+                                solution.backend, solution.backend_id, solution.epoch, solution.nonce
+                            ),
+                        );
+                    }
+                    return Ok((RuntimeBackendEventAction::None, Some(solution)));
+                }
+                RuntimeMode::Bench => {
+                    if !backend_active {
+                        return Ok((RuntimeBackendEventAction::None, None));
+                    }
+                    if solution.epoch == epoch {
+                        info(
+                            "BENCH",
+                            format!(
+                                "unexpected solution from {}#{} at nonce={}",
+                                solution.backend, solution.backend_id, solution.nonce
+                            ),
+                        );
+                    }
+                }
+            }
+
+            Ok((RuntimeBackendEventAction::None, None))
+        }
+        BackendEvent::Warning {
+            backend_id,
+            backend,
+            message,
+        } => {
+            if matches!(mode, RuntimeMode::Mining) {
+                crate::diagnostics::record(
+                    seine_telemetry::DiagnosticCode::BackendWarning,
+                    crate::diagnostics::classify(&message),
+                    Some(backend),
+                );
+            }
+            let tag = match mode {
+                RuntimeMode::Mining => "BACKEND",
+                RuntimeMode::Bench => "BENCH",
+            };
+            warn(tag, format!("{backend}#{backend_id}: {message}"));
+            return Ok((RuntimeBackendEventAction::None, None));
+        }
+        BackendEvent::Error {
+            backend_id,
+            backend,
+            message,
+        } => {
+            if matches!(mode, RuntimeMode::Mining) {
+                crate::diagnostics::record(
+                    seine_telemetry::DiagnosticCode::BackendError,
+                    crate::diagnostics::classify(&message),
+                    Some(backend),
+                );
+            }
+            match mode {
+                RuntimeMode::Mining => {
+                    error(
+                        "BACKEND",
+                        format!("{backend}#{backend_id} runtime error: {message}"),
+                    );
+                }
+                RuntimeMode::Bench => {
+                    error(
+                        "BENCH",
+                        format!("backend '{backend}#{backend_id}' runtime error: {message}"),
+                    );
+                }
+            }
+
+            let removed = remove_backend_by_id(backends, backend_id, backend_executor);
+            if removed {
+                if backends.is_empty() {
+                    match mode {
+                        RuntimeMode::Mining => {
+                            bail!(
+                                "all mining backends are unavailable after failure in '{backend}#{backend_id}'"
+                            );
+                        }
+                        RuntimeMode::Bench => {
+                            bail!(
+                                "all benchmark backends are unavailable after failure in '{backend}#{backend_id}'"
+                            );
+                        }
+                    }
+                }
+
+                match mode {
+                    RuntimeMode::Mining => {
+                        warn(
+                            "BACKEND",
+                            format!(
+                                "quarantined {backend}#{backend_id}; continuing with {}",
+                                backend_names(backends)
+                            ),
+                        );
+                    }
+                    RuntimeMode::Bench => {
+                        warn(
+                            "BENCH",
+                            format!(
+                                "quarantined {backend}#{backend_id}; remaining backends={}",
+                                backend_names(backends)
+                            ),
+                        );
+                    }
+                }
+                Ok((RuntimeBackendEventAction::TopologyChanged, None))
+            } else {
+                if mode == RuntimeMode::Mining {
+                    warn(
+                        "BACKEND",
+                        format!("ignoring error from unavailable backend '{backend}#{backend_id}'"),
+                    );
+                }
+                Ok((RuntimeBackendEventAction::None, None))
+            }
+        }
+    }
+}
+
+pub(super) fn drain_runtime_backend_events(
+    backend_events: &Receiver<BackendEvent>,
+    epoch: u64,
+    backends: &mut Vec<BackendSlot>,
+    mode: RuntimeMode,
+    backend_executor: &backend_executor::BackendExecutor,
+) -> Result<(
+    RuntimeBackendEventAction,
+    Vec<crate::backend::MiningSolution>,
+)> {
+    let mut action = RuntimeBackendEventAction::None;
+    let mut solutions = Vec::new();
+    while let Ok(event) = backend_events.try_recv() {
+        let (event_action, maybe_solution) =
+            handle_runtime_backend_event(event, epoch, backends, mode, backend_executor)?;
+        if event_action == RuntimeBackendEventAction::TopologyChanged {
+            action = RuntimeBackendEventAction::TopologyChanged;
+        }
+        if let Some(solution) = maybe_solution {
+            solutions.push(solution);
+        }
+    }
+    Ok((action, solutions))
+}
+
+fn control_backend_slots(
+    backends: &mut Vec<BackendSlot>,
+    mode: RuntimeMode,
+    include_fence: bool,
+    backend_executor: &backend_executor::BackendExecutor,
+) -> Result<RuntimeBackendEventAction> {
+    if backends.is_empty() {
+        return Ok(RuntimeBackendEventAction::None);
+    }
+
+    let mut failures = BackendFailureMap::new();
+
+    let (mut survivors, cancel_failures) = run_backend_control_phase(
+        std::mem::take(backends),
+        BackendControlPhase::Cancel,
+        backend_executor,
+    );
+    merge_backend_failures(&mut failures, cancel_failures);
+
+    if include_fence && !survivors.is_empty() {
+        let (after_fence, fence_failures) =
+            run_backend_control_phase(survivors, BackendControlPhase::Fence, backend_executor);
+        survivors = after_fence;
+        merge_backend_failures(&mut failures, fence_failures);
+    }
+
+    *backends = survivors;
+    backend_executor.prune(backends);
+
+    if failures.is_empty() {
+        return Ok(RuntimeBackendEventAction::None);
+    }
+
+    for (backend_id, (backend, messages)) in &failures {
+        let details = messages.join(" | ");
+        match mode {
+            RuntimeMode::Mining => {
+                error(
+                    "BACKEND",
+                    format!("{backend}#{backend_id} control error: {details}"),
+                );
+            }
+            RuntimeMode::Bench => {
+                error(
+                    "BENCH",
+                    format!("backend '{backend}#{backend_id}' control error: {details}"),
+                );
+            }
+        }
+    }
+
+    if backends.is_empty() {
+        let failed = failures
+            .iter()
+            .map(|(backend_id, (backend, _))| format!("{backend}#{backend_id}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        match mode {
+            RuntimeMode::Mining => {
+                bail!("all mining backends are unavailable after control failure in {failed}");
+            }
+            RuntimeMode::Bench => {
+                bail!("all benchmark backends are unavailable after control failure in {failed}");
+            }
+        }
+    }
+
+    let remaining = backend_names(backends);
+    for (backend_id, (backend, _)) in &failures {
+        match mode {
+            RuntimeMode::Mining => {
+                warn(
+                    "BACKEND",
+                    format!(
+                        "quarantined {backend}#{backend_id} after control failure; continuing with {remaining}"
+                    ),
+                );
+            }
+            RuntimeMode::Bench => {
+                warn(
+                    "BENCH",
+                    format!(
+                        "quarantined {backend}#{backend_id} after control failure; remaining backends={remaining}"
+                    ),
+                );
+            }
+        }
+    }
+
+    Ok(RuntimeBackendEventAction::TopologyChanged)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BackendControlPhase {
+    Cancel,
+    Fence,
+}
+
+impl BackendControlPhase {
+    fn action_label(self) -> &'static str {
+        match self {
+            Self::Cancel => "cancel",
+            Self::Fence => "fence",
+        }
+    }
+}
+
+fn run_backend_control_phase(
+    slots: Vec<BackendSlot>,
+    phase: BackendControlPhase,
+    backend_executor: &backend_executor::BackendExecutor,
+) -> (Vec<BackendSlot>, BackendFailureMap) {
+    if slots.is_empty() {
+        return (Vec::new(), BackendFailureMap::new());
+    }
+
+    let expected = slots.len();
+    let mut slots_by_idx: Vec<Option<BackendSlot>> = slots.into_iter().map(Some).collect();
+    let backend_tasks = slots_by_idx
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, slot_opt)| {
+            slot_opt.as_ref().map(|slot| BackendTask {
+                idx,
+                backend_id: slot.id,
+                backend: slot.backend.name(),
+                backend_handle: Arc::clone(&slot.backend),
+                kind: match phase {
+                    BackendControlPhase::Cancel => BackendTaskKind::Cancel,
+                    BackendControlPhase::Fence => BackendTaskKind::Fence,
+                },
+                timeout: slot.runtime_policy.control_timeout,
+            })
+        })
+        .collect();
+    let mut outcomes = backend_executor.dispatch_backend_tasks(backend_tasks);
+    if outcomes.len() < expected {
+        outcomes.resize_with(expected, || None);
+    }
+
+    let mut survivors = Vec::new();
+    let mut failures = BackendFailureMap::new();
+    let action_label = phase.action_label();
+
+    for (idx, outcome_slot) in outcomes.iter_mut().enumerate().take(expected) {
+        let Some(slot) = slots_by_idx.get_mut(idx).and_then(Option::take) else {
+            continue;
+        };
+        let timeout = slot
+            .runtime_policy
+            .control_timeout
+            .max(Duration::from_millis(1));
+        let backend_id = slot.id;
+        let backend = slot.backend.name();
+        let outcome = outcome_slot.take();
+        if let Some((kind, detail)) = control_failure_detail(phase, outcome.as_ref()) {
+            crate::diagnostics::record_failure(
+                DiagnosticCode::BackendQuarantined,
+                kind,
+                Some(backend),
+                detail,
+            );
+        }
+        match outcome {
+            Some(BackendTaskDispatchResult::Completed(Ok(()))) => survivors.push((idx, slot)),
+            Some(BackendTaskDispatchResult::Completed(Err(err))) => {
+                backend_executor.quarantine_backend(backend_id, Arc::clone(&slot.backend));
+                backend_executor.remove_backend_worker(backend_id, &slot.backend);
+                failures
+                    .entry(backend_id)
+                    .or_insert_with(|| (backend, Vec::new()))
+                    .1
+                    .push(format!("{action_label} failed: {err:#}"));
+            }
+            Some(BackendTaskDispatchResult::TimedOut(BackendTaskTimeoutKind::Enqueue)) => {
+                backend_executor.quarantine_backend(backend_id, Arc::clone(&slot.backend));
+                backend_executor.remove_backend_worker(backend_id, &slot.backend);
+                failures
+                    .entry(backend_id)
+                    .or_insert_with(|| (backend, Vec::new()))
+                    .1
+                    .push(format!(
+                        "{action_label} dispatch queue remained saturated for {}ms before enqueue; backend quarantined",
+                        timeout.as_millis()
+                    ));
+            }
+            Some(BackendTaskDispatchResult::TimedOut(BackendTaskTimeoutKind::Execution)) | None => {
+                backend_executor.quarantine_backend(backend_id, Arc::clone(&slot.backend));
+                backend_executor.remove_backend_worker(backend_id, &slot.backend);
+                failures
+                    .entry(backend_id)
+                    .or_insert_with(|| (backend, Vec::new()))
+                    .1
+                    .push(format!(
+                        "{action_label} timed out after {}ms; backend quarantined",
+                        timeout.as_millis()
+                    ));
+            }
+        }
+    }
+
+    survivors.sort_by_key(|(idx, _)| *idx);
+    (
+        survivors
+            .into_iter()
+            .map(|(_, slot)| slot)
+            .collect::<Vec<_>>(),
+        failures,
+    )
+}
+
+fn control_failure_detail(
+    phase: BackendControlPhase,
+    outcome: Option<&BackendTaskDispatchResult>,
+) -> Option<(DiagnosticKind, FailureDetail)> {
+    let (reason, kind) = match outcome {
+        Some(BackendTaskDispatchResult::Completed(Ok(()))) => return None,
+        Some(BackendTaskDispatchResult::Completed(Err(err))) => (
+            FailureReason::BackendControlFailed,
+            crate::diagnostics::classify(&format!("{err:#}")),
+        ),
+        Some(BackendTaskDispatchResult::TimedOut(BackendTaskTimeoutKind::Enqueue)) => (
+            FailureReason::BackendEnqueueTimedOut,
+            DiagnosticKind::Timeout,
+        ),
+        Some(BackendTaskDispatchResult::TimedOut(BackendTaskTimeoutKind::Execution)) | None => (
+            FailureReason::BackendExecutionTimedOut,
+            DiagnosticKind::Timeout,
+        ),
+    };
+    let operation = match phase {
+        BackendControlPhase::Cancel => DiagnosticOperation::BackendCancel,
+        BackendControlPhase::Fence => DiagnosticOperation::BackendFence,
+    };
+    Some((kind, FailureDetail::new(reason, operation)))
+}
+
+fn merge_backend_failures(failures: &mut BackendFailureMap, additional: BackendFailureMap) {
+    for (backend_id, (backend, messages)) in additional {
+        failures
+            .entry(backend_id)
+            .or_insert_with(|| (backend, Vec::new()))
+            .1
+            .extend(messages);
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn control_failures_keep_operation_and_timeout_stage() {
+        for (phase, operation) in [
+            (
+                BackendControlPhase::Cancel,
+                DiagnosticOperation::BackendCancel,
+            ),
+            (
+                BackendControlPhase::Fence,
+                DiagnosticOperation::BackendFence,
+            ),
+        ] {
+            for (stage, reason) in [
+                (
+                    BackendTaskTimeoutKind::Enqueue,
+                    FailureReason::BackendEnqueueTimedOut,
+                ),
+                (
+                    BackendTaskTimeoutKind::Execution,
+                    FailureReason::BackendExecutionTimedOut,
+                ),
+            ] {
+                let result = BackendTaskDispatchResult::TimedOut(stage);
+                let (kind, detail) = control_failure_detail(phase, Some(&result)).unwrap();
+                assert_eq!(kind, DiagnosticKind::Timeout);
+                assert_eq!(detail.reason, reason);
+                assert_eq!(detail.operation, operation);
+            }
+        }
+        let success = BackendTaskDispatchResult::Completed(Ok(()));
+        assert!(control_failure_detail(BackendControlPhase::Cancel, Some(&success)).is_none());
+        let failure =
+            BackendTaskDispatchResult::Completed(Err(anyhow::anyhow!("idle wait timed out")));
+        let (kind, detail) =
+            control_failure_detail(BackendControlPhase::Cancel, Some(&failure)).unwrap();
+        assert_eq!(kind, DiagnosticKind::Timeout);
+        assert_eq!(detail.reason, FailureReason::BackendControlFailed);
+        assert_eq!(
+            control_failure_detail(BackendControlPhase::Fence, None)
+                .unwrap()
+                .1
+                .reason,
+            FailureReason::BackendExecutionTimedOut
+        );
+    }
+}

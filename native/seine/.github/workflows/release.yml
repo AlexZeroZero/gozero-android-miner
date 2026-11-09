@@ -1,0 +1,450 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # A manual run builds, checks and packages every platform as workflow
+  # artifacts; only version tags publish a release.
+  workflow_dispatch:
+
+jobs:
+  # AMD kernels compiled ahead of time with hipRTC (no GPU needed), built into
+  # the binaries with the AMD backend for hosts without hipRTC.
+  amd-code-objects:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - name: Install build tools and the ROCm 10.1 runtime (hipRTC)
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git gpg
+          mkdir -p -m 0755 /etc/apt/keyrings
+          curl -fsSL https://stable.repo.amd.com/rocm/gpg/packages.gpg | gpg --dearmor > /etc/apt/keyrings/amdrocm.gpg
+          printf '%s\n' 'Types: deb' 'URIs: https://stable.repo.amd.com/rocm/core/packages/ubuntu2404/' \
+            'Suites: stable' 'Components: main' 'Architectures: amd64' \
+            'Signed-By: /etc/apt/keyrings/amdrocm.gpg' > /etc/apt/sources.list.d/amdrocm-stable.sources
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends amdrocm-runtime10.1
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.93.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: amd-code-objects
+
+      - name: Export AMD code objects
+        run: |
+          cargo build --release --locked --no-default-features --features amd
+          LD_LIBRARY_PATH=/opt/rocm/core-10.1/lib target/release/seine --amd-export-code-objects amd-code-objects
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amd-code-objects
+          path: amd-code-objects
+          if-no-files-found: error
+
+  build:
+    needs: amd-code-objects
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds run in Ubuntu 20.04 so the binary needs at most
+          # glibc 2.31 and starts on older distributions and mining OSes.
+          - os: ubuntu-latest
+            container: ubuntu:20.04
+            target: x86_64-unknown-linux-gnu
+            name: seine-linux-x86_64
+            # NVIDIA (default) plus the AMD HIP backend; both resolve their
+            # runtimes at startup via dlopen, so the build needs neither toolkit.
+            features: --features amd
+          - os: ubuntu-24.04-arm
+            container: ubuntu:20.04
+            target: aarch64-unknown-linux-gnu
+            name: seine-linux-aarch64
+            features: --no-default-features
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: seine-windows-x86_64
+            # NVIDIA (default) plus the AMD HIP backend, which loads the HIP
+            # runtime the AMD graphics driver installs and uses the built-in kernels.
+            features: --features amd
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            name: seine-macos-x86_64
+            features: --no-default-features
+          - os: macos-15
+            target: aarch64-apple-darwin
+            name: seine-macos-aarch64
+            features: --no-default-features --features metal
+
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    env:
+      # Set only after HTTPS ingestion and the published privacy policy are verified.
+      SEINE_TELEMETRY_URL: ${{ vars.SEINE_TELEMETRY_URL }}
+      # Lets these binaries install newer releases automatically.
+      SEINE_RELEASE_BUILD: "1"
+
+    steps:
+      - name: Install build tools (container)
+        if: matrix.container
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git python3
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: actions/download-artifact@v4
+        if: contains(matrix.features, 'amd')
+        with:
+          name: amd-code-objects
+          path: amd-code-objects
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ -f amd-code-objects/manifest.tsv ]; then
+            # Native path on Windows (pwd -W), for build.rs.
+            export SEINE_AMD_CODE_OBJECTS="$(pwd -W 2>/dev/null || pwd)/amd-code-objects"
+            echo "SEINE_AMD_CODE_OBJECTS=$SEINE_AMD_CODE_OBJECTS" >> "$GITHUB_ENV"
+          fi
+          cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features || '' }}
+
+      - name: Verify native Linux ARM CPU kernels
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          cargo test --release --locked --target ${{ matrix.target }} -p blocknet-pow-kernel
+          cargo run --release --locked --target ${{ matrix.target }} -p blocknet-pow-kernel --example verify_cpu_kernels
+
+      - name: Test built-in AMD kernels
+        if: contains(matrix.features, 'amd')
+        shell: bash
+        run: |
+          cargo test --release --locked --target ${{ matrix.target }} ${{ matrix.features || '' }} backend::amd::code_objects::tests::embedded_kernels_match_this_builds_source -- --exact --test-threads=1 2>&1 | tee built-in-kernels.log
+          grep -q 'test result: ok. 1 passed' built-in-kernels.log
+
+      - name: Test updater installation and restart
+        shell: bash
+        run: |
+          cargo test --release --locked --target ${{ matrix.target }} ${{ matrix.features || '' }} self_update::tests:: -- --test-threads=1
+
+      - name: Check Linux glibc requirement
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          newest=$(objdump -T "target/${{ matrix.target }}/release/seine" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "newest glibc symbol: ${newest}"
+          test "$(printf '%s\n' "${newest#GLIBC_}" 2.31 | sort -V | tail -1)" = 2.31
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="${RUNNER_TEMP}/${{ matrix.name }}"
+          mkdir -p "${stage}"
+          cp "target/${{ matrix.target }}/release/seine" "${stage}/seine"
+          cp LICENSE "${stage}/SEINE-LICENSE.txt"
+          cp README.md "${stage}/README.md"
+          cp PRIVACY.md "${stage}/PRIVACY.md"
+          (
+            cd "${stage}"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum PRIVACY.md README.md SEINE-LICENSE.txt seine > SHA256SUMS.txt
+            else
+              shasum -a 256 PRIVACY.md README.md SEINE-LICENSE.txt seine > SHA256SUMS.txt
+            fi
+          )
+          tar -C "${stage}" -czf "${GITHUB_WORKSPACE}/${{ matrix.name }}.tar.gz" .
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nvrtcVersion = '12.8.61'
+          $nvrtcArchive = "cuda_nvrtc-windows-x86_64-$nvrtcVersion-archive.zip"
+          $nvrtcUrl = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/windows-x86_64/$nvrtcArchive"
+          $nvrtcSha256 = 'e43603b09f8a52d681ceb814c00b655af19da53692ab91671dabbf8071c8f93d'
+          $nvrtcExtract = Join-Path $env:RUNNER_TEMP 'seine-nvrtc'
+          $stage = Join-Path $env:RUNNER_TEMP '${{ matrix.name }}'
+
+          Invoke-WebRequest -Uri $nvrtcUrl -OutFile $nvrtcArchive
+          $actualSha256 = (Get-FileHash -Algorithm SHA256 $nvrtcArchive).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $nvrtcSha256) {
+            throw "NVRTC archive checksum mismatch: expected $nvrtcSha256, got $actualSha256"
+          }
+
+          Expand-Archive -LiteralPath $nvrtcArchive -DestinationPath $nvrtcExtract
+          $nvrtcRoot = Join-Path $nvrtcExtract "cuda_nvrtc-windows-x86_64-$nvrtcVersion-archive"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item 'target/${{ matrix.target }}/release/seine.exe' $stage
+          Copy-Item (Join-Path $nvrtcRoot 'bin/nvrtc64_120_0.dll') $stage
+          Copy-Item (Join-Path $nvrtcRoot 'bin/nvrtc-builtins64_128.dll') $stage
+          Copy-Item 'LICENSE' (Join-Path $stage 'SEINE-LICENSE.txt')
+          Copy-Item (Join-Path $nvrtcRoot 'LICENSE') (Join-Path $stage 'NVIDIA-CUDA-NVRTC-LICENSE.txt')
+          Copy-Item 'README.md' $stage
+          Copy-Item 'PRIVACY.md' $stage
+
+          Get-ChildItem $stage -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content -Encoding ascii (Join-Path $stage 'SHA256SUMS.txt')
+
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath '${{ matrix.name }}.zip'
+
+      - name: Check packaged miner (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir package-check
+          tar -xzf "${{ matrix.name }}.tar.gz" -C package-check
+          python3 scripts/check_memo_rollout.py --binary package-check/seine
+
+      - name: Check packaged miner (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Expand-Archive -LiteralPath '${{ matrix.name }}.zip' -DestinationPath package-check
+          python scripts/check_memo_rollout.py --binary package-check/seine.exe --skip-interactive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}.tar.gz
+            ${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  windows-sign:
+    needs: build
+    runs-on: windows-latest
+    environment: windows-signing
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SIGNING_ENABLED: ${{ vars.SEINE_WINDOWS_SIGNING_ENABLED }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      SIGNING_ENDPOINT: ${{ vars.SEINE_SIGNING_ENDPOINT }}
+      SIGNING_ACCOUNT: ${{ vars.SEINE_SIGNING_ACCOUNT }}
+      SIGNING_PROFILE: ${{ vars.SEINE_SIGNING_PROFILE }}
+      SIGNING_PUBLISHER: ${{ vars.SEINE_SIGNING_PUBLISHER }}
+    steps:
+      - name: Check signing configuration
+        shell: pwsh
+        run: |
+          if ($env:SIGNING_ENABLED -eq '' -or $env:SIGNING_ENABLED -eq 'false') {
+            Write-Warning 'Windows publisher signing is not enabled. See docs/windows-signing.md.'
+            'Windows package: Authenticode signing is not enabled.' >> $env:GITHUB_STEP_SUMMARY
+          } elseif ($env:SIGNING_ENABLED -ne 'true') {
+            throw 'SEINE_WINDOWS_SIGNING_ENABLED must be true, false, or unset.'
+          } else {
+            foreach ($name in @('AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_SUBSCRIPTION_ID', 'SIGNING_ENDPOINT', 'SIGNING_ACCOUNT', 'SIGNING_PROFILE', 'SIGNING_PUBLISHER')) {
+              if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+                throw "Missing signing configuration: $name"
+              }
+            }
+          }
+
+      - uses: actions/checkout@v4
+        if: env.SIGNING_ENABLED == 'true'
+
+      - uses: actions/download-artifact@v4
+        if: env.SIGNING_ENABLED == 'true'
+        with:
+          name: seine-windows-x86_64
+
+      - name: Extract Windows package
+        if: env.SIGNING_ENABLED == 'true'
+        shell: pwsh
+        run: Expand-Archive -LiteralPath seine-windows-x86_64.zip -DestinationPath windows-package
+
+      - name: Sign in to Azure
+        if: env.SIGNING_ENABLED == 'true'
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows executable
+        if: env.SIGNING_ENABLED == 'true'
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ env.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ env.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ env.SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\windows-package\seine.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: Seine miner
+          description-url: https://seineminer.com
+          exclude-environment-credential: true
+          exclude-azure-cli-credential: false
+
+      - name: Verify signature and rebuild Windows package
+        if: env.SIGNING_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          ./scripts/check_windows_signature.ps1 -Path windows-package/seine.exe -ExpectedPublisher $env:SIGNING_PUBLISHER
+          # Hash the signed executable; preserve the bundled NVIDIA files unchanged.
+          Get-ChildItem windows-package -File | Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content -Encoding ascii windows-package/SHA256SUMS.txt
+          Compress-Archive -Path windows-package/* -DestinationPath seine-windows-x86_64.zip -Force
+          Expand-Archive -LiteralPath seine-windows-x86_64.zip -DestinationPath signed-package-check
+          ./scripts/check_windows_signature.ps1 -Path signed-package-check/seine.exe -ExpectedPublisher $env:SIGNING_PUBLISHER
+          python scripts/check_memo_rollout.py --binary signed-package-check/seine.exe --skip-interactive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          'Windows package: publisher signature and timestamp verified.' >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Replace Windows artifact with signed package
+        if: env.SIGNING_ENABLED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: seine-windows-x86_64
+          path: seine-windows-x86_64.zip
+          overwrite: true
+          if-no-files-found: error
+
+  mining-os:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: seine-linux-x86_64
+      - name: Test mining OS packaging
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck jq
+          bash scripts/test_hiveos_package.sh
+          bash scripts/test_mmpos_package.sh
+      - name: Build mining OS packages
+        run: |
+          version="${GITHUB_REF_NAME}"
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-preflight.${GITHUB_SHA:0:12}"
+          fi
+          packaging/hiveos/build.sh --archive seine-linux-x86_64.tar.gz --version "$version" --out-dir dist
+          packaging/mmpos/build.sh --archive seine-linux-x86_64.tar.gz --version "$version" --out-dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seine-mining-os
+          path: dist/seine-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    # Only releases enter the protected environment and request approval.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, mining-os, windows-sign]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Generate archive checksums
+        run: sha256sum seine-*.tar.gz seine-*.zip > SHA256SUMS.txt
+
+      - name: Sign archive checksums
+        env:
+          SEINE_RELEASE_SIGNING_KEY: ${{ secrets.SEINE_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SEINE_RELEASE_SIGNING_KEY" || { echo "::error::SEINE_RELEASE_SIGNING_KEY secret is missing; the miner refuses unsigned releases"; exit 1; }
+          umask 077
+          printf '%s\n' "$SEINE_RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/signing.pem"
+          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/signing.pem" -rawin -in SHA256SUMS.txt -out SHA256SUMS.txt.sig
+          rm -f "$RUNNER_TEMP/signing.pem"
+          # The miner embeds the matching public key (src/self_update.rs); verify here too.
+          cat > "$RUNNER_TEMP/signing.pub" <<'PEM'
+          -----BEGIN PUBLIC KEY-----
+          MCowBQYDK2VwAyEA9grQMoR5CXIcecwpn+EmZTEZ9D0e5QhkpWbQi+8K7O4=
+          -----END PUBLIC KEY-----
+          PEM
+          openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/signing.pub" -rawin -in SHA256SUMS.txt -sigfile SHA256SUMS.txt.sig
+          test "$(wc -c < SHA256SUMS.txt.sig)" -eq 64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seine-signed-packages
+          path: |
+            SHA256SUMS.txt
+            SHA256SUMS.txt.sig
+            seine-*.tar.gz
+            seine-*.zip
+          if-no-files-found: error
+
+      - name: Extract changelog section for this tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          awk -v tag="$GITHUB_REF_NAME" '
+            $0 ~ "^## " tag "([[:space:]]|$)" { found = 1; next }
+            /^## v/ { if (found) exit }
+            found { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ -s RELEASE_NOTES.md ]; then
+            echo "Using CHANGELOG.md section for $GITHUB_REF_NAME"
+          else
+            echo "::warning::No CHANGELOG.md section for $GITHUB_REF_NAME; release body will only have the full-changelog link"
+          fi
+
+          # Keep the comparison link without publishing the generated commit list.
+          # Compare against the latest full release, so the link also covers any
+          # pre-release published since then.
+          notes_args=(-f tag_name="$GITHUB_REF_NAME")
+          previous_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' 2>/dev/null || true)
+          if [ -n "$previous_tag" ] && [ "$previous_tag" != "$GITHUB_REF_NAME" ]; then
+            notes_args+=(-f previous_tag_name="$previous_tag")
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            "${notes_args[@]}" --jq '.body' > GENERATED_NOTES.md
+          printf '\n' >> RELEASE_NOTES.md
+          sed -n '/^\*\*Full Changelog\*\*:/p' GENERATED_NOTES.md >> RELEASE_NOTES.md
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          # Suffixed tags (v1.2.3-rc1) publish as prereleases, which the
+          # updater and the latest-release link never pick up.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
+          files: |
+            SHA256SUMS.txt
+            SHA256SUMS.txt.sig
+            seine-*.tar.gz
+            seine-*.zip
+          generate_release_notes: false

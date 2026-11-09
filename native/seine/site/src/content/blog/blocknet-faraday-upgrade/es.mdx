@@ -1,0 +1,68 @@
+---
+title: 'La actualización Faraday de Blocknet, explicada'
+description: 'Conoce la propuesta Faraday de Blocknet: privacidad poscuántica, migración, palabras de recuperación y tiempos de bloque, con pasos para prepararte.'
+tags: ['Blocknet', 'Faraday', 'Actualización de red']
+faq:
+  - q: '¿Faraday ya está activo en Blocknet?'
+    a: 'El artículo oficial del 27 de octubre de 2026 describe Faraday como una actualización aún en desarrollo y pruebas, prevista para febrero de 2027 en el bloque 103.680. Las fechas, cifras y el diseño pueden cambiar antes del lanzamiento. Son reglas propuestas; utiliza las instrucciones publicadas de cartera y minero para la red actual.'
+  - q: '¿Seguirán funcionando mis palabras de recuperación de Blocknet?'
+    a: 'El plan anunciado indica que las frases existentes de 12 palabras seguirían funcionando, mientras que las carteras nuevas recibirían 24 palabras. Las carteras importadas desde claves sin palabras de recuperación necesitarían una cartera nueva y un traslado de monedas. Conserva tu respaldo actual y sigue las instrucciones finales cuando se publique la actualización.'
+  - q: '¿Qué deben hacer los titulares cuando se lance Faraday?'
+    a: 'El plan concede un año desde la activación para migrar las monedas mediante la cartera. Las monedas sin migrar quedarían permanentemente inutilizables después de ese plazo y las migradas esperarían alrededor de una semana antes de poder gastarse. Los pasos finales todavía no se han publicado; un respaldo de la cartera no completa la migración.'
+sourceHash: 7645976ef060
+translation: draft
+---
+
+Sigue la propuesta Faraday de Blocknet y prepara las comprobaciones de cartera, nodo y minero que te correspondan. Esta guía incorpora la [explicación oficial del 27 de octubre de 2026](https://blocknetcrypto.com/blog/2026-10-27-how-blocknet-privacy-survives-quantum-computers/). Faraday sigue en desarrollo y pruebas: el proyecto indica que las fechas, cifras y detalles pueden cambiar. Todo lo descrito aquí como cambio de Faraday pertenece a ese plan futuro.
+
+## ¿Qué es la actualización Faraday de Blocknet?
+
+<Answer>
+Faraday es una actualización prevista de la cadena existente de Blocknet. Propone pruebas de gasto basadas en hash, detección de pagos mediante ML-KEM y privacidad del gasto dentro del conjunto de monedas Faraday. La transición anunciada incluye migración de carteras, nuevos formatos de direcciones y recuperación y cambios en los tiempos de bloque. El historial de la cadena continuaría.
+</Answer>
+
+<img src="/assets/blog/blocknet-faraday-upgrade.svg" alt="Una cadena existente continúa tras una actualización propuesta, con un paso de migración de cartera separado y un calendario de la transición prevista." width="1200" height="675" loading="lazy" />
+
+## ¿Cómo cambiarían la privacidad y las pruebas de gasto?
+
+El diseño anunciado sustituye los mecanismos de curvas elípticas que protegen las monedas por mecanismos poscuánticos. Los gastos usarían pruebas basadas en hash construidas con Plonky3 y las carteras detectarían los pagos entrantes mediante ML-KEM. El proyecto los presenta como partes de una misma actualización. La [guía de privacidad actual](/es/blog/blocknet-privacy-features/) explica los mecanismos de la red de hoy; no describe una red Faraday ya activada.
+
+El anillo actual tiene 16 miembros. Con el nuevo plan, un gasto se ocultaría entre el conjunto completo de monedas Faraday, que crecería al incorporarse monedas a ese formato. El anuncio también describe la combinación de pruebas individuales en una prueba de bloque y su descarte individual tras la finalidad. Son descripciones del diseño del proyecto, no funciones probadas por esta guía en mainnet. Sigue la implementación publicada y su documentación conforme avance el desarrollo.
+
+## ¿Cuándo se prevé activar Faraday?
+
+El nuevo anuncio apunta a febrero de 2027, cerca del primer aniversario de mainnet, en el bloque 103.680. El [resumen oficial](https://blocknetcrypto.com/#faraday) da como fecha aproximada el 16 de febrero. La altura de activación y la estimación del calendario tienen funciones distintas: la producción real de bloques determina cuándo se alcanza una altura y las pruebas pueden cambiar el plan. Conserva su carácter provisional al crear recordatorios.
+
+El periodo de migración propuesto dura un año después de la activación. Planifica según las condiciones finales de activación y cierre que publique el proyecto, sin dar por hecho que un recordatorio las confirma. Guarda la fuente oficial y la fecha de tu última consulta. Revisa ese registro cuando aparezca una versión compatible de la cartera o del core; publicar un artículo no significa que la actualización esté activa.
+
+## ¿Cómo migrarían las monedas existentes?
+
+Faraday continuaría la cadena existente y su historial mientras los titulares trasladan las monedas al nuevo formato mediante sus carteras. El anuncio indica que los pasos exactos se publicarán antes de la activación. También propone una espera de aproximadamente una semana antes de poder gastar las monedas migradas. Ten en cuenta esa espera prevista al preparar el acceso a los fondos y verifica las instrucciones finales antes de actuar.
+
+Las monedas sin migrar al terminar el plazo de un año quedarían permanentemente inutilizables según las reglas anunciadas. Completa la migración documentada dentro del plazo y comprueba el resultado en la cartera. Un [respaldo de cartera](/es/blog/blocknet-wallet-backup-restore/) conserva el material de recuperación, pero no migra por sí mismo las monedas. Aquí no se proporciona ningún comando de migración: utiliza el procedimiento de la versión que realmente la admita cuando esté disponible.
+
+## ¿Qué ocurre con las palabras de recuperación y las direcciones?
+
+El artículo oficial dice que las frases existentes de 12 palabras seguirían funcionando y las carteras nuevas recibirían 24 palabras. Para una cartera importada desde claves que nunca tuvo palabras de recuperación, el plan requiere crear otra y trasladar las monedas. Comprueba qué material de recuperación tiene tu cartera actual y protégelo ahora. La [guía de respaldo y restauración](/es/blog/blocknet-wallet-backup-restore/) cubre el software publicado actualmente, no comandos futuros de recuperación Faraday.
+
+Las direcciones poscuánticas propuestas tienen aproximadamente 1700 caracteres. Los métodos anunciados para utilizarlas son copiar, pegar y códigos QR, mientras que los [nombres Blocknet ID](/es/blog/blocknet-id-pay-by-name/) ofrecen un identificador de pago más corto. Sigue el formato de la cartera actualizada cuando se publique y compara el destinatario resuelto antes de confirmar un pago. Un ejemplo de dirección actual no debe reutilizarse como dirección de prueba del formato futuro.
+
+## ¿Cómo cambiarían los tiempos de bloque y las recompensas?
+
+El anuncio propone aumentar el tiempo objetivo de bloque de 5 a 10 minutos y duplicar la recompensa por bloque en la transición. La mitad de bloques objetivo con el doble de recompensa conservaría el ritmo previsto de emisión; no duplicaría las monedas emitidas al día. La [guía del calendario de recompensas](https://bntpool.com/blog/es/blocknet-block-reward-schedule/) explica el calendario actual. Lee siempre las cifras futuras junto con sus supuestos sobre el mes de la bifurcación y los tiempos.
+
+La misma propuesta fija la profundidad máxima de reorganización en 60 bloques y mantiene una espera de 60 bloques para gastar monedas recién minadas. Con el objetivo propuesto de 10 minutos, equivale a unas 10 horas. Las carteras seguirían esperando 10 confirmaciones para marcar un pago como seguro, equivalentes a unos 100 minutos. Son estimaciones basadas en objetivos, no plazos garantizados: los intervalos reales varían y aún deben confirmarse las reglas finales.
+
+## ¿Qué deben preparar los operadores de nodos y los mineros?
+
+Mantén un inventario de la versión del core, la red, el directorio de datos y los servicios dependientes. El anuncio describe actualizaciones automáticas del nodo, pero los operadores deben comprobar su política de versiones y la versión que implemente la bifurcación. La [guía del nodo](/es/blog/run-blocknet-node/) cubre el funcionamiento actual, incluida la fijación de versiones. Planifica los reinicios teniendo en cuenta carteras, exploradores y pools y comprueba después los pares, el progreso de la cadena y las reconexiones.
+
+La minería también cambia en la bifurcación y el anuncio indica que tendrá otro artículo. No proporciona parámetros futuros de seine, clasificaciones de hardware ni un procedimiento de transición del pool. Utiliza la [guía actual de Argon2id](/es/blog/argon2id-proof-of-work-explained/) y la [configuración de bntpool](https://bntpool.com/blog/es/mine-blocknet-on-bntpool/) para la red de hoy. Cuando lleguen versiones compatibles e instrucciones, comprueba conjuntamente el minero y el pool y verifica nuevas shares aceptadas tras actualizar.
+
+## Separa la migración de monedas de las actualizaciones de software
+
+Usa un registro breve: dónde está tu respaldo verificado, qué material de recuperación tienes, las versiones de cartera y core en ejecución y qué instrucciones oficiales faltan. Registra las actualizaciones de nodo, de minero y la migración de monedas como tareas separadas con comprobaciones propias. Descargar una versión o ver sincronizarse el nodo no demuestra que tus monedas hayan migrado.
+
+El artículo oficial describe pruebas continuas del verificador, comparaciones entre una implementación de referencia y circuitos de prueba y trabajos públicos de medición. Esos informes explican el desarrollo del proyecto; la versión final sigue siendo la fuente de instrucciones operativas. Revisa el anuncio según avance el calendario, actualiza los recordatorios y registra el resultado de la migración cuando esté disponible. Mientras tanto, mantén respaldos actuales y utiliza la [guía de cartera](/es/blog/blocknet-wallet-for-mining/) para las operaciones de hoy.
+
+<CTA target="seine" title="Sigue la minería de Blocknet con seine" text="Explora el minero actual y guarda sus instrucciones publicadas junto a tu plan de actualización de Blocknet." />

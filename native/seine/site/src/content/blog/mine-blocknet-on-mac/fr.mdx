@@ -1,0 +1,144 @@
+---
+title: Comment miner Blocknet sur un Mac
+description: "macOS: Téléchargez seine, extrayez les fichiers, saisissez votre adresse Blocknet et vérifiez les shares acceptées sur bntpool.com. Commencez avec les réglages automatiques ; les conseils de performance viennent après l’installation."
+tags: [Guide de minage, macOS, Apple Silicon, seine]
+faq:
+  - q: 'Peut-on miner Blocknet sur un MacBook Air ?'
+    a: 'Oui. Tous les Mac Apple Silicon font tourner seine, MacBook Air compris. Téléchargez seine-macos-aarch64.tar.gz, décompressez-le dans le Terminal et lancez ./seine. Chaque thread a besoin d''environ 2 GB de mémoire : un MacBook Air de 16 GB peut donc accueillir jusqu''à sept threads, et seine fixe ce nombre pour vous d''après la mémoire libre.'
+  - q: 'seine utilise-t-il le GPU pour miner Blocknet sur un Mac ?'
+    a: 'Sur Apple Silicon, seine mine par défaut sur le CPU, car c''est le choix le plus rapide. Le CPU et les cœurs graphiques partagent la même mémoire unifiée, et la preuve de travail Argon2id de Blocknet dépend de la bande passante mémoire. Sur le M4 Max, le minage sur CPU seul a donné le hashrate le plus élevé, donc seine l''utilise automatiquement.'
+  - q: 'De combien de mémoire un Mac a-t-il besoin pour miner Blocknet ?'
+    a: 'Chaque thread de minage travaille sur un bloc de mémoire de 2 GiB : comptez donc environ 2 GB par thread. Un Mac de 16 GB peut accueillir jusqu''à sept threads, un Mac de 32 GB jusqu''à 15 et un Mac de 64 GB jusqu''à 31. seine compte la mémoire libre et adapte aussi le nombre de threads à vos cœurs.'
+  - q: 'Peut-on miner Blocknet sur un Mac Intel ?'
+    a: 'Oui. seine publie une archive distincte pour les Mac Intel, seine-macos-x86_64.tar.gz, et les étapes sont les mêmes que sur Apple Silicon. Téléchargez-la, décompressez-la dans le Terminal, lancez ./seine et collez votre adresse Blocknet ou votre @name. seine dimensionne ses threads selon votre mémoire et commence à miner sur bntpool.com par défaut.'
+sourceHash: 10bf5cec430a
+translation: draft
+---
+
+## Peut-on miner Blocknet sur un Mac ?
+
+<Answer>
+Téléchargez seine, extrayez les fichiers, saisissez votre adresse Blocknet et vérifiez les shares acceptées sur bntpool.com. Commencez avec les réglages automatiques ; les conseils de performance viennent après l’installation.
+</Answer>
+
+## Étape 1 : télécharger la bonne version
+
+Dans le menu Apple → À propos de ce Mac, consultez la puce ou le processeur. Dans la [section téléchargement](/fr/#download), choisissez `seine-macos-aarch64.tar.gz` pour Apple Silicon ou `seine-macos-x86_64.tar.gz` pour Intel.
+
+## Étape 2 : extraire et lancer
+
+Ouvrez Terminal. Ces commandes supposent que l’archive se trouve dans le dossier Downloads ; adaptez le chemin si nécessaire. Sur un Mac Intel, remplacez `seine-macos-aarch64.tar.gz` par `seine-macos-x86_64.tar.gz`. Elles extraient seine dans votre dossier personnel et le lancent :
+
+```sh
+mkdir -p "$HOME/seine"
+tar -xzf "$HOME/Downloads/seine-macos-aarch64.tar.gz" -C "$HOME/seine"
+cd "$HOME/seine"
+./seine
+```
+
+## Étape 3 : saisir l’adresse de votre portefeuille
+
+Collez votre adresse publique de réception Blocknet ou votre `@name` enregistré, puis appuyez sur Entrée pour accepter `stratum+tcp://bntpool.com:3333`. Le [guide du portefeuille](/fr/blog/blocknet-wallet-for-mining/) explique où trouver votre adresse. Seine n’a besoin ni de votre phrase de récupération ni de vos clés de dépense. Il attribue automatiquement un nom au worker du pool.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="Demandes d’adresse et de pool au premier lancement. Remplacez l’exemple par votre adresse ou votre nom enregistré." loading="lazy" />
+  </picture>
+  <figcaption>Demandes d’adresse et de pool au premier lancement. Remplacez l’exemple par votre adresse ou votre nom enregistré.</figcaption>
+</figure>
+
+Seine choisit les threads et se règle automatiquement. Lors des prochains lancements, utilisez le même dossier pour réutiliser `seine-data/seine.config.json`.
+
+## Étape 4 : vérifier les shares acceptées
+
+Dans le [tableau de bord](/fr/blog/seine-dashboard-explained/), cherchez un hashrate et un compteur **Accepted** qui augmente. Une share acceptée confirme que le pool a reçu votre travail ; cela ne signifie pas qu’un paiement a eu lieu. Appuyez sur `q` ou `Ctrl+C` pour arrêter.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="Le véritable tableau de bord de seine avec des données d’exemple. Repérez Accepted ; ces chiffres ne sont pas un benchmark." loading="lazy" />
+  </picture>
+  <figcaption>Le véritable tableau de bord de seine avec des données d’exemple. Repérez Accepted ; ces chiffres ne sont pas un benchmark.</figcaption>
+</figure>
+
+Ouvrez [Mes statistiques](https://bntpool.com/stats?lang=fr) et saisissez la même adresse ou le même nom enregistré pour retrouver votre worker, vos shares et votre solde.
+
+## Si macOS bloque le premier lancement
+
+La version macOS est signée ad hoc. Si macOS bloque le premier lancement, ouvrez Réglages Système, allez dans Confidentialité et sécurité, et autorisez `seine`. Vous pouvez aussi retirer l'indicateur de téléchargement depuis le Terminal et relancer le programme :
+
+```sh
+xattr -d com.apple.quarantine ./seine
+./seine
+```
+
+<MinerSettings os="mac" />
+
+## Pourquoi les Mac Apple Silicon minent-ils bien Blocknet ?
+
+La preuve de travail de Blocknet est [Argon2id](/fr/blog/argon2id-proof-of-work-explained/) avec 2 GiB de mémoire par hachage. Chaque hachage remplit un bloc de mémoire de 2 GiB en relisant au fur et à mesure des parties antérieures de ce bloc : la vitesse d'un thread de minage dépend donc surtout de la rapidité avec laquelle la puce échange des données avec la mémoire. C'est pourquoi chaque thread de seine a besoin d'environ 2 GB de RAM pour lui seul.
+
+Apple Silicon repose sur une mémoire unifiée, qu'[Apple décrit](https://www.apple.com/newsroom/2020/11/apple-unleashes-m1/) comme une mémoire à large bande passante et faible latence réunie en un seul pool. Chaque thread de minage dispose ainsi de beaucoup de bande passante, exactement ce dont un hachage gourmand en mémoire a besoin. Résultat : un ordinateur portable qui mine Blocknet dans la même fourchette que des processeurs de serveur.
+
+## À quelle vitesse un M4 Max mine-t-il Blocknet ?
+
+<Answer>
+Un MacBook Pro de 48 GB équipé de la puce M4 Max a miné Blocknet à 30,94 H/s avec 16 threads sur son seul CPU. À 14 threads placés sur les cœurs de performance, le réglage équilibré que seine utilise par défaut sur cette machine, il a miné à 29,26 H/s en laissant plus de mémoire libre pour les autres applications.
+</Answer>
+
+Ces résultats proviennent de la campagne de validation de seine sur un M4 Max de 48 GB (12 cœurs de performance et 4 cœurs d'efficacité), le 10 juillet 2026 :
+
+| Réglage | Threads | Hashrate |
+|---|---|---|
+| Débit maximal | 16, placement `auto` | 30,94 H/s |
+| Équilibré (plafond par défaut de seine sur ce Mac) | 14, placement `pcore-only` | 29,26 H/s |
+
+## Combien de threads votre Mac peut-il faire tourner ?
+
+Chaque thread a besoin de ses propres 2 GiB de mémoire : c'est donc la mémoire qui fixe le plafond. seine laisse aussi 5 % (au maximum 1 GiB par défaut) de la mémoire de votre Mac libre comme marge lorsqu'il se dimensionne. Cela donne ces limites hautes :
+
+| Mémoire du Mac | Threads que la mémoire peut accueillir |
+|---|---|
+| 16 GB | jusqu'à 7 |
+| 24 GB | jusqu'à 11 |
+| 32 GB | jusqu'à 15 |
+| 36 GB | jusqu'à 17 |
+| 48 GB | jusqu'à 23 |
+| 64 GB | jusqu'à 31 |
+
+Deux facteurs ajustent le nombre final à votre Mac :
+
+- **La mémoire libre.** seine compte la mémoire réellement libre au démarrage : les applications ouvertes réduisent donc un peu le nombre. Si la mémoire devient juste pendant qu'il tourne, seine met des threads en pause et libère leur mémoire.
+- **Les cœurs.** Par défaut sur un Mac, seine utilise tous les cœurs de performance plus la moitié des cœurs d'efficacité. Sur le M4 Max à 12+4 cœurs, cela fait 14 threads, le réglage équilibré du tableau ci-dessus.
+
+Vous n'avez rien à calculer. seine choisit le nombre de threads au démarrage et continue de tester les valeurs voisines pendant qu'il mine.
+
+## Pourquoi seine mine-t-il uniquement sur le CPU sur un Mac ?
+
+Sur Apple Silicon, le CPU et les cœurs graphiques partagent un seul pool de mémoire unifiée. Argon2id dépend de la bande passante mémoire, si bien que le CPU et les cœurs graphiques se disputeraient la même bande passante. Lors des tests de seine sur le M4 Max, le minage sur CPU seul a donné le hashrate le plus élevé : seine le sélectionne donc automatiquement sur tous les Mac Apple Silicon. Vous obtenez la configuration la plus rapide sans aucune option à définir.
+
+## Comment tirer le meilleur d'un Mac ?
+
+- **Laissez seine s'optimiser tout seul.** Il compare les nombres de threads et les kernels CPU sur du vrai travail de minage, ne change de réglage qu'après un gain confirmé et retient le résultat pour le prochain lancement.
+- **Gardez le Mac éveillé.** macOS met en veille un Mac inactif, ce qui met le minage en pause. Lancez seine avec la commande intégrée `caffeinate` pour garder le Mac éveillé tant que seine tourne :
+
+  ```sh
+  caffeinate -i ./seine
+  ```
+
+- **Visez le débit maximal sur un Mac dédié.** Si le Mac ne fait que miner, le réglage qui a atteint 30,94 H/s sur le M4 Max utilise les 16 cœurs et plus de mémoire que le réglage équilibré par défaut :
+
+  ```sh
+  ./seine --backend cpu --threads 16 --cpu-affinity auto
+  ```
+
+Pour toutes les options, consultez le [guide de configuration](https://github.com/zpalmtree/seine/blob/master/docs/guides/configuration.md). Le [guide de minage principal](/fr/blog/how-to-mine-blocknet/) traite des paiements et des autres plateformes.
+
+<Note>
+Ces résultats concernent la preuve de travail Argon2id actuelle de Blocknet. Blocknet prévoit vers le 16 février 2027 une mise à niveau du réseau appelée Faraday, qui doit modifier la preuve de travail, selon [blocknetcrypto.com](https://blocknetcrypto.com/#faraday). seine vérifie la présence de nouvelles versions au démarrage puis toutes les 12 heures : tenez-le à jour.
+</Note>
+
+<CTA target="seine" title="Téléchargez seine pour macOS" text="La version Apple Silicon mine sur le CPU de votre Mac et choisit automatiquement son nombre de threads." />
+
+Ouvrez [Mes statistiques](https://bntpool.com/stats?lang=fr) et saisissez la même adresse ou le même nom enregistré pour retrouver votre worker, vos shares et votre solde.

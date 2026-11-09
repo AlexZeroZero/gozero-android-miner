@@ -1,0 +1,62 @@
+---
+title: 'Comment Blocknet rend les paiements privés par défaut'
+description: 'Découvrez la confidentialité des paiements Blocknet : signatures en anneau, clés uniques, montants cachés, mémos chiffrés et changements proposés par Faraday.'
+tags: ['Blocknet', 'Confidentialité', 'Paiements']
+faq:
+  - q: 'La confidentialité est-elle automatique quand je paie en Blocknet ?'
+    a: 'Oui. Le portefeuille publié construit les paiements ordinaires avec signatures en anneau, clés de sortie uniques, montants cachés et mémos chiffrés. Vous ne choisissez pas un mode privé séparé. La structure publique demeure, et émetteur et destinataire connaissent leurs propres détails. Cela décrit les dépenses normales ; la création des récompenses de bloc suit ses propres règles.'
+  - q: 'Pourquoi une entrée Blocknet a-t-elle 16 membres d’anneau ?'
+    a: 'Une entrée normale utilise une vraie sortie et 15 leurres de la chaîne. Sa signature prouve l’autorisation sans identifier le vrai membre. Le consensus fixe la taille à 16, sans choix individuel par paiement. Les leurres n’apportent pas les fonds de leurs propriétaires, et les images de clé aident à détecter les dépenses répétées.'
+  - q: 'Faraday remplace-t-il déjà le système actuel ?'
+    a: 'Non. Faraday reste une proposition de mise à niveau. L’explication officielle du 27 octobre décrit des preuves de dépense fondées sur le hachage sur l’ensemble des pièces Faraday et un mécanisme ML-KEM distinct pour recevoir. Cet ensemble grandirait avec les pièces entrant dans le nouveau format. Les règles publiées actuelles restent la référence jusqu’à l’activation applicable.'
+sourceHash: '64f1034d2ebb'
+translation: draft
+---
+
+Payer quelqu’un ne devrait pas obliger à publier votre historique de dépenses à tous les lecteurs d’une blockchain. Blocknet applique ses mécanismes de confidentialité aux paiements ordinaires du portefeuille. Ce guide explique la protection automatique, les vérifications du réseau et la place de vos propres registres. Le comportement actuel correspond à core v0.22.0 publié ; la partie Faraday décrit une proposition.
+
+## Que signifie privé par défaut pour un paiement Blocknet ?
+
+<Answer>
+Les paiements ordinaires utilisent des signatures en anneau pour les entrées dépensées, des clés uniques pour les destinataires et des engagements avec preuves de plage pour les montants. Les mémos sont chiffrés et Dandelion++ réduit l’exposition de l’origine réseau. Le portefeuille applique ces couches sans bouton distinct, tandis que structure publique et registres personnels subsistent.
+</Answer>
+
+## Comment la protection par défaut couvre-t-elle l’argent dépensé ?
+
+Quand vous saisissez un destinataire et un montant, le portefeuille construit un paiement au format privé normal. Vous n’avez pas à choisir entre transfert public et protégé. La confidentialité fait ainsi partie de l’usage monétaire de BNT : payer une personne ou une entreprise utilise les mêmes protections fondamentales qu’un autre paiement ordinaire. Le choix d’activer la confidentialité ne devient pas non plus un signe distinctif.
+
+Chaque entrée normale utilise un anneau CLSAG de 16 sorties : votre vraie sortie et 15 leurres de la chaîne. Les [règles de validation publiées](https://github.com/blocknetprivacy/core/blob/5a0a5b510c1dce46f4eeb12c33a291052e44e7b3/transaction.go#L1013) imposent cette taille et des membres qui sont de vraies sorties de la chaîne. La signature prouve l’autorisation sans identifier le membre qui fournit les fonds. Les leurres offrent des sources possibles à la preuve ; ils ne financent pas votre paiement. Une image de clé permet de détecter une dépense répétée. Le [guide des signatures en anneau](/fr/blog/ring-signatures-explained/) explique ce mécanisme.
+
+[![Trois protections d’un paiement Blocknet ordinaire : 1, un anneau de 16 sources possibles ; 2, une clé unique de sortie destinataire ; 3, un engagement de montant caché.](/assets/blog/blocknet-privacy-default.svg)](/assets/blog/blocknet-privacy-default.svg)
+
+Le schéma regroupe trois protections : **1** l’autorisation parmi les membres de l’anneau, **2** la sortie reçue et **3** son montant caché. Aucun membre n’est désigné comme vraie source. Cette vue conceptuelle ne représente pas une transaction réelle.
+
+## Comment protège-t-on le destinataire et la note ?
+
+Votre adresse de réception permet au payeur de construire une sortie pour vous. Le portefeuille dérive une clé de sortie unique au lieu de placer cette adresse familière à côté de chaque paiement sur la chaîne. Il utilise ses informations privées de consultation pour reconnaître les sorties entrantes. Vous pouvez réutiliser l’adresse tandis que les paiements ont leurs propres clés de sortie. Le [guide des adresses furtives](/fr/blog/stealth-addresses-explained/) explique cette relation.
+
+Un [nom public Blocknet ID](/fr/blog/blocknet-id-pay-by-name/) facilite la recherche de la destination. Quelqu’un peut associer le nom publié à votre personne, mais un paiement ordinaire vers cette destination garde la même construction de sortie. Publier un nom de réception ne publie pas les clés privées de consultation du portefeuille.
+
+Vous pouvez aussi joindre une référence de facture ou une courte note. Le portefeuille chiffre le mémo avec un secret partagé pour cette sortie. Le champ occupe 128 octets et accepte jusqu’à 124 octets de texte ; un contenu court ou vide reçoit un remplissage aléatoire avant chiffrement. La taille fixe ne signale donc pas la longueur de la note. Émetteur et destinataire peuvent la connaître, et des informations de vérification ou de consultation partagées volontairement peuvent la révéler. Le [guide des mémos](/fr/blog/blocknet-encrypted-memos/) couvre leur écriture et leur lecture.
+
+## Comment le réseau vérifie-t-il les montants cachés ?
+
+Les sorties ordinaires contiennent des engagements de Pedersen plutôt que des montants publiés en clair. Avec ces engagements et les preuves associées, les nœuds vérifient l’équilibre de la transaction, frais publics compris. Les preuves de plage Bulletproofs établissent que les montants sont dans l’intervalle autorisé. Ensemble, ces contrôles valident le mouvement d’argent en laissant les montants hors du registre public ordinaire.
+
+Votre portefeuille peut toujours afficher le montant reçu. Le [guide des preuves de plage](/fr/blog/bulletproofs-explained/) explique la cryptographie, tandis que le [parcours d’une transaction](/fr/blog/blocknet-transaction-explained/) suit entrées sélectionnées, sorties du destinataire et monnaie rendue. Cette monnaie utilise de nouvelles sorties du portefeuille émetteur ; la confidentialité ne supprime pas le besoin de comptabiliser dépenses et retours.
+
+Les registres publics conservent hash, structure des entrées et sorties, frais et statut du bloc après inclusion. Un paiement privé reste donc vérifiable. Cette explication concerne les dépenses ordinaires : la transaction spéciale coinbase qui crée une récompense de bloc n’a pas d’entrées dépensées et suit des règles distinctes. Distinguer ces cas rattache « privé par défaut » au comportement décrit.
+
+## Que se passe-t-il hors de la transaction publique ?
+
+[Dandelion++](/fr/blog/dandelion-plus-plus-explained/) traite le relais réseau. Une nouvelle transaction suit d’abord une tige avant une diffusion plus large, réduisant le lien direct entre son origine et les pairs qui l’annoncent largement. Cette couche complète la cryptographie de transaction. Elle ne promet pas de cacher une adresse IP dans toute situation réseau.
+
+Les participants ont aussi leurs registres. L’émetteur connaît la destination et le montant saisis ; le destinataire reconnaît son encaissement. Facture, conversation ou capture partagée peuvent relier ces données à une personne ou commande. Ces informations extérieures diffèrent de ce que publie le format. Le [guide de visibilité des paiements](/fr/blog/blocknet-payment-visibility/) compare accès public, émetteur, destinataire et consultation accordée, y compris les preuves volontairement partagées. Pour l’usage monétaire courant, distinguez les deux : le réseau valide le transfert et chaque participant garde les détails utiles à sa comptabilité.
+
+## Que changerait la proposition Faraday ?
+
+L’[explication officielle du 27 octobre](https://blocknetcrypto.com/blog/2026-10-27-how-blocknet-privacy-survives-quantum-computers/) décrit Faraday comme une conception encore en construction et en test. Faraday remplacerait la preuve de dépense actuelle par des preuves fondées sur le hachage couvrant tout l’ensemble des pièces Faraday. Cet ensemble grandirait avec les pièces entrant dans le nouveau format ; cela ne signifie pas que toutes les sorties historiques y figurent déjà. La proposition Faraday utiliserait ML-KEM pour recevoir et détecter les paiements, une tâche distincte de la preuve de dépense.
+
+Le [guide de confidentialité de Faraday](/fr/blog/blocknet-faraday-privacy/) explique ces mécanismes prévus. Conception et calendrier peuvent changer ; les règles publiées décrivent le portefeuille actuel jusqu’à la mise à niveau applicable. Aujourd’hui, la confidentialité par défaut signifie que le format ordinaire protège les détails sensibles sans mode supplémentaire. [Blocknet et la fongibilité](/fr/blog/blocknet-fungibility/) explique le lien avec des unités interchangeables ; les étapes pratiques restent dans le [guide de paiement](/fr/blog/send-receive-blocknet/).
+
+<CTA target="seine" title="Minez Blocknet avec seine" text="Utilisez seine avec bntpool.com pour miner Blocknet et recevoir les paiements dans votre propre portefeuille." />

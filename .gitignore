@@ -1,0 +1,16 @@
+.gradle/
+**/build/
+.build/
+local.properties
+**/target/
+**/__pycache__/
+app/src/main/jniLibs/
+*.apk
+*.aab
+*.log
+*.jks
+*.p12
+*.keystore
+*.dpapi.xml
+.env
+.env.*

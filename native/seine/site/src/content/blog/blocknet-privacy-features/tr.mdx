@@ -1,0 +1,62 @@
+---
+title: 'Blocknet normal ödemeleri nasıl varsayılan olarak gizli tutar?'
+description: 'Blocknet ödemelerindeki halka imzalarını, tek kullanımlık anahtarları, gizli tutarları, şifreli notları ve Faraday ile önerilen gizlilik değişimlerini öğrenin.'
+tags: ['Blocknet', 'Gizlilik', 'Ödemeler']
+faq:
+  - q: 'Blocknet ile ödeme yaparken gizlilik otomatik mi?'
+    a: 'Evet. Yayımlanan cüzdan normal ödemeleri halka imzaları, tek kullanımlık çıktı anahtarları, gizli tutarlar ve şifreli notlarla oluşturur. Ayrı bir gizli ödeme modu seçmezsiniz. Açık işlem yapısı kalır; gönderen ve alıcı kendi ödeme ayrıntılarını bilir. Bu normal harcamaları anlatır; blok ödülü oluşturma kendi işlem kurallarını izler.'
+  - q: 'Blocknet girdisinde neden 16 halka üyesi var?'
+    a: 'Normal girdi zincirden bir gerçek çıktı ve 15 şaşırtıcı öğe kullanır. Halka imzası gerçek üyeyi belirlemeden yetkiyi kanıtlar. Konsensüs boyutu 16 olarak sabitler; kullanıcılar ödemelere göre farklı boyut seçmez. Diğer üyeler sahiplerinin fonlarını katmaz ve anahtar imgeleri tekrar harcamayı tespit etmeye yardım eder.'
+  - q: 'Faraday mevcut gizlilik sisteminin yerini aldı mı?'
+    a: 'Hayır. Faraday hâlâ önerilen bir yükseltmedir. 27 Ekim tarihli resmî açıklama, Faraday coin kümesi üzerinde hash tabanlı harcama kanıtlarını ve ödeme almak için ayrı ML-KEM mekanizmasını anlatır. Coinler yeni biçime girdikçe küme büyüyecektir. İlgili yükseltme etkinleşene kadar yayımlanmış mevcut ödeme kuralları referans olmaya devam eder.'
+sourceHash: '64f1034d2ebb'
+translation: draft
+---
+
+Birine ödeme yapmak, harcama geçmişinizi blokzinciri okuyabilen herkese yayımlamanızı gerektirmemeli. Blocknet gizlilik mekanizmalarını normal cüzdan ödemelerinin parçası olarak uygular. Bu rehber otomatik korumayı, ağın ödemeyi nasıl kontrol ettiğini ve kendi kayıtlarınızın yerini açıklar. Mevcut davranış yayımlanmış core v0.22.0 sürümüne dayanır; Faraday bölümü bir öneriyi anlatır.
+
+## Blocknet ödemesinde varsayılan gizlilik ne demek?
+
+<Answer>
+Normal Blocknet ödemeleri harcanan girdiler için halka imzası, alıcılar için tek kullanımlık anahtar, tutarlar için taahhüt ve aralık kanıtı kullanır. Notlar şifrelenir; Dandelion++ ağ kaynağının açığa çıkmasını azaltır. Cüzdan bu katmanları ayrı bir gizlilik düğmesi olmadan uygular; açık işlem yapısı ve tarafların kendi kayıtları kalır.
+</Answer>
+
+## Varsayılan koruma harcadığınız parayı nasıl korur?
+
+Alıcı ve tutar girdiğinizde cüzdan normal gizli biçimde ödeme oluşturur. Açık transferle korumalı transfer arasında seçim gerekmez. Böylece gizlilik BNT’yi para olarak kullanmanın parçasıdır: kişiye veya işletmeye ödeme, diğer normal ödemelerle aynı temel korumayı kullanır. Gizliliği etkinleştirme kararının ayırt edici bir seçim olmasını da önler.
+
+Her normal girdi 16 çıktılı CLSAG halkası kullanır: size ait gerçek çıktı ve zincirden 15 şaşırtıcı öğe. [Yayımlanmış doğrulama kuralları](https://github.com/blocknetprivacy/core/blob/5a0a5b510c1dce46f4eeb12c33a291052e44e7b3/transaction.go#L1013) bu boyutu ve üyelerin gerçek zincir üstü çıktılar olmasını zorunlu kılar. İmza hangi üyenin kaynak olduğunu belirtmeden harcama yetkisini kanıtlar. Diğer üyeler kanıta olası kaynaklar sunar; ödemenizi finanse etmez. Anahtar imgesi tekrar harcamayı tespit etmeyi sağlar. [Halka imzası rehberi](/tr/blog/ring-signatures-explained/) mekanizmayı açıklar.
+
+[![Normal Blocknet ödemesinde üç koruma: 1, 16 olası kaynaklı halka; 2, alıcının tek kullanımlık çıktı anahtarı; 3, gizli tutar taahhüdü.](/assets/blog/blocknet-privacy-default.svg)](/assets/blog/blocknet-privacy-default.svg)
+
+Şema üç korumayı gruplar: **1** halka üyeleri arasında yetkilendirme, **2** alınan çıktı ve **3** gizli tutarı. Hiçbir üye gerçek kaynak olarak işaretlenmez. Bu kavramsal görünüm canlı bir işlem değildir.
+
+## Alıcı ve ödeme notu nasıl korunur?
+
+Alım adresiniz ödeyenin size çıktı oluşturmasını sağlar. Cüzdan bilinen adresi zincirde her ödemenin yanına koymak yerine tek kullanımlık çıktı anahtarı türetir. Gelen çıktıları özel görüntüleme bilgileriyle tanır. Alım adresini yeniden kullanabilirsiniz; ödemelerin kendi çıktı anahtarları olur. [Gizli adres rehberi](/tr/blog/stealth-addresses-explained/) ilişkiyi açıklar.
+
+Herkese açık bir [Blocknet ID adı](/tr/blog/blocknet-id-pay-by-name/) alım hedefini kolayca bulmayı sağlar. Birisi yayımlanan adı sizinle ilişkilendirebilir, ancak o hedefe normal ödeme aynı çıktı yapımını kullanır. Alım adını yayımlamak cüzdanın özel görüntüleme anahtarlarını yayımlamaz.
+
+Fatura referansı veya kısa not da ekleyebilirsiniz. Cüzdan notu o çıktı için paylaşılan sırla şifreler. Not alanı 128 bayttır ve 124 bayta kadar metin destekler; kısa veya boş içerik şifrelenmeden önce rastgele dolguyla tamamlanır. Sabit alan boyutu not uzunluğunu açıklamaz. Gönderen ve alıcı notu bilebilir; bilinçli paylaşılan doğrulama veya görüntüleme bilgileri de açığa çıkarabilir. [Not rehberi](/tr/blog/blocknet-encrypted-memos/) yazma ve okumayı anlatır.
+
+## Ağ gizli tutarları nasıl kontrol eder?
+
+Normal ödeme çıktıları okunabilir tutarlar yayımlamak yerine Pedersen taahhütleri taşır. Düğümler bunlar ve ilgili kanıtlarla işlemin açık ücreti dahil dengelendiğini kontrol eder. Bulletproofs aralık kanıtları çıktı tutarlarının izin verilen aralıkta olduğunu gösterir. Kontroller birlikte para hareketini doğrular, ödeme tutarlarını normal açık kaydın dışında tutar.
+
+Cüzdan alınan tutarı yine gösterebilir. [Aralık kanıtı rehberi](/tr/blog/bulletproofs-explained/) kriptografiyi, [işlem anlatımı](/tr/blog/blocknet-transaction-explained/) seçilen girdileri, alıcı çıktılarını ve para üstünü açıklar. Para üstü gönderen cüzdana ait yeni çıktılar kullanır; gizlilik harcananı ve geri döneni hesaplama ihtiyacını kaldırmaz.
+
+Açık kayıtlar işlem özetini, girdi ve çıktı yapısını, ücreti ve dahil olduktan sonra blok durumunu korur. Gizli ödeme bu yüzden doğrulanabilir bir işlemdir. Bu açıklama normal harcamalar içindir: blok ödülü oluşturan özel coinbase işleminin harcama girdisi yoktur ve ayrı doğrulama kuralları izler. Bu ayrım “varsayılan gizliliği” anlattığı ödeme davranışına bağlar.
+
+## Açık işlemin dışında ne olur?
+
+[Dandelion++](/tr/blog/dandelion-plus-plus-explained/) ağ aktarımını ele alır. Yeni işlem geniş yayından önce bir gövde yolu izleyerek kaynağı ile geniş duyuru yapan eşler arasındaki doğrudan bağı azaltır. İşlem kriptografisine ek bir katmandır. Her ağ durumunda IP adresini gizlemeyi vaat etmez.
+
+Tarafların da kayıtları vardır. Gönderen girilen hedef ve tutarı bilir; alıcı aldığı ödemeyi tanır. Fatura, konuşma veya paylaşılan ekran görüntüsü bunları kişi ya da siparişle bağlayabilir. Bu dış bilgiler işlem biçiminin yayımladıklarından ayrıdır. [Ödeme görünürlüğü rehberi](/tr/blog/blocknet-payment-visibility/), bilinçli ödeme kanıtları dahil açık, gönderen, alıcı ve verilen görüntüleme erişimini karşılaştırır. Normal para kullanımında ayrımı koruyun: ağ transferi doğrular, taraflar kendi muhasebeleri için gereken ayrıntıları saklar.
+
+## Önerilen Faraday yükseltmesi neyi değiştirir?
+
+[27 Ekim tarihli resmî açıklama](https://blocknetcrypto.com/blog/2026-10-27-how-blocknet-privacy-survives-quantum-computers/), Faraday’ı hâlâ geliştirilip test edilen tasarım olarak anlatır. Faraday mevcut harcama kanıtını tüm Faraday coin kümesini kapsayan hash tabanlı kanıtlarla değiştirecektir. Coinler yeni biçime girdikçe küme büyüyecektir; bu, geçmişteki her çıktının zaten dahil olduğu anlamına gelmez. Faraday önerisi alma ve ödeme tespiti için ML-KEM kullanacaktır; bu, harcamayı kanıtlamaktan ayrı bir görevdir.
+
+[Faraday gizlilik rehberi](/tr/blog/blocknet-faraday-privacy/) planlanan mekanizmaları açıklar. Tasarım ve takvim değişebilir; ilgili yükseltmeye kadar cüzdan davranışı yayımlanmış kurallardan okunmalıdır. Bugün varsayılan gizlilik, normal biçimin hassas ayrıntıları ek mod seçmeden korumasıdır. Değiştirilebilir birimlerle ilişkisi [Blocknet ve fungibilite](/tr/blog/blocknet-fungibility/) yazısında, pratik gönderim adımları [ödeme rehberinde](/tr/blog/send-receive-blocknet/) açıklanır.
+
+<CTA target="seine" title="seine ile Blocknet madenciliği yapın" text="seine ve bntpool.com ile Blocknet madenciliği yapın, ödemeleri kendi cüzdanınıza alın." />

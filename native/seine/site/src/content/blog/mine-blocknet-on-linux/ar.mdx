@@ -1,0 +1,87 @@
+---
+title: 'كيفية تعدين Blocknet على Linux'
+description: "Linux: نزّل seine وفك ضغطه، ثم أدخل عنوان Blocknet وتأكد من قبول الحصص على bntpool.com. ابدأ بالإعدادات التلقائية؛ تأتي نصائح الأداء بعد خطوات الإعداد."
+tags: ['دليل التعدين', 'Linux', 'NVIDIA']
+faq:
+  - q: 'أي أرشيف Linux ينبغي تنزيله؟'
+    a: "افتح قسم التنزيل. شغّل uname -m: اختر seine-linux-x86_64.tar.gz للنتيجة x86_64، أو seine-linux-aarch64.tar.gz للنتيجة aarch64. تتطلب إصدارات Linux مكتبة glibc 2.31 أو أحدث. يدعم إصدار x86_64 التعدين على CPU وNVIDIA، بينما يدعم ARM64 التعدين على CPU."
+  - q: 'هل أحتاج إلى تشغيل seine باستخدام sudo؟'
+    a: 'شغّل برنامج التعدين العادي بحسابك الشخصي من مجلد قابل للكتابة. فك ضغط الأرشيف، وامنح مالك الملف إذن التنفيذ عند الحاجة، ثم شغّله باستخدام ./seine. تجهيز الصفحات الكبيرة المحجوزة مهمة إدارية منفصلة؛ ويمكن استخدام صفحات الذاكرة العادية عند بدء التشغيل المعتاد.'
+  - q: 'هل أحتاج إلى CUDA أو NVRTC للتعدين ببطاقات NVIDIA على Linux؟'
+    a: 'لا. يكفي تعريف NVIDIA. يستخدم seine مكتبة NVRTC إذا كانت مثبّتة، وإلا يحمّل النوى المضمّنة في seine، وهي تغطي بطاقات GeForce GTX 10 series والأحدث. ثبّت التعريف وشغّل seine وتأكد من ظهور بطاقتك في لوحة Devices.'
+sourceHash: acdcb56b3c1f
+translation: draft
+---
+
+## كيف تبدأ تعدين Blocknet على Linux؟
+
+<Answer>
+نزّل seine وفك ضغطه، ثم أدخل عنوان Blocknet وتأكد من قبول الحصص على bntpool.com. ابدأ بالإعدادات التلقائية؛ تأتي نصائح الأداء بعد خطوات الإعداد.
+</Answer>
+
+## الخطوة 1: نزّل الإصدار المناسب
+
+افتح [قسم التنزيل](/ar/#download). شغّل `uname -m`: اختر `seine-linux-x86_64.tar.gz` للنتيجة `x86_64`، أو `seine-linux-aarch64.tar.gz` للنتيجة `aarch64`. تتطلب إصدارات Linux مكتبة glibc 2.31 أو أحدث. يدعم إصدار x86_64 التعدين على CPU وNVIDIA، بينما يدعم ARM64 التعدين على CPU.
+
+<img src="/assets/blog/setup-download.webp" alt="جدول التنزيل الرسمي الذي يعرض أرشيفي Linux وLinux ARM64" loading="lazy" />
+
+## الخطوة 2: فك الضغط وشغّل البرنامج
+
+افتح Terminal. تفترض هذه الأوامر وجود الأرشيف في مجلد Downloads؛ استخدم مساره الفعلي إن كان مختلفًا. على ARM64، استبدل `seine-linux-x86_64.tar.gz` بـ `seine-linux-aarch64.tar.gz`. تفك الأوامر ضغط seine داخل مجلدك الرئيسي وتُشغّله:
+
+```sh
+mkdir -p "$HOME/seine"
+tar -xzf "$HOME/Downloads/seine-linux-x86_64.tar.gz" -C "$HOME/seine"
+cd "$HOME/seine"
+./seine
+```
+
+## الخطوة 3: أدخل عنوان محفظتك
+
+الصق عنوان استلام Blocknet العام أو اسمك المسجل `@name`، ثم اضغط Enter لقبول `stratum+tcp://bntpool.com:3333`. يوضح [دليل المحفظة](/ar/blog/blocknet-wallet-for-mining/) أين تجد عنوانك. لا يحتاج seine إلى عبارة الاسترداد أو مفاتيح الإنفاق. ويعيّن اسم جهاز التعدين في المجمع تلقائيًا.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-prompts-mobile.webp" width="435" height="156" />
+    <img src="/assets/blog/setup-prompts.webp" width="893" height="91" alt="مطالبات العنوان والمجمع عند التشغيل الأول. استبدل المثال بعنوانك أو اسمك المسجل." loading="lazy" />
+  </picture>
+  <figcaption>مطالبات العنوان والمجمع عند التشغيل الأول. استبدل المثال بعنوانك أو اسمك المسجل.</figcaption>
+</figure>
+
+يختار seine الخيوط ويضبط الأداء تلقائيًا. في مرات التشغيل التالية، شغّله من المجلد نفسه لإعادة استخدام `seine-data/seine.config.json`.
+
+## الخطوة 4: تحقق من الحصص المقبولة
+
+ابحث عن معدل تجزئة وعدّاد **Accepted** يتزايد في [لوحة المتابعة](/ar/blog/seine-dashboard-explained/). تؤكد الحصة المقبولة أن المجمع استلم عملك؛ ولا تعني أن دفعة قد أُرسلت. اضغط `q` أو `Ctrl+C` للإيقاف.
+
+<figure>
+  <picture>
+    <source media="(max-width: 640px)" srcSet="/assets/blog/setup-accepted-shares-mobile.webp" width="384" height="221" />
+    <img src="/assets/blog/setup-accepted-shares.webp" width="912" height="241" alt="لوحة seine الفعلية ببيانات توضيحية. ابحث عن Accepted؛ هذه الأرقام ليست نتائج اختبار أداء." loading="lazy" />
+  </picture>
+  <figcaption>لوحة seine الفعلية ببيانات توضيحية. ابحث عن Accepted؛ هذه الأرقام ليست نتائج اختبار أداء.</figcaption>
+</figure>
+
+افتح [إحصاءاتي](https://bntpool.com/stats?lang=ar) وأدخل العنوان أو الاسم المسجل نفسه للعثور على جهازك وحصصك ورصيدك.
+
+## ماذا تحتاج للتعدين بوحدة الرسوميات على Linux؟
+
+تحتاج بطاقات NVIDIA إلى تعريف NVIDIA فقط. وتحتاج بطاقات AMD إلى تعريف amdgpu وبيئة ROCm HIP، كما يشرح [دليل AMD](https://github.com/zpalmtree/seine/blob/master/docs/guides/amd.md). يجد seine بطاقاتك بنفسه ويعدّن بها إلى جانب المعالج في نسخة x86_64. ويشرح [دليل NVIDIA](/ar/blog/mine-blocknet-nvidia-gpu/) كيفية اختيار البطاقات وفحص حصص وحدة الرسوميات.
+
+<MinerSettings os="linux" />
+
+## كيف تعالج خطأ بدء التشغيل في Linux؟
+
+استخدم أول رسالة خطأ لتحديد الفحص التالي:
+
+| الرسالة أو العَرَض | ما ينبغي فحصه |
+|---|---|
+| `Exec format error` | معمارية غير مطابقة: قارن `uname -m` باسم ملف الأرشيف. |
+| `GLIBC_... not found` | يتطلب الملف التنفيذي glibc أحدث. استخدم نظامًا متوافقًا أو ابنِ من المصدر؛ واترك إدارة مكتبة C الخاصة بالنظام لتوزيعتك. |
+| `Permission denied` | تحقق من إذن التنفيذ للمستخدم، واستخدم مجلدًا على نظام ملفات يسمح بالتنفيذ. |
+
+بعد بدء قبول الحصص، يشرح [دليل الصفحات الكبيرة](/ar/blog/huge-pages-blocknet-mining/) الإعداد الاختياري لصفحات الذاكرة في Linux. ويشرح [دليل الخوادم](/ar/blog/mine-blocknet-on-servers/) التشغيل دون شاشة وتوزيع NUMA. لا يلزم أي من هذين الإعدادين لاتباع خطوات التشغيل الأول هذه؛ أجرِ كل تغيير منفصلًا لتعرف ما الذي تغير على جهازك.
+
+<CTA target="seine" title="نزّل seine لنظام Linux" text="فك ضغط تنزيل Linux وأدخل عنوانك، ثم ابدأ التعدين مع الضبط التلقائي لـ CPU." />
+
+افتح [إحصاءاتي](https://bntpool.com/stats?lang=ar) وأدخل العنوان أو الاسم المسجل نفسه للعثور على جهازك وحصصك ورصيدك.

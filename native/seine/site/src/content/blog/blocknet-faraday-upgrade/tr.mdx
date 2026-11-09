@@ -1,0 +1,68 @@
+---
+title: 'Blocknet Faraday yükseltmesi açıklandı'
+description: 'Blocknet Faraday önerisini keşfedin: kuantum sonrası gizlilik, cüzdan geçişi, kurtarma sözcükleri ve planlanan blok zamanları için pratik hazırlık.'
+tags: ['Blocknet', 'Faraday', 'Ağ yükseltmesi']
+faq:
+  - q: 'Faraday Blocknet üzerinde etkin mi?'
+    a: '27 Ekim 2026 tarihli resmî yazı Faraday’ın hâlâ geliştirildiğini ve test edildiğini, Şubat 2027 ve 103.680 numaralı bloğun hedeflendiğini söylüyor. Tarihler, rakamlar ve tasarım yayımdan önce değişebilir. Bunları önerilen kurallar sayın; bugünkü ağ için yayımlanmış cüzdan ve madenci talimatlarını kullanın.'
+  - q: 'Mevcut kurtarma sözcükleri çalışacak mı?'
+    a: 'Faraday planına göre mevcut 12 sözcüklü ifadeler çalışmayı sürdürecek, yeni cüzdanlar 24 sözcük alacak. Kurtarma sözcüksüz anahtarlardan içe aktarılan cüzdanlar yeni cüzdan ve coin transferi gerektirecek. Mevcut yedeği koruyun, yükseltme çıkınca son talimatları izleyin.'
+  - q: 'Faraday açılınca sahipler ne yapmalı?'
+    a: 'Plan, sahiplerine etkinleşmeden sonra coinleri cüzdan üzerinden taşımak için bir yıl verir. Bu pencerenin ardından taşınmayan coinler kalıcı biçimde harcanamaz olacak, taşınan coinler ise harcanmadan önce yaklaşık bir hafta bekleyecektir. Son adımlar henüz yayımlanmadı; yalnızca cüzdan yedeği almak coin taşımasını tamamlamaz.'
+sourceHash: 7645976ef060
+translation: draft
+---
+
+Blocknet’in Faraday önerisini izleyip ilgili cüzdan, düğüm ve madenci kontrollerini hazırlayın. Kılavuz [27 Ekim 2026 tarihli resmî açıklamayı](https://blocknetcrypto.com/blog/2026-10-27-how-blocknet-privacy-survives-quantum-computers/) içerir. Faraday hâlâ geliştiriliyor ve test ediliyor; proje tarihler, rakamlar ve tasarımın değişebileceğini söylüyor. Aşağıdaki tüm Faraday değişiklikleri gelecek plana aittir.
+
+## Blocknet Faraday yükseltmesi nedir?
+
+<Answer>
+Faraday mevcut Blocknet zinciri için planlanan yükseltmedir. Hash tabanlı harcama kanıtları, ML-KEM ödeme algılama ve tüm Faraday coin kümesi içinde harcama gizliliği önerir. Geçiş cüzdan taşıması, yeni adres ve kurtarma biçimleri ve değişen blok zamanını içerir. Zincir geçmişi devam edecektir.
+</Answer>
+
+<img src="/assets/blog/blocknet-faraday-upgrade.svg" alt="Mevcut zincir önerilen yükseltmeyle sürer; ayrı cüzdan geçişi adımı ve takvim planlanan dönemi gösterir." width="1200" height="675" loading="lazy" />
+
+## Gizlilik ve harcama kanıtları nasıl değişir?
+
+Açıklanan Faraday tasarımı, coinleri koruyan eliptik eğri mekanizmalarını kuantum sonrası mekanizmalarla değiştirmeyi önerir. Harcama, Plonky3 ile oluşturulan hash tabanlı kanıtları kullanacak; cüzdanlar ise gelen ödemeleri ML-KEM ile algılayacaktır. Proje bunları aynı yükseltmenin parçaları olarak sunar. [Mevcut gizlilik kılavuzu](/tr/blog/blocknet-privacy-features/) bugünkü ağın mekanizmalarını açıklar; etkinleştirilmiş bir Faraday ağının açıklaması olarak okunmamalıdır.
+
+Bugünkü halka 16 üyeden oluşur. Yeni plana göre harcama, coinler yeni biçime geçtikçe büyüyen tüm Faraday coin kümesi içinde gizlenecektir. Açıklama ayrıca bireysel harcama kanıtlarının bir blok kanıtında birleştirilmesini ve kesinleşmeden sonra bireysel kanıtların atılmasını tarif eder. Bunlar projenin tasarım açıklamalarıdır; bu kılavuzun mainnet üzerinde test ettiği özellikler değildir. Geliştirme ilerledikçe yayımlanan uygulamayı ve belgelerini izleyin.
+
+## Faraday ne zaman etkinleşebilir?
+
+Yeni açıklama mainnetin ilk yıldönümüne yakın Şubat 2027’yi, 103.680 numaralı bloğu hedefler. [Resmî genel bakış](https://blocknetcrypto.com/#faraday) yaklaşık 16 Şubat der. Yükseklik ile takvim tahmini farklıdır: gerçek blok üretimi yüksekliğe ne zaman ulaşılacağını belirler, testler planı değiştirebilir. Hatırlatmalarda ikisinin de geçici durumunu koruyun.
+
+Önerilen geçiş süresi etkinleşmeden sonra bir yıldır. Takvim hatırlatmasını onay saymak yerine projenin yayımladığı son açılış ve kapanış koşullarına göre planlayın. Resmî kaynağı ve son kontrol tarihini kaydedin. Uyumlu cüzdan veya core yayımlanınca dönüp bakın; yazının tarihi yükseltmenin etkin olduğu anlamına gelmez.
+
+## Mevcut coinler nasıl taşınır?
+
+Faraday mevcut zinciri ve geçmişini sürdürürken, sahipler coinlerini cüzdanları üzerinden yeni biçime taşıyacaktır. Açıklama, kesin adımların etkinleşmeden önce yayımlanacağını söyler. Ayrıca taşınan coinlerin yeniden harcanabilmesi için yaklaşık bir hafta bekleme önerir. Taşıma dönemindeki fon erişimini hazırlarken bu planlanan beklemeyi hesaba katın ve harekete geçmeden önce son cüzdan talimatlarını doğrulayın.
+
+Açıklanan kurallara göre bir yıllık pencere sonunda taşınmamış coinler kalıcı harcanamaz olacaktır. Belgelenmiş geçişi pencerede tamamlayıp sonucu cüzdanda kontrol edin. [Cüzdan yedeği](/tr/blog/blocknet-wallet-backup-restore/) kurtarma malzemesini korur ama coinleri taşımaz. Burada geçiş komutu yoktur; gerçek geçiş destekli sürüm çıktığında onun prosedürünü kullanın.
+
+## Kurtarma sözcükleri ve adreslere ne olur?
+
+Resmî yazı mevcut 12 sözcüklü kurtarma ifadelerinin çalışmayı sürdüreceğini, yeni cüzdanların 24 sözcük alacağını söyler. Hiç kurtarma sözcüğü olmayan, anahtarlardan içe aktarılan bir cüzdan için plan yeni cüzdan oluşturmayı ve coinleri ona taşımayı öngörür. Mevcut cüzdanınızın hangi kurtarma malzemesine sahip olduğunu kontrol edin ve şimdiden koruyun. [Yedekleme ve kurtarma kılavuzu](/tr/blog/blocknet-wallet-backup-restore/) şu anda yayımlanmış yazılımı anlatır, gelecekteki Faraday kurtarma komutlarını değil.
+
+Önerilen kuantum sonrası Faraday adresleri yaklaşık 1.700 karakterdir. Kopyalama, yapıştırma ve QR kodları açıklanmış yöntemlerdir; [Blocknet ID adları](/tr/blog/blocknet-id-pay-by-name/) daha kısa ödeme kimliği sağlar. Çıkınca yükseltilmiş cüzdan biçimini izleyin ve onaydan önce çözümlenen alıcıyı karşılaştırın. Mevcut örnek adresi gelecek biçimin test adresi yapmayın.
+
+## Blok zamanı ve ödüller nasıl değişir?
+
+Açıklama hedef blok süresini 5 dakikadan 10 dakikaya çıkarmayı ve geçiş sırasında blok ödülünü ikiye katlamayı önerir. Yarısı kadar hedef blok ve iki kat ödül, planlanan coin ihraç hızını koruyacaktır; günlük çıkarılan coin sayısını ikiye katlamayacaktır. [Ödül takvimi kılavuzu](https://bntpool.com/blog/tr/blocknet-block-reward-schedule/) mevcut takvimi açıklar. Gelecekteki ödül rakamlarını her zaman fork ayı ve zamanlamaya ilişkin varsayımlarıyla birlikte okuyun.
+
+Aynı öneri en fazla yeniden düzenleme derinliğini 60 blok olarak belirler ve yeni kazılan coinlerin harcanmadan önce 60 blok beklemesini korur. Önerilen 10 dakikalık hedefte bu bekleme yaklaşık 10 saate karşılık gelir. Cüzdanlar bir ödemeyi güvenli olarak işaretlemeden önce yine 10 onay bekleyecektir; bu yaklaşık 100 dakikadır. Bunlar hedefe dayalı tahminlerdir, garanti edilmiş süreler değil: tek tek blok aralıkları değişir ve son sürümün kuralları hâlâ doğrulanmalıdır.
+
+## Düğüm operatörleri ve madenciler ne hazırlamalı?
+
+Core sürümü, ağ, veri dizini ve bağımlı hizmetlerin envanterini tutun. Açıklama otomatik düğüm güncellemelerini anlatır, ancak operatörler yine de gerçek sürüm politikalarını ve forku uygulayan sürümü kontrol etmelidir. [Düğüm kılavuzu](/tr/blog/run-blocknet-node/) sürüm sabitleme dahil mevcut işletimi anlatır. Gereken yeniden başlatmaları cüzdanları, gezginleri ve havuz hizmetlerini dikkate alarak planlayın; ardından eşleri, zincirin ilerlemesini ve istemcilerin yeniden bağlanmasını doğrulayın.
+
+Madencilik de fork sırasında değişecektir; açıklama bunun için ayrı bir yazı yayımlanacağını söyler. Gelecekteki seine bayraklarını, donanım sıralamalarını veya havuz geçiş prosedürünü sunmaz. Bugünkü ağ için mevcut [Argon2id kılavuzunu](/tr/blog/argon2id-proof-of-work-explained/) ve [bntpool kurulumunu](https://bntpool.com/blog/tr/mine-blocknet-on-bntpool/) kullanın. Uyumlu sürümler ve geçiş talimatları geldiğinde madenci ile havuzu birlikte kontrol edin ve belirtilen güncellemeden sonra yeni kabul edilen payları doğrulayın.
+
+## Cüzdan geçişiyle yazılım güncellemesini ayırın
+
+Kısa bir hazırlık kaydı tutun: doğrulanmış yedeğin konumu, sahip olduğunuz kurtarma malzemesi, çalışan cüzdan ve core sürümleri ve henüz yayımlanması gereken resmî talimatlar. Düğüm güncellemelerini, madenci güncellemelerini ve coin taşımayı ayrı tamamlanma kontrolleri olan ayrı görevler olarak kaydedin. Bir sürümü indirmek veya düğümün eşitlendiğini görmek coinlerin taşındığını kanıtlamaz.
+
+Resmî yazı süren doğrulayıcı testlerini, referans uygulama ile kanıt devreleri arasındaki karşılaştırmaları ve yayımlanmış performans ölçümü çalışmalarını anlatır. Bu raporlar projenin geliştirme sürecini açıklar; işletim talimatlarının kaynağı son sürüm olmaya devam eder. Takvim geliştikçe açıklamayı yeniden kontrol edin, hatırlatmaları güncelleyin ve iş akışı kullanılabilir olduğunda cüzdanın taşıma sonucunu kaydedin. Bu sırada güncel yedekleri koruyun ve bugünkü işlemler için mevcut [cüzdan kılavuzunu](/tr/blog/blocknet-wallet-for-mining/) kullanın.
+
+<CTA target="seine" title="seine ile Blocknet madenciliğini izleyin" text="Mevcut madenciyi keşfedin ve yayımlanmış sürüm talimatlarını Blocknet yükseltme planınızla saklayın." />

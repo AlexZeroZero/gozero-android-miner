@@ -1,0 +1,111 @@
+---
+title: 'Bulletproofs explicados: como valores ocultos são verificados'
+description: Bulletproofs explicados em palavras simples. Veja como os compromissos de Pedersen ocultam os valores e como as provas de intervalo deixam cada nó conferir as contas.
+tags: [Bulletproofs, Privacidade, Criptografia, Blocknet]
+faq:
+  - q: 'Os Bulletproofs precisam de uma configuração confiável (trusted setup)?'
+    a: 'Não. Os Bulletproofs dependem apenas da hipótese do logaritmo discreto, a mesma hipótese por trás das assinaturas de curva elíptica, e usam parâmetros públicos que qualquer pessoa pode derivar. Não há cerimônia de configuração nem segredo que alguém precise destruir depois, e moedas de privacidade como o Monero e o Blocknet os usam em suas provas de intervalo.'
+  - q: 'Qual é o tamanho de uma prova de intervalo Bulletproofs?'
+    a: 'Um único Bulletproof de 64 bits contém 2 × log2(64) + 9 = 21 elementos. No grupo Ristretto, cada elemento ocupa 32 bytes, então cada prova tem 672 bytes, e o explorador do Blocknet mostra exatamente isso para cada saída. O tamanho cresce com o logaritmo do intervalo, então dobrar o número de bits acrescenta só dois elementos.'
+  - q: 'Quem pode ver o valor de uma transação Blocknet?'
+    a: "Em um pagamento comum, o remetente conhece o valor e a carteira destinatária recupera o valor recebido. Provas de pagamento ou acesso de visualização compartilhados deliberadamente podem revelá-lo a outras pessoas. Os dados públicos da transação continuam incluindo a taxa e a estrutura. As recompensas coinbase são diferentes: o valor permitido e sua codificação podem ser derivados publicamente da altura do bloco e dos dados da transação."
+  - q: 'Como os nós sabem que nenhuma moeda foi criada se os valores estão ocultos?'
+    a: "Nos pagamentos comuns, as provas de intervalo limitam cada saída de 0 a 2^64−1, e o balanço dos compromissos verifica a conservação do valor, incluindo a taxa. A validação completa também verifica autorização de gasto, vinculação do anel e reutilização de imagens de chave. A nova emissão passa por uma verificação coinbase separada em relação à recompensa permitida. São verificações distintas; uma prova de intervalo não verifica sozinha todas as regras da transação."
+sourceHash: 3be778e9122b
+translation: draft
+---
+
+Bulletproofs são provas de intervalo curtas e de conhecimento zero que ajudam a verificar valores ocultos de pagamentos. Este guia explica os compromissos de Pedersen, por que os valores precisam de limites e como as Bulletproofs permanecem pequenas. No Blocknet, as provas de intervalo trabalham junto com verificações de autorização, balanço, gasto repetido e coinbase. Juntas, elas explicam como a privacidade dos pagamentos comuns se combina com a validação da movimentação de dinheiro e da nova emissão.
+
+## O que são Bulletproofs?
+
+<Answer>
+Bulletproofs são provas curtas de conhecimento zero, publicadas por Bünz, Bootle, Boneh, Poelstra, Wuille e Maxwell em 2018. Nas criptomoedas, elas provam que um valor oculto está dentro de um intervalo válido, como de 0 a 2^64−1, sem revelá-lo. Elas não precisam de configuração confiável, e seu tamanho cresce só com o logaritmo do intervalo.
+</Answer>
+
+O artigo [Bulletproofs: Short Proofs for Confidential Transactions and More](https://eprint.iacr.org/2017/1066) foi apresentado no IEEE Symposium on Security and Privacy em 2018. Os autores os projetaram para transações confidenciais, em que os valores em uma blockchain são substituídos por compromissos. Para entender por que esse tipo de prova é necessário, comece pelo compromisso.
+
+## O que é um compromisso de Pedersen?
+
+Um compromisso (commitment) é a versão criptográfica de um envelope lacrado. Você coloca um número dentro, mostra o envelope a todos e depois pode provar o que havia dentro. Ninguém consegue ler o número pelo envelope, e você não consegue trocá-lo por outro número depois.
+
+Um compromisso de Pedersen, descrito por Torben Pedersen em 1991, faz isso com pontos de curva elíptica. Para se comprometer com um valor `v`, a carteira escolhe um segredo aleatório `r`, chamado fator de cegamento (blinding factor), e calcula:
+
+```
+C = v·G + r·H
+```
+
+`G` e `H` são dois pontos públicos fixos na curva, escolhidos de forma que ninguém saiba escrever um como múltiplo do outro. O resultado `C` é um único ponto de 32 bytes. Ele tem duas propriedades:
+
+- **Ocultação.** Como `r` é aleatório, `C` parece um ponto aleatório. O mesmo valor comprometido duas vezes gera dois compromissos sem relação entre si, e o compromisso sozinho não diz nada a um observador sobre `v`.
+- **Vinculação.** Depois que `C` é publicado, a carteira não consegue abri-lo com um valor diferente. Fazer isso exigiria resolver o problema do logaritmo discreto na curva.
+
+## Como os nós verificam uma transação que não conseguem ler?
+
+<Answer>
+Compromissos de Pedersen podem ser somados. A soma de dois compromissos é um compromisso com a soma dos seus valores, com os fatores de cegamento também somados. Um nó soma os compromissos de entrada de uma transação e os compromissos de saída mais a taxa e verifica se os dois totais batem, então confirma o saldo sem ver nenhum valor.
+</Answer>
+
+Somar dois compromissos resulta em `(v1 + v2)·G + (r1 + r2)·H`, que também é um compromisso com `v1 + v2`. O remetente organiza os fatores de ocultação para que o total das entradas seja igual ao das saídas. Se os valores estiverem equilibrados, subtrair os compromissos das saídas e da taxa da soma das entradas resulta em zero.
+
+A taxa de rede é pública, assim como outros dados da transação, como o hash e a estrutura de entradas e saídas. Os nós transformam a taxa em um compromisso com ocultação zero e o acrescentam ao lado das saídas. Para um pagamento comum, a verificação de conservação é entradas = saídas + taxa.
+
+## Por que valores ocultos precisam de provas de intervalo?
+
+A aritmética dos compromissos funciona módulo um número muito grande, a ordem do grupo da curva, que é cerca de 2^252. Nessa aritmética, um valor "negativo" é só um valor positivo enorme. Alguém poderia gastar uma entrada de 10 moedas e criar duas saídas, uma de 11 e outra de "menos 1". Os compromissos fechariam perfeitamente, e 1 moeda surgiria do nada, oculta de todo observador.
+
+Uma prova de intervalo fecha essa brecha. Ela prova que o valor dentro de um compromisso está entre 0 e 2^64−1 sem dizer qual é. Com cada saída limitada dessa forma, um punhado de saídas nunca consegue somar um número grande o bastante para dar a volta na ordem do grupo, então compromissos que fecham significam valores que fecham.
+
+Os designs anteriores de transações confidenciais usavam provas de intervalo que cresciam linearmente com o número de bits. Os Bulletproofs crescem só com o logaritmo, o que reduz uma prova de 64 bits a algumas centenas de bytes.
+
+## Como os Bulletproofs funcionam?
+
+Um Bulletproof prova um intervalo em três etapas.
+
+1. **Dividir o valor em bits.** Um valor de 64 bits vira um vetor de 64 bits. O provador se compromete com esse vetor e mostra dois fatos sobre ele: cada componente é 0 ou 1, e os bits, ponderados por potências de dois, somam o valor comprometido.
+2. **Transformar esses fatos em um único produto interno.** Usando desafios aleatórios, o provador condensa todas essas condições em uma única afirmação sobre o produto interno de dois vetores. Como os desafios são aleatórios, uma afirmação falsa só passa com probabilidade desprezível.
+3. **Provar o produto interno dividindo pela metade.** A cada rodada, o provador envia dois pontos da curva, `L` e `R`, e os dois vetores são dobrados ao meio. Depois de log2(64) = 6 rodadas, sobra um único par de números.
+
+É dessa divisão pela metade que vem o tamanho. O resumo do artigo coloca uma prova de intervalo em `2·log2(n) + 9` elementos de grupo e de corpo para um intervalo de `n` bits. Para 64 bits, isso dá 12 pontos das seis rodadas mais outros 9, 21 elementos no total, ou 672 bytes quando cada elemento tem 32 bytes.
+
+A prova é não interativa. Em vez de um verificador ao vivo enviando desafios, os dois lados os derivam calculando o hash da transcrição da prova, uma técnica padrão conhecida como heurística de Fiat-Shamir. Os Bulletproofs também não precisam de configuração confiável: os geradores são públicos e derivados abertamente, e a segurança depende só da hipótese do logaritmo discreto. Várias provas podem ser agregadas, acrescentando apenas um número logarítmico de elementos, e a verificação pode ser feita em lote.
+
+## Quem usa Bulletproofs?
+
+O Monero ativou os Bulletproofs na atualização de rede de 18 de outubro de 2018 (a versão v0.13.0) para reduzir o tamanho das transações. A [biblioteca bulletproofs em Rust](https://github.com/dalek-cryptography/bulletproofs), do projeto dalek-cryptography, os implementa sobre o grupo Ristretto da Curve25519, e a biblioteca de criptografia do Blocknet é construída sobre ela.
+
+## Como o Blocknet valida pagamentos privados?
+
+Na versão lançada core v0.22.0, as saídas de pagamentos comuns contêm compromissos de Pedersen, valores criptografados e Bulletproofs individuais de 64 bits. Seus valores ficam ocultos no registro público comum. A transação especial coinbase cria a recompensa do bloco e tem um caminho de emissão separado, verificável publicamente.
+
+A validação criptográfica completa de um pagamento comum inclui estas verificações separadas no [validador de transações lançado](https://github.com/blocknetprivacy/core/blob/5a0a5b510c1dce46f4eeb12c33a291052e44e7b3/transaction.go#L960):
+
+- **Autorização e vinculação.** Cada entrada deve usar 16 membros canônicos do anel presentes na cadeia. RingCT prova a propriedade e a igualdade dos valores. O verificador também confere se a imagem de chave e o compromisso da pseudossaída correspondem à prova assinada.
+- **Intervalo e balanço.** A Bulletproof de cada saída é verificada em relação ao seu compromisso e limita o valor de 0 a 2^64−1. A transcrição usa o rótulo "Blocknet Range Proof". A soma das pseudossaídas assinadas deve ser igual às saídas mais a taxa. Isso verifica a conservação; não substitui a autorização.
+- **Gasto repetido.** As imagens de chave devem ser distintas dentro da transação e não podem já estar registradas como gastas.
+
+[![Quatro tarefas de validação separadas: 1 autorização de gasto e vinculação do anel; 2 intervalo do valor e balanço dos compromissos; 3 imagem de chave ainda não gasta; 4 emissão coinbase permitida em um caminho separado.](/assets/blog/blocknet-private-validation.svg)](/assets/blog/blocknet-private-validation.svg)
+
+As verificações **1–3** dizem respeito ao gasto comum. A verificação **4** diz respeito à transação especial que cria a recompensa do bloco. O diagrama separa suas funções; não representa uma transação em andamento nem substitui o restante da validação do bloco.
+
+## Como a rede detecta um gasto repetido?
+
+Uma prova de intervalo válida informa que um valor está dentro dos limites. Ela não informa que o proprietário ainda não gastou a saída. A imagem de chave fornece essa verificação separada de vinculação sem identificar o verdadeiro membro do anel. A validação rejeita imagens duplicadas em uma transação e imagens já gastas na cadeia aceita. Vincular a imagem à prova RingCT assinada impede sua substituição independente. [Quem controla o Blocknet](/pt-br/blog/who-controls-blocknet/) explica a relação entre essas regras e os nós que as aplicam.
+
+## Como verificar a emissão sem ler saldos de carteiras?
+
+A coinbase de um bloco não tem entradas de gasto. O [validador de blocos lançado](https://github.com/blocknetprivacy/core/blob/5a0a5b510c1dce46f4eeb12c33a291052e44e7b3/block.go#L543) calcula a recompensa permitida para a altura e reconstrói o compromisso e o valor codificado esperados usando ocultação derivada publicamente. Ambos devem corresponder. Seu valor, portanto, pode ser derivado publicamente, ao contrário dos valores ocultos dos pagamentos comuns.
+
+A emissão acumulada é calculada somando as recompensas previstas a partir da altura 1; o gênese não tem coinbase. Esse total não é obtido pela soma de saldos privados de carteiras e não informa quanto está disponível para gastar ou em circulação atualmente. O [guia de oferta monetária](/pt-br/blog/blocknet-supply/) explica a distinção, enquanto o [exemplo de transação](/pt-br/blog/blocknet-transaction-explained/) aborda transferências e troco que não emitem a recompensa novamente.
+
+Você pode ver isso no [explorador do Blocknet](https://explorer.blocknetcrypto.com). A página de uma transação lista seus valores como "hidden · Pedersen commitments", e cada saída mostra seu compromisso, um memo criptografado e uma prova de intervalo de "672 bytes · Bulletproof", o tamanho que as contas acima preveem.
+
+Nos pagamentos comuns, a carteira destinatária reconhece suas saídas e recupera os valores criptografados com suas informações privadas de visualização. O remetente conhece o valor informado. Provas de pagamento ou acesso de visualização compartilhados deliberadamente podem fornecer informações adicionais a outras pessoas. Essas escolhas de divulgação não alteram as verificações de compromissos e provas da rede.
+
+Os valores ocultos dos pagamentos comuns trabalham com as outras camadas do Blocknet: [assinaturas em anel](/pt-br/blog/ring-signatures-explained/) sobre 16 saídas protegem a origem gasta, [endereços furtivos de uso único](/pt-br/blog/stealth-addresses-explained/) protegem o destino receptor, e [Dandelion++](/pt-br/blog/dandelion-plus-plus-explained/) reduz a exposição da origem de rede. O [guia de privacidade](/pt-br/blog/blocknet-privacy-features/) explica cada camada. Essas verificações descrevem a validação completa; a sincronização rápida pode se apoiar em pontos de controle históricos confiáveis para algumas verificações custosas de assinaturas e provas de intervalo, conforme a implementação lançada.
+
+## Consiga seus próprios BNT privados
+
+Para receber pagamentos comuns em BNT na sua carteira, você pode minerar por um pool. O Blocknet usa [prova de trabalho Argon2id](/pt-br/blog/argon2id-proof-of-work-explained/), que exige muita memória, e o seine minera com sua CPU e GPUs NVIDIA compatíveis enquanto ajusta seu funcionamento. Os pagamentos enviados pelo bntpool.com são transferências comuns com compromissos e provas de intervalo, diferentes da recompensa coinbase do bloco. O [guia de mineração](/pt-br/blog/how-to-mine-blocknet/) aborda a configuração e as shares aceitas.
+
+<CTA target="seine" title="Minere BNT com o seine" text="Use o seine com o bntpool.com e receba pagamentos comuns do pool na sua própria carteira Blocknet." />
