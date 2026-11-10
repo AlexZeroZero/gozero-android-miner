@@ -55,9 +55,9 @@ public final class MiningService extends Service {
     private final Handler main=new Handler(Looper.getMainLooper());
     @Override public IBinder onBind(Intent i){return null;}
     @Override public void onCreate(){
-        super.onCreate();
+        super.onCreate();L10n.init(this);
         NotificationManager nm=getSystemService(NotificationManager.class);
-        nm.createNotificationChannel(new NotificationChannel("mining","挖矿状态",NotificationManager.IMPORTANCE_LOW));
+        nm.createNotificationChannel(new NotificationChannel("mining",L10n.text("挖矿状态"),NotificationManager.IMPORTANCE_LOW));
         wake=((PowerManager)getSystemService(POWER_SERVICE)).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"GozeroBNT:Mining");
         wake.setReferenceCounted(false);
     }
@@ -82,11 +82,11 @@ public final class MiningService extends Service {
         PendingIntent stop=PendingIntent.getService(this,1,new Intent(this,MiningService.class).setAction(STOP),PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
         String title=String.format(Locale.US,"%.2f H/s · %s",MinerState.rate,MinerState.status);
         String resources=MinerState.runningThreads+" 线程 · 核心内存 "+MinerState.memoryText()+" · CPU "+CpuTemperature.text();
-        return new Notification.Builder(this,"mining").setSmallIcon(R.drawable.ic_notification).setContentTitle(title)
-            .setContentText(resources).setSubText(settings.coin+" · 1% 开发费用"+(MinerState.feeActive?" · 手续费计算中":""))
-            .setStyle(new Notification.BigTextStyle().bigText(resources+"\n有效份额 "+MinerState.accepted+" · "+MinerState.detail))
+        return new Notification.Builder(this,"mining").setSmallIcon(R.drawable.ic_notification).setContentTitle(L10n.text(title))
+            .setContentText(L10n.text(resources)).setSubText(L10n.text(settings.coin+" · 1% 开发费用"+(MinerState.feeActive?" · 手续费计算中":"")))
+            .setStyle(new Notification.BigTextStyle().bigText(L10n.text(resources+"\n有效份额 "+MinerState.accepted+" · "+MinerState.detail)))
             .setShowWhen(false).setVisibility(Notification.VISIBILITY_PUBLIC).setCategory(Notification.CATEGORY_SERVICE)
-            .setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true).addAction(new Notification.Action.Builder(null,"停止挖矿",stop).build()).build();
+            .setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true).addAction(new Notification.Action.Builder(null,L10n.text("停止挖矿"),stop).build()).build();
     }
     private void publish(){CpuTemperature.request(this);if(requested)getSystemService(NotificationManager.class).notify(7,notification());}
     static ActivityManager.MemoryInfo memory(Context c){ActivityManager.MemoryInfo m=new ActivityManager.MemoryInfo();((ActivityManager)c.getSystemService(ACTIVITY_SERVICE)).getMemoryInfo(m);return m;}
@@ -133,7 +133,7 @@ public final class MiningService extends Service {
             File core=new File(getApplicationInfo().nativeLibraryDir,settings.coin.binary);
             if(!core.canExecute())throw new IOException("当前架构没有可执行核心："+Build.SUPPORTED_ABIS[0]);
             File data=new File(getFilesDir(),"seine-data");if(!data.exists()&&!data.mkdirs())throw new IOException("无法建立核心目录");
-            MinerState.line("Gozero 1.0.0 · "+settings.coin+" · "+settings.coin.core+" · "+Build.MODEL);
+            MinerState.line("Gozero 1.1.0 · "+settings.coin+" · "+settings.coin.core+" · "+Build.MODEL);
             MinerState.line(FeePolicy.description(settings.coin));
             while(requested){
                 String reason=guard(true);
