@@ -6,8 +6,8 @@ android {
         applicationId 'trade.gozero.bnt'
         minSdk 28
         targetSdk 35
-        versionCode 17
-        versionName '1.1.0'
+        versionCode 18
+        versionName '1.10'
         ndk { abiFilters 'arm64-v8a', 'x86_64' }
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
